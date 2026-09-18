@@ -1,0 +1,3 @@
+ALTER TABLE mabar_sessions
+    ADD COLUMN IF NOT EXISTS shuttle_pack_price BIGINT NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS shuttle_units_per_pack INT NOT NULL DEFAULT 12;

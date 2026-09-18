@@ -1,0 +1,2 @@
+ALTER TABLE player_bills
+    ADD COLUMN IF NOT EXISTS payment_method TEXT NOT NULL DEFAULT 'CASH';

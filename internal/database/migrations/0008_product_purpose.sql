@@ -1,0 +1,2 @@
+ALTER TABLE shuttlecock_products
+    ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'GENERAL';
