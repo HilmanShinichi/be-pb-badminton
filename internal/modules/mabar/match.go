@@ -335,7 +335,28 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 		shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(avgPerUnit, 1, int64(unitsUsed)))
 	}
 	operatingCost := sess.CourtCost + shuttleCost + otherExpense
-	profit := revenue - operatingCost
+	// Upfront member money (commitment fees) pre-funds the courts: spread
+	// what the period has actually collected across its planned sessions so
+	// one session doesn't look like a loss for courts already paid for.
+	var prepaidCourts int64
+	if sess.PeriodID != nil {
+		var prepaidTotal int64
+		var planSessions int
+		_ = s.db.QueryRow(r.Context(),
+			`SELECT COALESCE(SUM(amount), 0) FROM revenues WHERE period_id = $1 AND source = 'COMMITMENT_FEE'`,
+			*sess.PeriodID).Scan(&prepaidTotal)
+		_ = s.db.QueryRow(r.Context(),
+			`SELECT COALESCE(number_of_sessions, 0) FROM membership_periods WHERE id = $1`,
+			*sess.PeriodID).Scan(&planSessions)
+		if planSessions <= 0 {
+			_ = s.db.QueryRow(r.Context(),
+				`SELECT COUNT(*) FROM mabar_sessions WHERE period_id = $1`, *sess.PeriodID).Scan(&planSessions)
+		}
+		if planSessions > 0 {
+			prepaidCourts = prepaidTotal / int64(planSessions)
+		}
+	}
+	profit := revenue + prepaidCourts - operatingCost
 
 	var listed, present, noShow int
 	_ = s.db.QueryRow(r.Context(), `
@@ -349,12 +370,13 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 		"revenue":          revenue,
 		"billed_paid":      billedPaid,
 		"court_cost":       sess.CourtCost,
+		"prepaid_courts":   prepaidCourts,
 		"shuttlecock_used": unitsUsed,
 		"shuttlecock_cost": shuttleCost,
 		"other_expense":    otherExpense,
 		"operating_cost":   operatingCost,
 		"profit":           profit,
-		"status":           finance.FinancialStatus(revenue, operatingCost),
+		"status":           finance.FinancialStatus(revenue+prepaidCourts, operatingCost),
 		"players_present":  present,
 		"players_listed":   listed,
 		"no_show":          noShow,

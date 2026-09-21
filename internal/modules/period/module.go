@@ -547,6 +547,41 @@ func (s *Service) RemoveMember(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteAppError(w, err)
 		return
 	}
+	// ?hard=true permanently deletes the membership AND every payment
+	// recorded for this player in this period (revenues). Session history
+	// (attendance, session bills) is left untouched. Default is a reversible
+	// withdraw that keeps the money in finance.
+	if r.URL.Query().Get("hard") == "true" {
+		tx, err := s.db.Begin(r.Context())
+		if err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
+			return
+		}
+		defer tx.Rollback(r.Context())
+		var dropped int64
+		if err := tx.QueryRow(r.Context(),
+			`WITH d AS (DELETE FROM revenues WHERE period_id = $1 AND player_id = $2 RETURNING 1)
+			 SELECT COUNT(*) FROM d`, id, playerID).Scan(&dropped); err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
+			return
+		}
+		tag, err := tx.Exec(r.Context(),
+			`DELETE FROM memberships WHERE period_id = $1 AND player_id = $2`, id, playerID)
+		if err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Membership not found.")
+			return
+		}
+		if err := tx.Commit(r.Context()); err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
+			return
+		}
+		httpx.OK(w, http.StatusOK, map[string]any{"ok": true, "payments_deleted": dropped})
+		return
+	}
 	tag, err := s.db.Exec(r.Context(),
 		`UPDATE memberships SET status = 'WITHDRAWN' WHERE period_id = $1 AND player_id = $2 AND status <> 'WITHDRAWN'`,
 		id, playerID)
@@ -1004,3 +1039,201 @@ func coalesceInt(p *int, cur int) int {
 	}
 	return *p
 }
+
+type MatrixSession struct {
+	ID           string `json:"id"`
+	Date         string `json:"date"`
+	Status       string `json:"status"`
+	PresentCount int    `json:"present_count"`
+	TotalKasKok  int64  `json:"total_kas_kok"`
+}
+
+type MatrixMemberRow struct {
+	PlayerID             string            `json:"player_id"`
+	PlayerName           string            `json:"player_name"`
+	CommitmentFee        int64             `json:"commitment_fee"`
+	CommitmentPaid       bool              `json:"commitment_paid"`
+	CommitmentAmountPaid int64             `json:"commitment_amount_paid"`
+	Attendances          map[string]string `json:"attendances"`
+	PresentCount         int               `json:"present_count"`
+}
+
+type MatrixNonMemberRow struct {
+	SessionID  string `json:"session_id"`
+	PlayerID   string `json:"player_id"`
+	PlayerName string `json:"player_name"`
+	Fee        int64  `json:"fee"`
+	Paid       bool   `json:"paid"`
+	Note       string `json:"note"`
+}
+
+// AttendanceMatrix aggregates attendance and kas kok data across all sessions
+// of a period for each active member, producing a matrix table matching the
+// club's weekly member recap spreadsheet.
+func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	p, err := s.fetch(r, id)
+	if err != nil {
+		httpx.WriteAppError(w, err)
+		return
+	}
+
+	// 1. Fetch all sessions for this period ordered by date
+	srows, err := s.db.Query(r.Context(), `
+		SELECT id::text, date::text, status
+		FROM mabar_sessions
+		WHERE period_id = $1
+		ORDER BY date ASC, created_at ASC`, id)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load period sessions.")
+		return
+	}
+	defer srows.Close()
+
+	sessions := []MatrixSession{}
+	sessionMap := map[string]int{}
+	for srows.Next() {
+		var ms MatrixSession
+		if err := srows.Scan(&ms.ID, &ms.Date, &ms.Status); err == nil {
+			sessionMap[ms.ID] = len(sessions)
+			sessions = append(sessions, ms)
+		}
+	}
+	srows.Close()
+
+	// 2. Fetch active members for this period
+	mrows, err := s.db.Query(r.Context(), `
+		SELECT m.player_id::text, pl.name, m.commitment_fee
+		FROM memberships m
+		JOIN players pl ON pl.id = m.player_id
+		WHERE m.period_id = $1 AND m.status <> 'WITHDRAWN'
+		ORDER BY pl.name ASC`, id)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load members.")
+		return
+	}
+	defer mrows.Close()
+
+	rows := []MatrixMemberRow{}
+	memberIndexMap := map[string]int{}
+	for mrows.Next() {
+		var mr MatrixMemberRow
+		if err := mrows.Scan(&mr.PlayerID, &mr.PlayerName, &mr.CommitmentFee); err == nil {
+			mr.Attendances = make(map[string]string)
+			memberIndexMap[mr.PlayerID] = len(rows)
+			rows = append(rows, mr)
+		}
+	}
+	mrows.Close()
+
+	// 3. Fetch commitment payments per member
+	prows, err := s.db.Query(r.Context(), `
+		SELECT player_id::text, COALESCE(SUM(amount), 0)
+		FROM revenues
+		WHERE period_id = $1 AND source = 'COMMITMENT_FEE' AND player_id IS NOT NULL
+		GROUP BY player_id`, id)
+	if err == nil {
+		for prows.Next() {
+			var pid string
+			var sum int64
+			if err := prows.Scan(&pid, &sum); err == nil {
+				if idx, ok := memberIndexMap[pid]; ok {
+					rows[idx].CommitmentAmountPaid = sum
+				}
+			}
+		}
+		prows.Close()
+	}
+
+	for i := range rows {
+		requiredFee := rows[i].CommitmentFee
+		if requiredFee <= 0 {
+			requiredFee = p.CommitmentFee
+		}
+		if requiredFee <= 0 {
+			rows[i].CommitmentPaid = true
+		} else {
+			rows[i].CommitmentPaid = rows[i].CommitmentAmountPaid >= requiredFee
+		}
+	}
+
+	// 4. Fetch attendance records for sessions in this period
+	arows, err := s.db.Query(r.Context(), `
+		SELECT a.session_id::text, a.player_id::text, a.status
+		FROM attendances a
+		JOIN mabar_sessions ms ON ms.id = a.session_id
+		WHERE ms.period_id = $1`, id)
+	if err == nil {
+		for arows.Next() {
+			var sid, pid, status string
+			if err := arows.Scan(&sid, &pid, &status); err == nil {
+				if midx, ok := memberIndexMap[pid]; ok {
+					rows[midx].Attendances[sid] = status
+					if status == "PRESENT" {
+						rows[midx].PresentCount++
+						if sidx, ok := sessionMap[sid]; ok {
+							sessions[sidx].PresentCount++
+						}
+					}
+				}
+			}
+		}
+		arows.Close()
+	}
+
+	// 5. Fetch non-members attending sessions in this period
+	nonMembers := []MatrixNonMemberRow{}
+	nonMemberFee := p.NonMemberFee
+	if nonMemberFee <= 0 {
+		nonMemberFee = 25000
+	}
+	nmRows, err := s.db.Query(r.Context(), `
+		SELECT a.session_id::text, a.player_id::text, pl.name,
+		       COALESCE(b.total, $2),
+		       COALESCE(b.payment_status, 'PAID'),
+		       COALESCE(b.payment_method, a.no_show_reason, '')
+		FROM attendances a
+		JOIN players pl ON pl.id = a.player_id
+		JOIN mabar_sessions ms ON ms.id = a.session_id
+		LEFT JOIN player_bills b ON b.session_id = a.session_id AND b.player_id = a.player_id
+		WHERE ms.period_id = $1 AND (a.is_member = false OR a.player_id NOT IN (
+			SELECT player_id FROM memberships WHERE period_id = $1 AND status <> 'WITHDRAWN'
+		)) AND a.status = 'PRESENT'
+		ORDER BY ms.date ASC, a.listed_at ASC, pl.name ASC`, id, nonMemberFee)
+	if err == nil {
+		for nmRows.Next() {
+			var nm MatrixNonMemberRow
+			var payStatus, payMethod string
+			if err := nmRows.Scan(&nm.SessionID, &nm.PlayerID, &nm.PlayerName, &nm.Fee, &payStatus, &payMethod); err == nil {
+				nm.Paid = payStatus == "PAID"
+				nm.Note = payMethod
+				nonMembers = append(nonMembers, nm)
+			}
+		}
+		nmRows.Close()
+	}
+
+	// 6. Calculate totals
+	var totalLapanganPaid int64
+	for _, m := range rows {
+		totalLapanganPaid += m.CommitmentAmountPaid
+	}
+
+	var totalKasKok int64
+	for i := range sessions {
+		sessions[i].TotalKasKok = int64(sessions[i].PresentCount) * p.MemberContribution
+		totalKasKok += sessions[i].TotalKasKok
+	}
+
+	httpx.OK(w, http.StatusOK, map[string]any{
+		"sessions":            sessions,
+		"rows":                rows,
+		"non_members":         nonMembers,
+		"commitment_fee":      p.CommitmentFee,
+		"member_contribution": p.MemberContribution,
+		"non_member_fee":      p.NonMemberFee,
+		"total_lapangan_paid": totalLapanganPaid,
+		"total_kas_kok":       totalKasKok,
+	})
+}
+

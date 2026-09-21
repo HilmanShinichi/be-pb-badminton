@@ -1,6 +1,8 @@
 package config
 
 import (
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -8,7 +10,12 @@ import (
 
 type Config struct {
 	Port            string
-	DatabaseURL     string
+	DBHost          string
+	DBPort          string
+	DBName          string
+	DBUser          string
+	DBPassword      string
+	DBSSLMode       string
 	JWTSecret       string
 	CORSOrigins     string
 	InactivityMonth int
@@ -37,11 +44,29 @@ func LoadDotEnv(path string) {
 func Load() Config {
 	return Config{
 		Port:            env("PORT", "8080"),
-		DatabaseURL:     env("DATABASE_URL", "postgres://pb:pb@localhost:5432/pb_kecebong?sslmode=disable"),
+		DBHost:          env("DB_HOST", "localhost"),
+		DBPort:          env("DB_PORT", "5432"),
+		DBName:          env("DB_NAME", "pb_kecebong"),
+		DBUser:          env("DB_USER", "pb"),
+		DBPassword:      env("DB_PASSWORD", "pb"),
+		DBSSLMode:       env("DB_SSLMODE", "disable"),
 		JWTSecret:       env("JWT_SECRET", "dev-only-secret"),
 		CORSOrigins:     env("CORS_ORIGINS", "http://localhost:5173"),
 		InactivityMonth: envInt("INACTIVITY_MONTHS", 6),
 	}
+}
+
+func (c Config) DatabaseConnectionString() string {
+	databaseURL := url.URL{
+		Scheme: "postgres",
+		Host:   net.JoinHostPort(c.DBHost, c.DBPort),
+		Path:   c.DBName,
+		User:   url.UserPassword(c.DBUser, c.DBPassword),
+	}
+	query := databaseURL.Query()
+	query.Set("sslmode", c.DBSSLMode)
+	databaseURL.RawQuery = query.Encode()
+	return databaseURL.String()
 }
 
 func env(key, fallback string) string {

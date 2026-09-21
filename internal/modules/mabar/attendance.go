@@ -60,12 +60,14 @@ type attendanceInput struct {
 	NoShowReason           *string `json:"no_show_reason"`
 }
 
+// SeedMembers inserts every active period member as PRESENT without
+// touching rows that already exist (late joiners appear, manual ABSENT
+// marks stay), so the admin marks exceptions instead of every player.
 type bulkAttendanceInput struct {
-	Players []attendanceInput `json:"players"`
-	// PresentAll flips every current LISTED/CONFIRMED entry to PRESENT first,
-	// so the admin marks exceptions instead of every player. PRD §54.
-	PresentAll bool              `json:"present_all"`
-	Overrides  []attendanceInput `json:"overrides"`
+	Players     []attendanceInput `json:"players"`
+	PresentAll  bool              `json:"present_all"`
+	SeedMembers bool              `json:"seed_members"`
+	Overrides   []attendanceInput `json:"overrides"`
 }
 
 // SetAttendance upserts the full attendance sheet of one session in one call.
@@ -103,6 +105,19 @@ func (s *Service) SetAttendance(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec(r.Context(), `
 			UPDATE attendances SET status = 'PRESENT'
 			WHERE session_id = $1 AND status IN ('LISTED', 'CONFIRMED')`, id); err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
+			return
+		}
+	}
+
+	if in.SeedMembers && sess.PeriodID != nil {
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO attendances (id, session_id, player_id, status, is_member)
+			SELECT gen_random_uuid(), $1, m.player_id, 'PRESENT', true
+			FROM memberships m
+			JOIN players pl ON pl.id = m.player_id
+			WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'
+			ON CONFLICT (session_id, player_id) DO NOTHING`, id, *sess.PeriodID); err != nil {
 			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 			return
 		}

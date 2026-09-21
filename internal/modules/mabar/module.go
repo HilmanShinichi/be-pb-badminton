@@ -201,7 +201,13 @@ func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var newID string
-	err := s.db.QueryRow(r.Context(), `
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	err = tx.QueryRow(r.Context(), `
 		INSERT INTO mabar_sessions
 		(id, type, period_id, venue_id, date, start_time, end_time, duration_minutes,
 		 description, venue_description, court_cost, pricing_mode, shuttlecock_price,
@@ -215,6 +221,24 @@ func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
 		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12)).Scan(&newID)
 	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
+		return
+	}
+	// Period sessions start with every active member already PRESENT —
+	// the admin then only marks whoever didn't show up.
+	if in.PeriodID != nil {
+		if _, err := tx.Exec(r.Context(), `
+			INSERT INTO attendances (id, session_id, player_id, status, is_member)
+			SELECT gen_random_uuid(), $1, m.player_id, 'PRESENT', true
+			FROM memberships m
+			JOIN players pl ON pl.id = m.player_id
+			WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'`,
+			newID, *in.PeriodID); err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
 		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 		return
 	}

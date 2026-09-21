@@ -36,12 +36,18 @@ func ParseToken(secret, raw string) (*Claims, error) {
 func RequireAuth(secret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			tokenStr := ""
 			header := r.Header.Get("Authorization")
-			if !strings.HasPrefix(header, "Bearer ") {
+			if strings.HasPrefix(header, "Bearer ") {
+				tokenStr = strings.TrimPrefix(header, "Bearer ")
+			} else if qToken := r.URL.Query().Get("token"); qToken != "" {
+				tokenStr = qToken
+			}
+			if tokenStr == "" {
 				Err(w, http.StatusUnauthorized, "UNAUTHORIZED", "Login is required.")
 				return
 			}
-			claims, err := ParseToken(secret, strings.TrimPrefix(header, "Bearer "))
+			claims, err := ParseToken(secret, tokenStr)
 			if err != nil {
 				Err(w, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid session.")
 				return
