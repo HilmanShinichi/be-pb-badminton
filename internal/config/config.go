@@ -19,6 +19,10 @@ type Config struct {
 	JWTSecret       string
 	CORSOrigins     string
 	InactivityMonth int
+	AIProvider      string
+	AIModel         string
+	AIBaseURL       string
+	AIAPIKey        string
 }
 
 // LoadDotEnv reads KEY=VALUE lines from path into the environment. Existing
@@ -53,6 +57,10 @@ func Load() Config {
 		JWTSecret:       env("JWT_SECRET", "dev-only-secret"),
 		CORSOrigins:     env("CORS_ORIGINS", "http://localhost:5173"),
 		InactivityMonth: envInt("INACTIVITY_MONTHS", 6),
+		AIProvider:      env("AI_PROVIDER", "openai"),
+		AIModel:         env("AI_MODEL", ""),
+		AIBaseURL:       env("AI_BASE_URL", ""),
+		AIAPIKey:        env("AI_API_KEY", ""),
 	}
 }
 

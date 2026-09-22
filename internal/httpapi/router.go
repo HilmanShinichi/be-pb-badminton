@@ -16,6 +16,7 @@ import (
 	financemod "github.com/pb-kecebong/backend/internal/modules/finance"
 	"github.com/pb-kecebong/backend/internal/modules/inventory"
 	"github.com/pb-kecebong/backend/internal/modules/mabar"
+	"github.com/pb-kecebong/backend/internal/modules/matchmaker"
 	"github.com/pb-kecebong/backend/internal/modules/period"
 	"github.com/pb-kecebong/backend/internal/modules/player"
 	"github.com/pb-kecebong/backend/internal/modules/report"
@@ -29,6 +30,7 @@ type Dependencies struct {
 	Finance   *financemod.Service
 	Inventory *inventory.Service
 	Mabar     *mabar.Service
+	MatchMaker *matchmaker.Service
 	Period    *period.Service
 	Player    *player.Service
 	Report    *report.Service
@@ -55,6 +57,10 @@ func NewRouter(deps Dependencies, cfg config.Config) http.Handler {
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/auth/login", deps.Auth.Login)
+
+		// Public live view: no token needed, read-only.
+		r.Get("/public/match-events", deps.MatchMaker.PublicEvents)
+		r.Get("/public/match-events/{id}", deps.MatchMaker.PublicEvent)
 
 		r.Group(func(r chi.Router) {
 			r.Use(httpx.RequireAuth(cfg.JWTSecret))
@@ -110,6 +116,17 @@ func NewRouter(deps Dependencies, cfg config.Config) http.Handler {
 				r.Delete("/{id}", deps.Mabar.DeleteMatch)
 				r.Post("/{id}/players", deps.Mabar.AddMatchPlayer)
 				r.Delete("/{id}/players/{playerId}", deps.Mabar.RemoveMatchPlayer)
+			})
+			r.Route("/match-events", func(r chi.Router) {
+				r.Get("/", deps.MatchMaker.ListEvents)
+				r.Post("/", deps.MatchMaker.CreateEvent)
+				r.Get("/{id}", deps.MatchMaker.GetEvent)
+				r.Patch("/{id}", deps.MatchMaker.UpdateEvent)
+				r.Delete("/{id}", deps.MatchMaker.DeleteEvent)
+				r.Post("/{id}/generate", deps.MatchMaker.Generate)
+			})
+			r.Route("/generated-matches", func(r chi.Router) {
+				r.Patch("/{id}", deps.MatchMaker.UpdateMatch)
 			})
 			r.Route("/inventory/shuttlecock", func(r chi.Router) {
 				r.Get("/", deps.Inventory.ListProducts)

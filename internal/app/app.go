@@ -16,6 +16,7 @@ import (
 	financemod "github.com/pb-kecebong/backend/internal/modules/finance"
 	"github.com/pb-kecebong/backend/internal/modules/inventory"
 	"github.com/pb-kecebong/backend/internal/modules/mabar"
+	"github.com/pb-kecebong/backend/internal/modules/matchmaker"
 	"github.com/pb-kecebong/backend/internal/modules/period"
 	"github.com/pb-kecebong/backend/internal/modules/player"
 	"github.com/pb-kecebong/backend/internal/modules/report"
@@ -48,6 +49,7 @@ func Run(cfg config.Config) {
 		Finance:   financemod.NewService(pool),
 		Inventory: inventory.NewService(pool),
 		Mabar:     mabar.NewService(pool),
+		MatchMaker: matchmaker.NewService(pool, cfg),
 		Period:    period.NewService(pool),
 		Player:    player.NewService(pool),
 		Report:    report.NewService(pool),

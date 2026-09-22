@@ -22,6 +22,8 @@ type Player struct {
 	Phone     *string `json:"phone"`
 	Notes     *string `json:"notes"`
 	Status    string  `json:"status"`
+	Grade     *string `json:"grade"`
+	Gender    *string `json:"gender"`
 	CreatedAt string  `json:"created_at"`
 }
 
@@ -30,6 +32,70 @@ type playerInput struct {
 	Phone  *string `json:"phone"`
 	Notes  *string `json:"notes"`
 	Status *string `json:"status"`
+	Grade  *string `json:"grade"`
+	Gender *string `json:"gender"`
+}
+
+// validGrades: mains A, B, C with sub-grades 1-3. Lower number is superior
+// within a main (A1 outranks A2).
+var validGrades = map[string]bool{
+	"A1": true, "A2": true, "A3": true,
+	"B1": true, "B2": true, "B3": true,
+	"C1": true, "C2": true, "C3": true,
+}
+
+// GradeRank orders grades for balanced-team generation: A1 strongest.
+func GradeRank(g string) int {
+	switch g {
+	case "A1":
+		return 1
+	case "A2":
+		return 2
+	case "A3":
+		return 3
+	case "B1":
+		return 4
+	case "B2":
+		return 5
+	case "B3":
+		return 6
+	case "C1":
+		return 7
+	case "C2":
+		return 8
+	case "C3":
+		return 9
+	}
+	return 99
+}
+
+func normalizeGrade(in *string) (*string, error) {
+	if in == nil {
+		return nil, nil
+	}
+	g := strings.ToUpper(strings.TrimSpace(*in))
+	if g == "" {
+		return nil, nil
+	}
+	if !validGrades[g] {
+		return nil, httpx.Unprocessable("Invalid grade. Use A1-A3, B1-B3, or C1-C3.")
+	}
+	return &g, nil
+}
+
+// normalizeGender accepts only L (male) or P (female); empty clears to NULL.
+func normalizeGender(in *string) (*string, error) {
+	if in == nil {
+		return nil, nil
+	}
+	g := strings.ToUpper(strings.TrimSpace(*in))
+	if g == "" {
+		return nil, nil
+	}
+	if g != "L" && g != "P" {
+		return nil, httpx.Unprocessable("Invalid gender. Use L or P.")
+	}
+	return &g, nil
 }
 
 func (s *Service) List(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +108,7 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 	}
 	offset, _ := strconv.Atoi(q.Get("offset"))
 
-	sql := `SELECT id::text, name, phone, notes, status, created_at::text
+	sql := `SELECT id::text, name, phone, notes, status, grade, gender, created_at::text
 		FROM players WHERE status <> 'ARCHIVED'`
 	args := []any{}
 	if search != "" {
@@ -65,7 +131,7 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 	players := []Player{}
 	for rows.Next() {
 		var p Player
-		if err := rows.Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.CreatedAt); err == nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt); err == nil {
 			players = append(players, p)
 		}
 	}
@@ -80,8 +146,8 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	}
 	var p Player
 	err := s.db.QueryRow(r.Context(),
-		`SELECT id::text, name, phone, notes, status, created_at::text FROM players WHERE id = $1`, id,
-	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.CreatedAt)
+		`SELECT id::text, name, phone, notes, status, grade, gender, created_at::text FROM players WHERE id = $1`, id,
+	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt)
 	if err != nil {
 		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
 		return
@@ -96,6 +162,16 @@ func (s *Service) validate(in playerInput) error {
 	if in.Status != nil && !map[string]bool{"ACTIVE": true, "INACTIVE": true, "ARCHIVED": true}[*in.Status] {
 		return httpx.Unprocessable("Invalid player status.")
 	}
+	if in.Grade != nil {
+		if _, err := normalizeGrade(in.Grade); err != nil {
+			return err
+		}
+	}
+	if in.Gender != nil {
+		if _, err := normalizeGender(in.Gender); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -109,12 +185,14 @@ func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteAppError(w, err)
 		return
 	}
+	grade, _ := normalizeGrade(in.Grade)
+	gender, _ := normalizeGender(in.Gender)
 	var p Player
 	err := s.db.QueryRow(r.Context(),
-		`INSERT INTO players (id, name, phone, notes) VALUES (gen_random_uuid(), $1, $2, $3)
-		 RETURNING id::text, name, phone, notes, status, created_at::text`,
-		strings.TrimSpace(*in.Name), in.Phone, in.Notes,
-	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.CreatedAt)
+		`INSERT INTO players (id, name, phone, notes, grade, gender) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+		 RETURNING id::text, name, phone, notes, status, grade, gender, created_at::text`,
+		strings.TrimSpace(*in.Name), in.Phone, in.Notes, grade, gender,
+	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt)
 	if err != nil {
 		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save player.")
 		return
@@ -137,14 +215,31 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteAppError(w, err)
 		return
 	}
+	grade, _ := normalizeGrade(in.Grade)
+	gender, _ := normalizeGender(in.Gender)
+	// Re-assigning the grade the player already holds is rejected so
+	// duplicate grade assignments surface as an explicit error.
+	if grade != nil {
+		var current *string
+		if err := s.db.QueryRow(r.Context(),
+			`SELECT grade FROM players WHERE id = $1`, id).Scan(&current); err != nil {
+			httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
+			return
+		}
+		if current != nil && *current == *grade {
+			httpx.WriteAppError(w, httpx.Conflict("GRADE_EXISTS",
+				"Player already has grade "+*grade+"."))
+			return
+		}
+	}
 	var p Player
 	err := s.db.QueryRow(r.Context(),
 		`UPDATE players SET name = $2, phone = $3, notes = $4,
-		 status = COALESCE($5, status), updated_at = now()
+		 status = COALESCE($5, status), grade = COALESCE($6, grade), gender = COALESCE($7, gender), updated_at = now()
 		 WHERE id = $1
-		 RETURNING id::text, name, phone, notes, status, created_at::text`,
-		id, strings.TrimSpace(*in.Name), in.Phone, in.Notes, in.Status,
-	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.CreatedAt)
+		 RETURNING id::text, name, phone, notes, status, grade, gender, created_at::text`,
+		id, strings.TrimSpace(*in.Name), in.Phone, in.Notes, in.Status, grade, gender,
+	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt)
 	if err != nil {
 		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
 		return

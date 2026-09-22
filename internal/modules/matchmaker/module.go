@@ -1,0 +1,761 @@
+package matchmaker
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/pb-kecebong/backend/internal/config"
+	"github.com/pb-kecebong/backend/internal/httpx"
+)
+
+type Service struct {
+	db  *pgxpool.Pool
+	cfg config.Config
+}
+
+func NewService(db *pgxpool.Pool, cfg config.Config) *Service { return &Service{db: db, cfg: cfg} }
+
+var validStatuses = map[string]bool{"UPCOMING": true, "PLAYING": true, "ENDED": true}
+
+// TeamPlayer is one side member stored as an object so names/grades stay
+// editable and readable after generation.
+type TeamPlayer struct {
+	PlayerID string  `json:"player_id"`
+	Name     string  `json:"name"`
+	Grade    *string `json:"grade"`
+	Gender   *string `json:"gender"`
+}
+
+type GenMatch struct {
+	ID             string       `json:"id"`
+	EventID        string       `json:"event_id"`
+	Round          int          `json:"round"`
+	Team1          []TeamPlayer `json:"team1"`
+	Team2          []TeamPlayer `json:"team2"`
+	Status         string       `json:"status"`
+	Court          int          `json:"court"`
+	StartedAt      *string      `json:"started_at"`
+	EndedAt        *string      `json:"ended_at"`
+	ShuttlecockUsed int         `json:"shuttlecock_used"`
+	CreatedAt      string       `json:"created_at"`
+	UpdatedAt      string       `json:"updated_at"`
+}
+
+type MatchEvent struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Status     string   `json:"status"`
+	CourtCount int      `json:"court_count"`
+	IsPublic   bool     `json:"is_public"`
+	ShowGrades bool     `json:"show_grades"`
+	PlayerIDs  []string `json:"player_ids"`
+	CreatedAt  string   `json:"created_at"`
+}
+
+type PlayerCount struct {
+	PlayerID string  `json:"player_id"`
+	Name     string  `json:"name"`
+	Grade    *string `json:"grade"`
+	Gender   *string `json:"gender"`
+	Arrival  int     `json:"arrival"`
+	Played   int     `json:"played"`
+}
+
+func parseTeam(raw string) []TeamPlayer {
+	team := []TeamPlayer{}
+	if raw == "" || raw == "null" {
+		return team
+	}
+	_ = json.Unmarshal([]byte(raw), &team)
+	if team == nil {
+		team = []TeamPlayer{}
+	}
+	return team
+}
+
+func mustTeamJSON(team []TeamPlayer) string {
+	b, _ := json.Marshal(team)
+	return string(b)
+}
+
+type poolPlayer struct {
+	ID     string
+	Name   string
+	Grade  *string
+	Gender *string
+}
+
+func (s *Service) pool(ctx context.Context, eventID string) ([]poolPlayer, error) {
+	var idsRaw string
+	if err := s.db.QueryRow(ctx,
+		`SELECT player_ids::text FROM match_events WHERE id = $1`, eventID).Scan(&idsRaw); err != nil {
+		return nil, err
+	}
+	var ids []string
+	_ = json.Unmarshal([]byte(idsRaw), &ids)
+	if len(ids) == 0 {
+		return []poolPlayer{}, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT id::text, name, grade, gender FROM players WHERE id::text = ANY($1) AND status = 'ACTIVE'
+		 ORDER BY array_position($1, id::text)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	pool := []poolPlayer{}
+	for rows.Next() {
+		var p poolPlayer
+		if err := rows.Scan(&p.ID, &p.Name, &p.Grade, &p.Gender); err == nil {
+			pool = append(pool, p)
+		}
+	}
+	return pool, nil
+}
+
+func (s *Service) resolveTeams(pool []poolPlayer, t1, t2 []string) ([]TeamPlayer, []TeamPlayer, error) {
+	byID := map[string]poolPlayer{}
+	for _, p := range pool {
+		byID[p.ID] = p
+	}
+	build := func(ids []string) ([]TeamPlayer, error) {
+		if len(ids) != 2 {
+			return nil, httpx.Unprocessable("Each side must have exactly 2 players.")
+		}
+		if ids[0] == ids[1] {
+			return nil, httpx.Unprocessable("A side cannot list the same player twice.")
+		}
+		team := []TeamPlayer{}
+		for _, id := range ids {
+			p, ok := byID[id]
+			if !ok {
+				return nil, httpx.Unprocessable("Player is not in this event pool.")
+			}
+			team = append(team, TeamPlayer{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender})
+		}
+		// Mixed-doubles rule: a female player (P) must pair with a male (L).
+		for i, t := range team {
+			if t.Gender != nil && *t.Gender == "P" {
+				other := team[1-i]
+				if other.Gender == nil || *other.Gender != "L" {
+					return nil, httpx.Unprocessable(t.Name + " (P) must pair with a male (L) player.")
+				}
+			}
+		}
+		return team, nil
+	}
+	team1, err := build(t1)
+	if err != nil {
+		return nil, nil, err
+	}
+	team2, err := build(t2)
+	if err != nil {
+		return nil, nil, err
+	}
+	return team1, team2, nil
+}
+
+// matchupKey canonicalizes a 2v2 so repeats are detectable regardless of
+// side or within-side ordering.
+func matchupKey(t1, t2 []string) string {
+	a := append([]string{}, t1...)
+	b := append([]string{}, t2...)
+	sort.Strings(a)
+	sort.Strings(b)
+	sides := []string{strings.Join(a, "+"), strings.Join(b, "+")}
+	sort.Strings(sides)
+	return strings.Join(sides, " vs ")
+}
+
+func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id::text, event_id::text, round, team1::text, team2::text, status, court,
+		       started_at::text, ended_at::text, shuttlecock_used,
+		       created_at::text, updated_at::text
+		FROM generated_matches WHERE event_id = $1 ORDER BY round, created_at`, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	matches := []GenMatch{}
+	for rows.Next() {
+		var m GenMatch
+		var t1, t2 string
+		if err := rows.Scan(&m.ID, &m.EventID, &m.Round, &t1, &t2, &m.Status, &m.Court,
+			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt); err == nil {
+			m.Team1 = parseTeam(t1)
+			m.Team2 = parseTeam(t2)
+			matches = append(matches, m)
+		}
+	}
+	return matches, nil
+}
+
+// CreateEvent opens a match night. Without player_ids the pool defaults to
+// every active player. court_count caps the court numbers usable on cards
+// (0 = unlimited).
+func (s *Service) CreateEvent(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name       string   `json:"name"`
+		PlayerIDs  []string `json:"player_ids"`
+		CourtCount *int     `json:"court_count"`
+	}
+	if err := httpx.Decode(r, &in); err != nil || strings.TrimSpace(in.Name) == "" {
+		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Event name is required.")
+		return
+	}
+	courts := 0
+	if in.CourtCount != nil {
+		if *in.CourtCount < 0 || *in.CourtCount > 99 {
+			httpx.WriteAppError(w, httpx.Unprocessable("Court count must be between 0 and 99."))
+			return
+		}
+		courts = *in.CourtCount
+	}
+	ids := in.PlayerIDs
+	if len(ids) == 0 {
+		rows, err := s.db.Query(r.Context(), `SELECT id::text FROM players WHERE status = 'ACTIVE' ORDER BY name`)
+		if err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create event.")
+			return
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err == nil {
+				ids = append(ids, id)
+			}
+		}
+		rows.Close()
+	}
+	if len(ids) < 4 {
+		httpx.WriteAppError(w, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles."))
+		return
+	}
+	idsJSON, _ := json.Marshal(ids)
+	var ev MatchEvent
+	var poolRaw string
+	err := s.db.QueryRow(r.Context(), `
+		INSERT INTO match_events (id, name, court_count, player_ids) VALUES (gen_random_uuid(), $1, $2, $3)
+		RETURNING id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text`,
+		strings.TrimSpace(in.Name), courts, string(idsJSON)).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create event.")
+		return
+	}
+	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	httpx.OK(w, http.StatusCreated, ev)
+}
+
+func (s *Service) ListEvents(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+		SELECT e.id::text, e.name, e.status, e.court_count, e.is_public, e.created_at::text,
+		       COALESCE(jsonb_array_length(e.player_ids), 0),
+		       COUNT(m.id)
+		FROM match_events e
+		LEFT JOIN generated_matches m ON m.event_id = e.id
+		GROUP BY e.id ORDER BY e.created_at DESC`)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load events.")
+		return
+	}
+	defer rows.Close()
+	type row struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		CourtCount int    `json:"court_count"`
+		IsPublic   bool   `json:"is_public"`
+		CreatedAt  string `json:"created_at"`
+		Players    int    `json:"players"`
+		Matches    int    `json:"matches"`
+	}
+	list := []row{}
+	for rows.Next() {
+		var t row
+		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CourtCount, &t.IsPublic, &t.CreatedAt, &t.Players, &t.Matches); err == nil {
+			list = append(list, t)
+		}
+	}
+	httpx.OK(w, http.StatusOK, list)
+}
+
+// GetEvent returns the event with its matches and per-player play counts.
+// Only ENDED and PLAYING matches count as played; UPCOMING is excluded.
+func (s *Service) GetEvent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var ev MatchEvent
+	var poolRaw string
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text FROM match_events WHERE id = $1`,
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return
+	}
+	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	matches, err := s.listMatches(r.Context(), id)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load matches.")
+		return
+	}
+	pool, err := s.pool(r.Context(), id)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
+		return
+	}
+	played := map[string]int{}
+	for _, m := range matches {
+		if m.Status != "ENDED" && m.Status != "PLAYING" {
+			continue
+		}
+		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+			played[t.PlayerID]++
+		}
+	}
+	arrival := map[string]int{}
+	for i, pid := range ev.PlayerIDs {
+		arrival[pid] = i + 1
+	}
+	counts := []PlayerCount{}
+	for _, p := range pool {
+		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: played[p.ID]})
+	}
+	httpx.OK(w, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
+}
+
+// publicEventDetail loads the read-only payload for the public live page.
+// Non-public events look exactly like missing ones.
+func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent, []GenMatch, []PlayerCount, error) {
+	var ev MatchEvent
+	var poolRaw string
+	if err := s.db.QueryRow(ctx,
+		`SELECT id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text
+		 FROM match_events WHERE id = $1 AND is_public`,
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
+		return ev, nil, nil, err
+	}
+	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	matches, err := s.listMatches(ctx, id)
+	if err != nil {
+		return ev, nil, nil, err
+	}
+	pool, err := s.pool(ctx, id)
+	if err != nil {
+		return ev, nil, nil, err
+	}
+	if !ev.ShowGrades {
+		for i := range matches {
+			for j := range matches[i].Team1 {
+				matches[i].Team1[j].Grade = nil
+			}
+			for j := range matches[i].Team2 {
+				matches[i].Team2[j].Grade = nil
+			}
+		}
+	}
+	played := map[string]int{}
+	for _, m := range matches {
+		if m.Status != "ENDED" && m.Status != "PLAYING" {
+			continue
+		}
+		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+			played[t.PlayerID]++
+		}
+	}
+	arrival := map[string]int{}
+	for i, pid := range ev.PlayerIDs {
+		arrival[pid] = i + 1
+	}
+	counts := []PlayerCount{}
+	for _, p := range pool {
+		grade := p.Grade
+		if !ev.ShowGrades {
+			grade = nil
+		}
+		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: played[p.ID]})
+	}
+	// Pool ids are an admin concern; the public payload carries names only.
+	ev.PlayerIDs = []string{}
+	return ev, matches, counts, nil
+}
+
+// PublicEvents lists events flagged public — the live index.
+func (s *Service) PublicEvents(w http.ResponseWriter, r *http.Request) {
+	rows, err := s.db.Query(r.Context(), `
+		SELECT e.id::text, e.name, e.created_at::text, COUNT(m.id)
+		FROM match_events e
+		LEFT JOIN generated_matches m ON m.event_id = e.id
+		WHERE e.is_public
+		GROUP BY e.id ORDER BY e.created_at DESC`)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load events.")
+		return
+	}
+	defer rows.Close()
+	type row struct {
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		CreatedAt string `json:"created_at"`
+		Matches   int    `json:"matches"`
+	}
+	list := []row{}
+	for rows.Next() {
+		var t row
+		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.Matches); err == nil {
+			list = append(list, t)
+		}
+	}
+	httpx.OK(w, http.StatusOK, list)
+}
+
+// PublicEvent is the read-only live view of one public event.
+func (s *Service) PublicEvent(w http.ResponseWriter, r *http.Request) {
+	ev, matches, counts, err := s.publicEventDetail(r.Context(), chi.URLParam(r, "id"))
+	if err != nil {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return
+	}
+	httpx.OK(w, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
+}
+
+// Generate asks the AI for balanced rounds, validates every matchup (2v2,
+// pool members, one appearance per player per round, no repeat of any
+// previous matchup in this event), and stores them as UPCOMING.
+func (s *Service) Generate(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		Rounds int `json:"rounds"`
+	}
+	_ = httpx.Decode(r, &in)
+	if in.Rounds <= 0 {
+		in.Rounds = 1
+	}
+	if in.Rounds > 5 {
+		httpx.WriteAppError(w, httpx.Unprocessable("Generate at most 5 rounds at a time."))
+		return
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
+		return
+	}
+	pool, err := s.pool(r.Context(), id)
+	if err != nil {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return
+	}
+	if len(pool) < 4 {
+		httpx.WriteAppError(w, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles."))
+		return
+	}
+	matches, err := s.listMatches(r.Context(), id)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load history.")
+		return
+	}
+	aiPlayers := []aiPlayer{}
+	for i, p := range pool {
+		aiPlayers = append(aiPlayers, aiPlayer{ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
+	}
+	history := []aiHistoryMatch{}
+	seen := map[string]bool{}
+	maxRound := 0
+	for _, m := range matches {
+		names := func(team []TeamPlayer) []string {
+			out := []string{}
+			for _, t := range team {
+				out = append(out, t.Name)
+			}
+			return out
+		}
+		history = append(history, aiHistoryMatch{Round: m.Round, Team1: names(m.Team1), Team2: names(m.Team2)})
+		ids := []string{}
+		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+			ids = append(ids, t.PlayerID)
+		}
+		seen[matchupKey(ids[:2], ids[2:])] = true
+		if m.Round > maxRound {
+			maxRound = m.Round
+		}
+	}
+
+	// One AI call per round: small responses stay valid JSON, and every
+	// earlier round (existing or generated just now) joins the history of the
+	// next call, so nothing repeats. Nothing is stored until all rounds
+	// validate — existing rounds are never touched.
+	type pending struct {
+		round       int
+		team1, team2 []TeamPlayer
+	}
+	pendings := []pending{}
+	for i := 0; i < in.Rounds; i++ {
+		roundNo := maxRound + i + 1
+		var aiRounds []aiRound
+		var genErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			aiRounds, genErr = generateMatchups(r.Context(), s.cfg, aiPlayers, history, 1)
+			if genErr == nil && len(aiRounds) > 0 && len(aiRounds[0].Matches) > 0 {
+				break
+			}
+			if genErr == nil {
+				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
+			}
+		}
+		if genErr != nil {
+			httpx.WriteAppError(w, genErr)
+			return
+		}
+		used := map[string]bool{}
+		for _, mu := range aiRounds[0].Matches {
+			if len(mu.Team1) != 2 || len(mu.Team2) != 2 {
+				httpx.WriteAppError(w, httpx.Unprocessable("AI returned a non-2v2 matchup. Try generating again."))
+				return
+			}
+			t1, t2, err := s.resolveTeams(pool, mu.Team1, mu.Team2)
+			if err != nil {
+				httpx.WriteAppError(w, httpx.Unprocessable("AI used players outside this event ("+err.Error()+"). Try generating again."))
+				return
+			}
+			for _, pid := range append(append([]string{}, mu.Team1...), mu.Team2...) {
+				if used[pid] {
+					httpx.WriteAppError(w, httpx.Unprocessable("AI listed a player twice in one round. Try generating again."))
+					return
+				}
+				used[pid] = true
+			}
+			key := matchupKey(mu.Team1, mu.Team2)
+			if seen[key] {
+				httpx.WriteAppError(w, httpx.Unprocessable("AI repeated a previous matchup. Try generating again."))
+				return
+			}
+			seen[key] = true
+			pendings = append(pendings, pending{round: roundNo, team1: t1, team2: t2})
+		}
+		// Newly accepted matchups join the history for the next round call.
+		for _, p := range pendings {
+			if p.round != roundNo {
+				continue
+			}
+			history = append(history, aiHistoryMatch{
+				Round: p.round,
+				Team1: []string{p.team1[0].Name, p.team1[1].Name},
+				Team2: []string{p.team2[0].Name, p.team2[1].Name},
+			})
+		}
+	}
+	if len(pendings) == 0 {
+		httpx.WriteAppError(w, httpx.Unprocessable("AI returned no usable matchups. Try generating again."))
+		return
+	}
+	tx, err := s.db.Begin(r.Context())
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	saved := []GenMatch{}
+	for _, p := range pendings {
+		var m GenMatch
+		var t1, t2 string
+		err := tx.QueryRow(r.Context(), `
+			INSERT INTO generated_matches (id, event_id, round, team1, team2, status)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, 'UPCOMING')
+			RETURNING id::text, event_id::text, round, team1::text, team2::text, status, court,
+			          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
+			id, p.round, mustTeamJSON(p.team1), mustTeamJSON(p.team2),
+		).Scan(&m.ID, &m.EventID, &m.Round, &t1, &t2, &m.Status, &m.Court,
+			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
+		if err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
+			return
+		}
+		m.Team1 = parseTeam(t1)
+		m.Team2 = parseTeam(t2)
+		saved = append(saved, m)
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
+		return
+	}
+	httpx.OK(w, http.StatusCreated, saved)
+}
+
+// UpdateMatch edits teams (by player ids, resolved to fresh name/grade
+// snapshots), the court number, and/or advances the status. Court is locked
+// once the match has ENDED.
+func (s *Service) UpdateMatch(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		Team1           []string `json:"team1"`
+		Team2           []string `json:"team2"`
+		Status          *string  `json:"status"`
+		Court           *int     `json:"court"`
+		ShuttlecockUsed *int     `json:"shuttlecock_used"`
+	}
+	if err := httpx.Decode(r, &in); err != nil {
+		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+		return
+	}
+	var eventID, status, t1raw, t2raw string
+	var court, courtCap, cocks int
+	if err := s.db.QueryRow(r.Context(),
+		`SELECT m.event_id::text, m.status, m.team1::text, m.team2::text, m.court, e.court_count, m.shuttlecock_used
+		 FROM generated_matches m JOIN match_events e ON e.id = m.event_id WHERE m.id = $1`,
+		id).Scan(&eventID, &status, &t1raw, &t2raw, &court, &courtCap, &cocks); err != nil {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Match not found.")
+		return
+	}
+	prevStatus := status
+	if in.Status != nil {
+		st := strings.ToUpper(strings.TrimSpace(*in.Status))
+		if !validStatuses[st] {
+			httpx.WriteAppError(w, httpx.Unprocessable("Invalid status. Use UPCOMING, PLAYING, or ENDED."))
+			return
+		}
+		status = st
+	}
+	// Timer follows the status: PLAYING starts it (first time), ENDED stops
+	// it, reopening from ENDED resets it so replaying starts from 00:00.
+	startTimer := status == "PLAYING" && prevStatus != "PLAYING"
+	stopTimer := status == "ENDED"
+	clearStop := prevStatus == "ENDED" && status != "ENDED"
+	resetTimer := prevStatus == "ENDED" && status != "ENDED"
+	if in.ShuttlecockUsed != nil {
+		if prevStatus == "ENDED" {
+			httpx.WriteAppError(w, httpx.Unprocessable("Shuttlecock count is locked once the match has ended."))
+			return
+		}
+		if *in.ShuttlecockUsed < 0 || *in.ShuttlecockUsed > 999 {
+			httpx.WriteAppError(w, httpx.Unprocessable("Shuttlecock count must be between 0 and 999."))
+			return
+		}
+		cocks = *in.ShuttlecockUsed
+	}
+	if in.Court != nil {
+		if prevStatus == "ENDED" {
+			httpx.WriteAppError(w, httpx.Unprocessable("Court is locked once the match has ended."))
+			return
+		}
+		maxCourt := 99
+		if courtCap > 0 {
+			maxCourt = courtCap
+		}
+		if *in.Court < 0 || *in.Court > maxCourt {
+			httpx.WriteAppError(w, httpx.Unprocessable(
+				"Court must be between 0 and "+strconv.Itoa(maxCourt)+" for this event."))
+			return
+		}
+		court = *in.Court
+	}
+	team1 := parseTeam(t1raw)
+	team2 := parseTeam(t2raw)
+	if in.Team1 != nil || in.Team2 != nil {
+		pool, err := s.pool(r.Context(), eventID)
+		if err != nil {
+			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
+			return
+		}
+		cur1, cur2 := idsOf(team1), idsOf(team2)
+		if in.Team1 != nil {
+			cur1 = in.Team1
+		}
+		if in.Team2 != nil {
+			cur2 = in.Team2
+		}
+		t1, t2, err := s.resolveTeams(pool, cur1, cur2)
+		if err != nil {
+			httpx.WriteAppError(w, err)
+			return
+		}
+		team1, team2 = t1, t2
+	}
+	var m GenMatch
+	var t1, t2 string
+	err := s.db.QueryRow(r.Context(), `
+		UPDATE generated_matches
+		SET team1 = $2, team2 = $3, status = $4, court = $5, shuttlecock_used = $6,
+		    started_at = CASE WHEN $10 THEN NULL WHEN $7 AND started_at IS NULL THEN now() ELSE started_at END,
+		    ended_at = CASE WHEN $8 THEN now() WHEN $9 THEN NULL ELSE ended_at END,
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING id::text, event_id::text, round, team1::text, team2::text, status, court,
+		          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
+		id, mustTeamJSON(team1), mustTeamJSON(team2), status, court, cocks,
+		startTimer, stopTimer, clearStop, resetTimer,
+	).Scan(&m.ID, &m.EventID, &m.Round, &t1, &t2, &m.Status, &m.Court,
+		&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
+	if err != nil {
+		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
+		return
+	}
+	m.Team1 = parseTeam(t1)
+	m.Team2 = parseTeam(t2)
+	httpx.OK(w, http.StatusOK, m)
+}
+
+func idsOf(team []TeamPlayer) []string {
+	ids := []string{}
+	for _, t := range team {
+		ids = append(ids, t.PlayerID)
+	}
+	return ids
+}
+
+// UpdateEvent renames the event or changes its court cap and public flags.
+func (s *Service) UpdateEvent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		Name       *string `json:"name"`
+		CourtCount *int    `json:"court_count"`
+		IsPublic   *bool   `json:"is_public"`
+		ShowGrades *bool   `json:"show_grades"`
+	}
+	if err := httpx.Decode(r, &in); err != nil {
+		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+		return
+	}
+	if in.Name != nil && strings.TrimSpace(*in.Name) == "" {
+		httpx.WriteAppError(w, httpx.Unprocessable("Event name must not be empty."))
+		return
+	}
+	if in.CourtCount != nil && (*in.CourtCount < 0 || *in.CourtCount > 99) {
+		httpx.WriteAppError(w, httpx.Unprocessable("Court count must be between 0 and 99."))
+		return
+	}
+	var ev MatchEvent
+	var poolRaw string
+	err := s.db.QueryRow(r.Context(), `
+		UPDATE match_events
+		SET name = COALESCE(NULLIF(TRIM(COALESCE($2, '')), ''), name),
+		    court_count = COALESCE($3, court_count),
+		    is_public = COALESCE($4, is_public),
+		    show_grades = COALESCE($5, show_grades),
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text`,
+		id, in.Name, in.CourtCount, in.IsPublic, in.ShowGrades,
+	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+	if err != nil {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return
+	}
+	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	httpx.OK(w, http.StatusOK, ev)
+}
+
+// DeleteEvent removes the event and all its generated matches.
+func (s *Service) DeleteEvent(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	tag, err := s.db.Exec(r.Context(), `DELETE FROM match_events WHERE id = $1`, id)
+	if err != nil || tag.RowsAffected() == 0 {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return
+	}
+	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+}
