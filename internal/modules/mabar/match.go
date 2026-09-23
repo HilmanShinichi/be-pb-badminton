@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
 	"github.com/pb-kecebong/backend/internal/domain/finance"
@@ -26,16 +26,15 @@ type Matches struct {
 const matchCols = `m.id::text, m.session_id::text, m.court_id::text, m.sequence,
 	m.started_at::text, m.ended_at::text, m.shuttlecock_used`
 
-func (s *Service) ListMatches(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) ListMatches(c *fiber.Ctx) error {
+	id := c.Params("id")
+	rows, err := s.db.Query(c.Context(), `
 		SELECT `+matchCols+`, COALESCE(
 			(SELECT array_agg(mp.player_id::text) FROM match_players mp
 			 WHERE mp.match_id = m.id), '{}')
 		FROM matches m WHERE m.session_id = $1 ORDER BY m.sequence`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load matches.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load matches.")
 	}
 	defer rows.Close()
 	matches := []Matches{}
@@ -46,7 +45,7 @@ func (s *Service) ListMatches(w http.ResponseWriter, r *http.Request) {
 			matches = append(matches, m)
 		}
 	}
-	httpx.OK(w, http.StatusOK, matches)
+	return httpx.OK(c, http.StatusOK, matches)
 }
 
 type matchInput struct {
@@ -71,29 +70,25 @@ func (in matchInput) validate() error {
 
 // CreateMatch also writes the inventory USAGE transaction so stock always
 // moves with match data; total usage is derived, never re-entered. PRD §56.
-func (s *Service) CreateMatch(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	sess, err := s.fetch(r, id)
+func (s *Service) CreateMatch(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	var in matchInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := in.validate(); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	used := 0
 	if in.ShuttlecockUsed != nil {
@@ -104,27 +99,24 @@ func (s *Service) CreateMatch(w http.ResponseWriter, r *http.Request) {
 		seq = *in.Sequence
 	}
 	var matchID string
-	err = tx.QueryRow(r.Context(), `
+	err = tx.QueryRow(c.Context(), `
 		INSERT INTO matches (id, session_id, court_id, sequence, shuttlecock_used)
 		VALUES (gen_random_uuid(), $1, $2,
 		        COALESCE($3::int, (SELECT COALESCE(MAX(sequence), 0) + 1 FROM matches WHERE session_id = $1)),
 		        $4)
 		RETURNING id::text`, id, in.CourtID, nullableInt(seq), used).Scan(&matchID)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
 	}
 	for _, p := range in.Players {
 		if _, err := uuid.Parse(p.PlayerID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
 		}
-		if _, err := tx.Exec(r.Context(),
+		if _, err := tx.Exec(c.Context(),
 			`INSERT INTO match_players (match_id, player_id, team) VALUES ($1, $2, $3)
 			 ON CONFLICT (match_id, player_id) DO UPDATE SET team = EXCLUDED.team`,
 			matchID, p.PlayerID, p.Team); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match players.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match players.")
 		}
 	}
 	if used > 0 {
@@ -133,8 +125,8 @@ func (s *Service) CreateMatch(w http.ResponseWriter, r *http.Request) {
 		// explicitly via shuttle allocation (which supports splits).
 		covered := false
 		coverProduct := ""
-		if productID, err := pickUsageProduct(r.Context(), tx, sess.Type); err == nil {
-			if name, stock, serr := productStock(r.Context(), tx, productID); serr != nil {
+		if productID, err := pickUsageProduct(c.Context(), tx, sess.Type); err == nil {
+			if name, stock, serr := productStock(c.Context(), tx, productID); serr != nil {
 				covered = true
 				coverProduct = productID
 			} else if err := checkStockFit(name, stock, 0, int64(used)); err == nil {
@@ -143,87 +135,78 @@ func (s *Service) CreateMatch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if covered {
-			if _, err := tx.Exec(r.Context(), `
+			if _, err := tx.Exec(c.Context(), `
 				DELETE FROM shuttlecock_transactions WHERE match_id = $1`, matchID); err != nil {
-				httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
-				return
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
 			}
-			if _, err := tx.Exec(r.Context(), `
+			if _, err := tx.Exec(c.Context(), `
 				INSERT INTO shuttlecock_transactions (id, product_id, type, units, session_id, match_id)
 				VALUES (gen_random_uuid(), $1, 'USAGE', $2, $3, $4)`, coverProduct, used, id, matchID); err != nil {
-				httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
-				return
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
 			}
 		}
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"id": matchID})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"id": matchID})
 }
 
-func (s *Service) UpdateMatch(w http.ResponseWriter, r *http.Request) {
-	matchID := chi.URLParam(r, "id")
+func (s *Service) UpdateMatch(c *fiber.Ctx) error {
+	matchID := c.Params("id")
 	var in struct {
 		ShuttlecockUsed *int `json:"shuttlecock_used"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if in.ShuttlecockUsed != nil && *in.ShuttlecockUsed < 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Shuttlecock count must not be negative."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Shuttlecock count must not be negative."))
 	}
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	var sessionID string
 	if in.ShuttlecockUsed != nil {
 		var oldUsed int
-		_ = tx.QueryRow(r.Context(),
+		_ = tx.QueryRow(c.Context(),
 			`SELECT COALESCE(shuttlecock_used, 0) FROM matches WHERE id = $1`, matchID).Scan(&oldUsed)
-		if err := tx.QueryRow(r.Context(),
+		if err := tx.QueryRow(c.Context(),
 			`UPDATE matches SET shuttlecock_used = $2 WHERE id = $1 RETURNING session_id::text`,
 			matchID, *in.ShuttlecockUsed).Scan(&sessionID); err != nil {
-			httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Matches not found.")
-			return
+			return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Matches not found.")
 		}
 		if *in.ShuttlecockUsed == 0 {
 			// keep the USAGE ledger in sync with the edited match figure
-			if _, err := tx.Exec(r.Context(),
+			if _, err := tx.Exec(c.Context(),
 				`DELETE FROM shuttlecock_transactions WHERE match_id = $1`, matchID); err != nil {
-				httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update usage.")
-				return
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update usage.")
 			}
 		} else {
-			sess, ferr := s.fetch(r, sessionID)
+			sess, ferr := s.fetch(c.Context(), sessionID)
 			sessionType := ""
 			if ferr == nil {
 				sessionType = sess.Type
 			}
-			if productID, perr := pickUsageProduct(r.Context(), tx, sessionType); perr == nil {
+			if productID, perr := pickUsageProduct(c.Context(), tx, sessionType); perr == nil {
 				// Rewrite the ledger only when the bucket covers the new
 				// figure (counting the replaced figure back). Otherwise the
 				// old rows stay until an explicit shuttle allocation.
 				covered := true
-				if name, stock, serr := productStock(r.Context(), tx, productID); serr == nil {
+				if name, stock, serr := productStock(c.Context(), tx, productID); serr == nil {
 					if err := checkStockFit(name, stock, int64(oldUsed), int64(*in.ShuttlecockUsed)); err != nil {
 						covered = false
 					}
 				}
 				if covered {
-					if _, err := tx.Exec(r.Context(),
+					if _, err := tx.Exec(c.Context(),
 						`DELETE FROM shuttlecock_transactions WHERE match_id = $1`, matchID); err != nil {
-						httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update usage.")
-						return
+						return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update usage.")
 					}
-					_, _ = tx.Exec(r.Context(), `
+					_, _ = tx.Exec(c.Context(), `
 						INSERT INTO shuttlecock_transactions (id, product_id, type, units, session_id, match_id)
 						VALUES (gen_random_uuid(), $1, 'USAGE', $2, $3, $4)`,
 						productID, *in.ShuttlecockUsed, sessionID, matchID)
@@ -231,87 +214,77 @@ func (s *Service) UpdateMatch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"id": matchID})
+	return httpx.OK(c, http.StatusOK, map[string]any{"id": matchID})
 }
 
-func (s *Service) DeleteMatch(w http.ResponseWriter, r *http.Request) {
-	matchID := chi.URLParam(r, "id")
-	tx, err := s.db.Begin(r.Context())
+func (s *Service) DeleteMatch(c *fiber.Ctx) error {
+	matchID := c.Params("id")
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
 	}
-	defer tx.Rollback(r.Context())
-	if _, err := tx.Exec(r.Context(), `DELETE FROM shuttlecock_transactions WHERE match_id = $1`, matchID); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
-		return
+	defer tx.Rollback(c.Context())
+	if _, err := tx.Exec(c.Context(), `DELETE FROM shuttlecock_transactions WHERE match_id = $1`, matchID); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
 	}
-	tag, err := tx.Exec(r.Context(), `DELETE FROM matches WHERE id = $1`, matchID)
+	tag, err := tx.Exec(c.Context(), `DELETE FROM matches WHERE id = $1`, matchID)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Matches not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Matches not found.")
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *Service) AddMatchPlayer(w http.ResponseWriter, r *http.Request) {
-	matchID := chi.URLParam(r, "id")
+func (s *Service) AddMatchPlayer(c *fiber.Ctx) error {
+	matchID := c.Params("id")
 	var in struct {
 		PlayerID string `json:"player_id"`
 		Team     *int   `json:"team"`
 	}
-	if err := httpx.Decode(r, &in); err != nil || in.PlayerID == "" {
-		httpx.Err(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "A player must be selected.")
-		return
+	if err := httpx.Decode(c, &in); err != nil || in.PlayerID == "" {
+		return httpx.Err(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "A player must be selected.")
 	}
 	if _, err := uuid.Parse(in.PlayerID); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
-		return
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
 	}
-	_, err := s.db.Exec(r.Context(),
+	_, err := s.db.Exec(c.Context(),
 		`INSERT INTO match_players (match_id, player_id, team) VALUES ($1, $2, $3)
 		 ON CONFLICT (match_id, player_id) DO UPDATE SET team = EXCLUDED.team`,
 		matchID, in.PlayerID, in.Team)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not add player.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not add player.")
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"ok": true})
 }
 
-func (s *Service) RemoveMatchPlayer(w http.ResponseWriter, r *http.Request) {
-	matchID := chi.URLParam(r, "id")
-	playerID := chi.URLParam(r, "playerId")
-	tag, err := s.db.Exec(r.Context(),
+func (s *Service) RemoveMatchPlayer(c *fiber.Ctx) error {
+	matchID := c.Params("id")
+	playerID := c.Params("playerId")
+	tag, err := s.db.Exec(c.Context(),
 		`DELETE FROM match_players WHERE match_id = $1 AND player_id = $2`, matchID, playerID)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player is not in this match.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player is not in this match.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // Summary answers "is this session profitable?" in one call. PRD §37.
-func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	sess, err := s.fetch(r, id)
+func (s *Service) Summary(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 
 	var revenue, otherExpense int64
 	var unitsUsed int
 	var billedPaid int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE((SELECT SUM(amount) FROM revenues WHERE session_id = $1), 0),
 			COALESCE((SELECT SUM(amount) FROM expenses WHERE session_id = $1 AND category <> 'VENUE' AND category <> 'SHUTTLECOCK_PURCHASE'), 0),
@@ -321,7 +294,7 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	revenue += billedPaid
 
 	var avgPerUnit int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
 		FROM shuttlecock_transactions t
 		JOIN shuttlecock_products pr ON pr.id = t.product_id
@@ -342,14 +315,14 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	if sess.PeriodID != nil {
 		var prepaidTotal int64
 		var planSessions int
-		_ = s.db.QueryRow(r.Context(),
+		_ = s.db.QueryRow(c.Context(),
 			`SELECT COALESCE(SUM(amount), 0) FROM revenues WHERE period_id = $1 AND source = 'COMMITMENT_FEE'`,
 			*sess.PeriodID).Scan(&prepaidTotal)
-		_ = s.db.QueryRow(r.Context(),
+		_ = s.db.QueryRow(c.Context(),
 			`SELECT COALESCE(number_of_sessions, 0) FROM membership_periods WHERE id = $1`,
 			*sess.PeriodID).Scan(&planSessions)
 		if planSessions <= 0 {
-			_ = s.db.QueryRow(r.Context(),
+			_ = s.db.QueryRow(c.Context(),
 				`SELECT COUNT(*) FROM mabar_sessions WHERE period_id = $1`, *sess.PeriodID).Scan(&planSessions)
 		}
 		if planSessions > 0 {
@@ -359,13 +332,13 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	profit := revenue + prepaidCourts - operatingCost
 
 	var listed, present, noShow int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COUNT(*) FILTER (WHERE status <> 'NOT_LISTED'),
 		       COUNT(*) FILTER (WHERE status = 'PRESENT'),
 		       COUNT(*) FILTER (WHERE status = 'NO_SHOW')
 		FROM attendances WHERE session_id = $1`, id).Scan(&listed, &present, &noShow)
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"session":          sess,
 		"revenue":          revenue,
 		"billed_paid":      billedPaid,
@@ -388,12 +361,11 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 // when pricing is FIXED_PER_SHUTTLECOCK. PRD §26/§27. For PERIOD sessions
 // each present player is billed at period rates instead: members pay the
 // per-visit contribution, guests pay the non-member fee.
-func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	sess, err := s.fetch(r, id)
+func (s *Service) GenerateBilling(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 
 	type presentPlayer struct {
@@ -401,12 +373,11 @@ func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
 		isMember bool
 	}
 
-	rows, err := s.db.Query(r.Context(), `
+	rows, err := s.db.Query(c.Context(), `
 		SELECT a.player_id::text, a.is_member FROM attendances a
 		WHERE a.session_id = $1 AND a.status = 'PRESENT' ORDER BY a.listed_at`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
 	}
 	present := []presentPlayer{}
 	for rows.Next() {
@@ -420,32 +391,28 @@ func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
 	// Badminton needs at least 4 players on court: refuse to calculate
 	// bills for a session that cannot actually be played.
 	if len(present) < 4 {
-		httpx.WriteAppError(w, httpx.Unprocessable("An open play session needs at least 4 present players to calculate bills."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("An open play session needs at least 4 present players to calculate bills."))
 	}
 
 	var memberRate, guestRate int64
 	if sess.Type == "PERIOD" {
 		if sess.PeriodID == nil {
-			httpx.WriteAppError(w, httpx.Unprocessable("PERIOD sessions must belong to a period."))
-			return
+			return httpx.WriteAppError(c, httpx.Unprocessable("PERIOD sessions must belong to a period."))
 		}
-		if err := s.db.QueryRow(r.Context(),
+		if err := s.db.QueryRow(c.Context(),
 			`SELECT member_contribution, non_member_fee FROM membership_periods WHERE id = $1`,
 			*sess.PeriodID).Scan(&memberRate, &guestRate); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load period rates.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load period rates.")
 		}
 	}
 
-	scockRows, err := s.db.Query(r.Context(), `
+	scockRows, err := s.db.Query(c.Context(), `
 		SELECT mp.player_id::text, SUM(m.shuttlecock_used)
 		FROM match_players mp
 		JOIN matches m ON m.id = mp.match_id
 		WHERE m.session_id = $1 GROUP BY mp.player_id`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
 	}
 	playerShuttle := map[string]int64{}
 	for scockRows.Next() {
@@ -459,12 +426,11 @@ func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
 
 	// Simple recap also contributes kok per player, so daily billing works
 	// without composing 2v2 matches. Both sources are summed to support mixed use.
-	simpleRows, err := s.db.Query(r.Context(), `
+	simpleRows, err := s.db.Query(c.Context(), `
 		SELECT player_id::text, shuttlecock_used
 		FROM session_player_stats WHERE session_id = $1`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
 	}
 	for simpleRows.Next() {
 		var pid string
@@ -477,12 +443,11 @@ func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
 
 	shares := finance.CourtShares(sess.CourtCost, len(present))
 	bills := make([]map[string]any, 0, len(present))
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	for i, p := range present {
 		var share, count, contribution, total int64
@@ -498,7 +463,7 @@ func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
 			share = shares[i]
 			total = finance.DailyPlayerBill(share, count, sess.ShuttlecockPrice, 0)
 		}
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO player_bills (id, session_id, player_id, court_share, shuttlecock_count,
 			                          shuttlecock_contribution, other_charge, total)
 			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 0, $6)
@@ -508,32 +473,29 @@ func (s *Service) GenerateBilling(w http.ResponseWriter, r *http.Request) {
 				shuttlecock_contribution = EXCLUDED.shuttlecock_contribution,
 				total = EXCLUDED.total`,
 			id, p.id, share, count, contribution, total); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
 		}
 		bills = append(bills, map[string]any{
 			"player_id": p.id, "court_share": share,
 			"shuttlecock_count": count, "shuttlecock_contribution": contribution, "total": total,
 		})
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate bills.")
 	}
-	httpx.OK(w, http.StatusCreated, bills)
+	return httpx.OK(c, http.StatusCreated, bills)
 }
 
-func (s *Service) ListBilling(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) ListBilling(c *fiber.Ctx) error {
+	id := c.Params("id")
+	rows, err := s.db.Query(c.Context(), `
 		SELECT b.player_id::text, pl.name, b.court_share, b.shuttlecock_count,
 		       b.shuttlecock_contribution, b.other_charge, b.total, b.payment_status, b.payment_method
 		FROM player_bills b
 		JOIN players pl ON pl.id = b.player_id
 		WHERE b.session_id = $1 ORDER BY pl.name`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load bills.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load bills.")
 	}
 	defer rows.Close()
 	bills := []map[string]any{}
@@ -550,7 +512,7 @@ func (s *Service) ListBilling(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	httpx.OK(w, http.StatusOK, bills)
+	return httpx.OK(c, http.StatusOK, bills)
 }
 
 var billStatuses = map[string]bool{
@@ -563,24 +525,21 @@ var billMethods = map[string]bool{
 
 // UpdateBillingStatus updates one player's payment status and/or method
 // without recalculating amounts.
-func (s *Service) UpdateBillingStatus(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	playerID := chi.URLParam(r, "playerId")
+func (s *Service) UpdateBillingStatus(c *fiber.Ctx) error {
+	id := c.Params("id")
+	playerID := c.Params("playerId")
 	var in struct {
 		PaymentStatus *string `json:"payment_status"`
 		PaymentMethod *string `json:"payment_method"`
 	}
-	if err := httpx.Decode(r, &in); err != nil || (in.PaymentStatus == nil && in.PaymentMethod == nil) {
-		httpx.WriteAppError(w, httpx.Unprocessable("Provide payment_status and/or payment_method."))
-		return
+	if err := httpx.Decode(c, &in); err != nil || (in.PaymentStatus == nil && in.PaymentMethod == nil) {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Provide payment_status and/or payment_method."))
 	}
 	if in.PaymentStatus != nil && !billStatuses[*in.PaymentStatus] {
-		httpx.WriteAppError(w, httpx.Unprocessable("Payment status must be UNPAID or PAID."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Payment status must be UNPAID or PAID."))
 	}
 	if in.PaymentMethod != nil && !billMethods[*in.PaymentMethod] {
-		httpx.WriteAppError(w, httpx.Unprocessable("Payment method must be CASH, QRIS, or BCA."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Payment method must be CASH, QRIS, or BCA."))
 	}
 	set, args := []string{}, []any{id, playerID}
 	if in.PaymentStatus != nil {
@@ -591,13 +550,12 @@ func (s *Service) UpdateBillingStatus(w http.ResponseWriter, r *http.Request) {
 		args = append(args, *in.PaymentMethod)
 		set = append(set, "payment_method = $"+strconv.Itoa(len(args)))
 	}
-	tag, err := s.db.Exec(r.Context(),
+	tag, err := s.db.Exec(c.Context(),
 		`UPDATE player_bills SET `+strings.Join(set, ", ")+` WHERE session_id = $1 AND player_id = $2`, args...)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Bill not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Bill not found.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 func nullableInt(v int) any {

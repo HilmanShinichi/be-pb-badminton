@@ -3,7 +3,7 @@ package mabar
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
 	"github.com/pb-kecebong/backend/internal/httpx"
@@ -17,16 +17,15 @@ type SimpleStat struct {
 	ShuttlecockUsed int   `json:"shuttlecock_used"`
 }
 
-func (s *Service) ListSimpleStats(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) ListSimpleStats(c *fiber.Ctx) error {
+	id := c.Params("id")
+	rows, err := s.db.Query(c.Context(), `
 		SELECT s.session_id::text, s.player_id::text, pl.name, s.play_count, s.shuttlecock_used
 		FROM session_player_stats s
 		JOIN players pl ON pl.id = s.player_id
 		WHERE s.session_id = $1 ORDER BY pl.name`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load simple recap.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load simple recap.")
 	}
 	defer rows.Close()
 	list := []SimpleStat{}
@@ -36,7 +35,7 @@ func (s *Service) ListSimpleStats(w http.ResponseWriter, r *http.Request) {
 			list = append(list, st)
 		}
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 type simpleStatInput struct {
@@ -52,22 +51,19 @@ type saveSimpleInput struct {
 // SaveSimpleStats upserts the simple recap: per-player play count + kok.
 // It also syncs one session-level USAGE transaction (match_id IS NULL) so
 // stock and session totals move even without per-match 2v2 input.
-func (s *Service) SaveSimpleStats(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	sess, err := s.fetch(r, id)
+func (s *Service) SaveSimpleStats(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	var in saveSimpleInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	for _, row := range in.Rows {
 		if _, err := uuid.Parse(row.PlayerID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
 		}
 		plays := 0
 		if row.PlayCount != nil {
@@ -78,17 +74,15 @@ func (s *Service) SaveSimpleStats(w http.ResponseWriter, r *http.Request) {
 			cocks = *row.ShuttlecockUsed
 		}
 		if plays < 0 || cocks < 0 {
-			httpx.WriteAppError(w, httpx.Unprocessable("Play count and shuttlecock must not be negative."))
-			return
+			return httpx.WriteAppError(c, httpx.Unprocessable("Play count and shuttlecock must not be negative."))
 		}
 	}
 
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	for _, row := range in.Rows {
 		plays := 0
@@ -100,15 +94,14 @@ func (s *Service) SaveSimpleStats(w http.ResponseWriter, r *http.Request) {
 			cocks = *row.ShuttlecockUsed
 		}
 		if plays == 0 && cocks == 0 {
-			if _, err := tx.Exec(r.Context(),
+			if _, err := tx.Exec(c.Context(),
 				`DELETE FROM session_player_stats WHERE session_id = $1 AND player_id = $2`,
 				id, row.PlayerID); err != nil {
-				httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
-				return
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
 			}
 			continue
 		}
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO session_player_stats (session_id, player_id, play_count, shuttlecock_used, updated_at)
 			VALUES ($1, $2, $3, $4, now())
 			ON CONFLICT (session_id, player_id) DO UPDATE SET
@@ -116,17 +109,15 @@ func (s *Service) SaveSimpleStats(w http.ResponseWriter, r *http.Request) {
 				shuttlecock_used = EXCLUDED.shuttlecock_used,
 				updated_at = now()`,
 			id, row.PlayerID, plays, cocks); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
 		}
 	}
 
 	var totalSimple int
-	if err := tx.QueryRow(r.Context(),
+	if err := tx.QueryRow(c.Context(),
 		`SELECT COALESCE(SUM(shuttlecock_used), 0) FROM session_player_stats WHERE session_id = $1`,
 		id).Scan(&totalSimple); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
 	}
 
 	// Keep stock in sync: one session-level USAGE row, match_id NULL.
@@ -137,13 +128,13 @@ func (s *Service) SaveSimpleStats(w http.ResponseWriter, r *http.Request) {
 	covered := false
 	coverProduct := ""
 	if totalSimple > 0 {
-		if productID, err := pickUsageProduct(r.Context(), tx, sess.Type); err == nil {
+		if productID, err := pickUsageProduct(c.Context(), tx, sess.Type); err == nil {
 			var freed int64
-			_ = tx.QueryRow(r.Context(),
+			_ = tx.QueryRow(c.Context(),
 				`SELECT COALESCE(SUM(units), 0) FROM shuttlecock_transactions
 				 WHERE session_id = $1 AND match_id IS NULL AND type = 'USAGE' AND product_id = $2`,
 				id, productID).Scan(&freed)
-			if name, stock, serr := productStock(r.Context(), tx, productID); serr != nil {
+			if name, stock, serr := productStock(c.Context(), tx, productID); serr != nil {
 				covered = true
 				coverProduct = productID
 			} else if err := checkStockFit(name, stock, freed, int64(totalSimple)); err == nil {
@@ -153,26 +144,23 @@ func (s *Service) SaveSimpleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if covered {
-		if _, err := tx.Exec(r.Context(),
+		if _, err := tx.Exec(c.Context(),
 			`DELETE FROM shuttlecock_transactions WHERE session_id = $1 AND match_id IS NULL AND type = 'USAGE'`,
 			id); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
 		}
 	}
 	if totalSimple > 0 && covered {
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO shuttlecock_transactions (id, product_id, type, units, session_id, match_id, note)
 			VALUES (gen_random_uuid(), $1, 'USAGE', $2, $3, NULL, 'simple-recap')`,
 			coverProduct, totalSimple, id); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save shuttlecock usage.")
 		}
 	}
 
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
 	}
-	s.ListSimpleStats(w, r)
+	return s.ListSimpleStats(c)
 }

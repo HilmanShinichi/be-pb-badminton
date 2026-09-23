@@ -8,6 +8,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pb-kecebong/backend/internal/domain/finance"
+	"github.com/gofiber/fiber/v2"
+
 	"github.com/pb-kecebong/backend/internal/httpx"
 )
 
@@ -34,17 +36,17 @@ type sessionRow struct {
 
 // Get is the landing overview: what is happening, what is next, is the club
 // in the black. Kept to a handful of aggregate queries.
-func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Get(c *fiber.Ctx) error {
 	var activePeriodID, activePeriodName *string
 	var members int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT p.id::text, p.name, COALESCE((SELECT COUNT(*) FROM memberships m
 			WHERE m.period_id = p.id AND m.status <> 'WITHDRAWN'), 0)
 		FROM membership_periods p WHERE p.status = 'ACTIVE'
 		ORDER BY p.start_date DESC LIMIT 1`).Scan(&activePeriodID, &activePeriodName, &members)
 
 	upcoming := []sessionRow{}
-	rows, err := s.db.Query(r.Context(), `
+	rows, err := s.db.Query(c.Context(), `
 		SELECT s.id::text, s.type, s.date::text, p.name, v.name, s.court_cost, 0, 0, 0, 0, ''
 		FROM mabar_sessions s
 		LEFT JOIN membership_periods p ON p.id = s.period_id
@@ -74,21 +76,21 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	// recent_type (PERIOD or DAILY_EVENT), recent_q (matches venue,
 	// period, date, type, descriptions).
 	recentLimit := 5
-	if v, err := strconv.Atoi(r.URL.Query().Get("recent_limit")); err == nil && v > 0 && v <= 50 {
+	if v, err := strconv.Atoi(c.Query("recent_limit")); err == nil && v > 0 && v <= 50 {
 		recentLimit = v
 	}
 	recentOffset := 0
-	if v, err := strconv.Atoi(r.URL.Query().Get("recent_offset")); err == nil && v >= 0 {
+	if v, err := strconv.Atoi(c.Query("recent_offset")); err == nil && v >= 0 {
 		recentOffset = v
 	}
-	recentType := strings.ToUpper(strings.TrimSpace(r.URL.Query().Get("recent_type")))
+	recentType := strings.ToUpper(strings.TrimSpace(c.Query("recent_type")))
 	if recentType == "ALL" {
 		recentType = ""
 	}
 	if recentType != "" && recentType != "PERIOD" && recentType != "DAILY_EVENT" {
 		recentType = ""
 	}
-	recentQ := strings.TrimSpace(r.URL.Query().Get("recent_q"))
+	recentQ := strings.TrimSpace(c.Query("recent_q"))
 	recentArgs := []any{}
 	recentFilter := ""
 	if recentType != "" {
@@ -104,7 +106,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 			` OR COALESCE(s.description, '') ILIKE ` + ph + `)`
 	}
 	var recentTotal int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COUNT(*)
 		FROM mabar_sessions s
 		LEFT JOIN membership_periods p ON p.id = s.period_id
@@ -119,7 +121,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	recentArgs = append(recentArgs, recentLimit, recentOffset)
 	limitPH := `$` + strconv.Itoa(len(recentArgs)-1)
 	offsetPH := `$` + strconv.Itoa(len(recentArgs))
-	rows, err = s.db.Query(r.Context(), `
+	rows, err = s.db.Query(c.Context(), `
 		WITH avg_unit AS (
 			SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0) AS price
 			FROM shuttlecock_transactions t
@@ -150,8 +152,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 		       AND COALESCE(bl.total, 0) > 0 AND COALESCE(bl.paid, 0) >= bl.total))`+recentFilter+`
 		ORDER BY s.date DESC LIMIT `+limitPH+` OFFSET `+offsetPH, recentArgs...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load dashboard.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load dashboard.")
 	}
 	for rows.Next() {
 		var row sessionRow
@@ -166,14 +167,14 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 
 	var stock int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(units) FILTER (WHERE type = 'PURCHASE'), 0)
 		       - COALESCE(SUM(units) FILTER (WHERE type = 'USAGE'), 0)
 		       + COALESCE(SUM(units) FILTER (WHERE type = 'ADJUSTMENT'), 0)
 		FROM shuttlecock_transactions`).Scan(&stock)
 
 	stockByPurpose := map[string]int64{"DAILY": 0, "PERIOD": 0, "GENERAL": 0}
-	prows, err := s.db.Query(r.Context(), `
+	prows, err := s.db.Query(c.Context(), `
 		SELECT p.purpose,
 		       COALESCE(SUM(t.units) FILTER (WHERE t.type = 'PURCHASE'), 0)
 		       - COALESCE(SUM(t.units) FILTER (WHERE t.type = 'USAGE'), 0)
@@ -193,7 +194,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var monthRevenue, monthExpense int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE((SELECT SUM(amount) FROM revenues WHERE occurred_at >= date_trunc('month', CURRENT_DATE)), 0),
 		       COALESCE((SELECT SUM(amount) FROM expenses WHERE occurred_at >= date_trunc('month', CURRENT_DATE)), 0)`).
 		Scan(&monthRevenue, &monthExpense)
@@ -207,7 +208,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 		"general": {"revenue": 0, "expense": 0},
 	}
 	var dRev, pRev, gRev, dExp, pExp, gExp int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE(SUM(r.amount) FILTER (WHERE s.type = 'DAILY_EVENT'), 0),
 			COALESCE(SUM(r.amount) FILTER (WHERE s.type = 'PERIOD' OR (s.id IS NULL AND r.period_id IS NOT NULL)), 0),
@@ -215,7 +216,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 		FROM revenues r LEFT JOIN mabar_sessions s ON s.id = r.session_id
 		WHERE r.occurred_at >= date_trunc('month', CURRENT_DATE)`).
 		Scan(&dRev, &pRev, &gRev)
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE(SUM(e.amount) FILTER (WHERE s.type = 'DAILY_EVENT' OR (s.id IS NULL AND e.period_id IS NULL AND p.purpose = 'DAILY')), 0),
 			COALESCE(SUM(e.amount) FILTER (WHERE s.type = 'PERIOD' OR (s.id IS NULL AND e.period_id IS NOT NULL) OR (s.id IS NULL AND e.period_id IS NULL AND p.purpose = 'PERIOD')), 0),
@@ -233,7 +234,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	// while session cards (which add paid_total) show them. Same rule as the
 	// session cards: billed revenue counts once paid.
 	var dBilled, pBilled int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE(SUM(b.total) FILTER (WHERE s.type = 'DAILY_EVENT'), 0),
 			COALESCE(SUM(b.total) FILTER (WHERE s.type = 'PERIOD'), 0)
@@ -246,7 +247,7 @@ func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
 	monthScope["period"]["revenue"] += pBilled
 	monthRevenue += dBilled + pBilled
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"active_period": map[string]any{
 			"id": activePeriodID, "name": activePeriodName, "members": members,
 		},

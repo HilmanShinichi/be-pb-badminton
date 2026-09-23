@@ -3,7 +3,7 @@ package inventory
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -27,8 +27,8 @@ type Product struct {
 
 var productPurposes = map[string]bool{"GENERAL": true, "DAILY": true, "PERIOD": true}
 
-func (s *Service) ListProducts(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) ListProducts(c *fiber.Ctx) error {
+	rows, err := s.db.Query(c.Context(), `
 		SELECT p.id::text, p.name, p.unit_name, p.units_per_pack, p.purchase_price, p.purpose, p.active,
 		       COALESCE(stock.total, 0)
 		FROM shuttlecock_products p
@@ -41,8 +41,7 @@ func (s *Service) ListProducts(w http.ResponseWriter, r *http.Request) {
 		) stock ON stock.product_id = p.id
 		ORDER BY p.active DESC, p.created_at`)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load products.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load products.")
 	}
 	defer rows.Close()
 	products := []Product{}
@@ -52,10 +51,10 @@ func (s *Service) ListProducts(w http.ResponseWriter, r *http.Request) {
 			products = append(products, p)
 		}
 	}
-	httpx.OK(w, http.StatusOK, products)
+	return httpx.OK(c, http.StatusOK, products)
 }
 
-func (s *Service) CreateProduct(w http.ResponseWriter, r *http.Request) {
+func (s *Service) CreateProduct(c *fiber.Ctx) error {
 	var in struct {
 		Name          string `json:"name"`
 		UnitName      string `json:"unit_name"`
@@ -63,21 +62,17 @@ func (s *Service) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		PurchasePrice int64  `json:"purchase_price"`
 		Purpose       string `json:"purpose"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if in.Name == "" {
-		httpx.WriteAppError(w, httpx.Unprocessable("Nama produk is required."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Nama produk is required."))
 	}
 	if in.UnitsPerPack <= 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Units per pack must be greater than 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Units per pack must be greater than 0."))
 	}
 	if in.PurchasePrice < 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Purchase price must not be negative."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Purchase price must not be negative."))
 	}
 	if in.UnitName == "" {
 		in.UnitName = "pc"
@@ -86,26 +81,24 @@ func (s *Service) CreateProduct(w http.ResponseWriter, r *http.Request) {
 		in.Purpose = "GENERAL"
 	}
 	var p Product
-	err := s.db.QueryRow(r.Context(), `
+	err := s.db.QueryRow(c.Context(), `
 		INSERT INTO shuttlecock_products (id, name, unit_name, units_per_pack, purchase_price, purpose)
 		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
 		RETURNING id::text, name, unit_name, units_per_pack, purchase_price, purpose, active, 0::bigint`,
 		in.Name, in.UnitName, in.UnitsPerPack, in.PurchasePrice, in.Purpose,
 	).Scan(&p.ID, &p.Name, &p.UnitName, &p.UnitsPerPack, &p.PurchasePrice, &p.Purpose, &p.Active, &p.Stock)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save product.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save product.")
 	}
-	httpx.OK(w, http.StatusCreated, p)
+	return httpx.OK(c, http.StatusCreated, p)
 }
 
 // UpdateProduct fixes wrong input (name, pack size, price, purpose) without
 // touching stock history, which stays derived from transactions.
-func (s *Service) UpdateProduct(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) UpdateProduct(c *fiber.Ctx) error {
+	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
 	}
 	var in struct {
 		Name          *string `json:"name"`
@@ -115,33 +108,27 @@ func (s *Service) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 		Purpose       *string `json:"purpose"`
 		Active        *bool   `json:"active"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if in.Name != nil && *in.Name == "" {
-		httpx.WriteAppError(w, httpx.Unprocessable("Product name is required."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Product name is required."))
 	}
 	if in.UnitsPerPack != nil && *in.UnitsPerPack <= 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Units per pack must be greater than 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Units per pack must be greater than 0."))
 	}
 	if in.PurchasePrice != nil && *in.PurchasePrice < 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Purchase price must not be negative."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Purchase price must not be negative."))
 	}
 	if in.Purpose != nil && !productPurposes[*in.Purpose] {
-		httpx.WriteAppError(w, httpx.Unprocessable("Purpose must be GENERAL, DAILY, or PERIOD."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Purpose must be GENERAL, DAILY, or PERIOD."))
 	}
 	var cur Product
-	if err := s.db.QueryRow(r.Context(), `
+	if err := s.db.QueryRow(c.Context(), `
 		SELECT id::text, name, unit_name, units_per_pack, purchase_price, purpose, active, 0::bigint
 		FROM shuttlecock_products WHERE id = $1`, id).Scan(
 		&cur.ID, &cur.Name, &cur.UnitName, &cur.UnitsPerPack, &cur.PurchasePrice, &cur.Purpose, &cur.Active, &cur.Stock); err != nil {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Product not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Product not found.")
 	}
 	if in.Name != nil {
 		cur.Name = *in.Name
@@ -161,66 +148,57 @@ func (s *Service) UpdateProduct(w http.ResponseWriter, r *http.Request) {
 	if in.Active != nil {
 		cur.Active = *in.Active
 	}
-	tag, err := s.db.Exec(r.Context(), `
+	tag, err := s.db.Exec(c.Context(), `
 		UPDATE shuttlecock_products SET name = $2, unit_name = $3, units_per_pack = $4,
 		       purchase_price = $5, purpose = $6, active = $7 WHERE id = $1`,
 		id, cur.Name, cur.UnitName, cur.UnitsPerPack, cur.PurchasePrice, cur.Purpose, cur.Active)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Product not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Product not found.")
 	}
-	httpx.OK(w, http.StatusOK, cur)
+	return httpx.OK(c, http.StatusOK, cur)
 }
 
 // DeleteProduct removes a product. With history it refuses unless
 // ?force=true, which hard-deletes its transactions too (cash expenses stay
 // as books history).
-func (s *Service) DeleteProduct(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) DeleteProduct(c *fiber.Ctx) error {
+	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
 	}
 	var txs int
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT COUNT(*) FROM shuttlecock_transactions WHERE product_id = $1`, id).Scan(&txs)
-	if txs > 0 && r.URL.Query().Get("force") != "true" {
-		httpx.WriteAppError(w, httpx.Conflict("PRODUCT_HAS_HISTORY",
+	if txs > 0 && c.Query("force") != "true" {
+		return httpx.WriteAppError(c, httpx.Conflict("PRODUCT_HAS_HISTORY",
 			"Product already has stock transactions. Fix it with edit, or delete with force to wipe its transactions."))
-		return
 	}
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
 	}
-	defer tx.Rollback(r.Context())
-	if _, err := tx.Exec(r.Context(),
+	defer tx.Rollback(c.Context())
+	if _, err := tx.Exec(c.Context(),
 		`DELETE FROM shuttlecock_transactions WHERE product_id = $1`, id); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
 	}
 	// Purchases also write a linked expense row; force means wiping those too,
 	// otherwise the expenses FK would block the product delete below.
-	if _, err := tx.Exec(r.Context(),
+	if _, err := tx.Exec(c.Context(),
 		`DELETE FROM expenses WHERE product_id = $1`, id); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
 	}
-	tag, err := tx.Exec(r.Context(), `DELETE FROM shuttlecock_products WHERE id = $1`, id)
+	tag, err := tx.Exec(c.Context(), `DELETE FROM shuttlecock_products WHERE id = $1`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
 	}
 	if tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Product not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Product not found.")
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete product.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // Purchase records incoming stock and the cash-out expense in one
@@ -228,7 +206,7 @@ func (s *Service) DeleteProduct(w http.ResponseWriter, r *http.Request) {
 // either by full packs ({packs, unit_price per pack}) or as loose pieces
 // ({pcs, pcs_total}: total rupiah paid). Loose prices are normalized to a
 // per-pack-equivalent unit_price so average-cost math stays exact.
-func (s *Service) Purchase(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Purchase(c *fiber.Ctx) error {
 	var in struct {
 		ProductID string  `json:"product_id"`
 		Packs     int     `json:"packs"`
@@ -238,58 +216,48 @@ func (s *Service) Purchase(w http.ResponseWriter, r *http.Request) {
 		SessionID *string `json:"session_id"`
 		Note      *string `json:"note"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if _, err := uuid.Parse(in.ProductID); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
 	}
 	loose := in.Pcs > 0
 	if loose && in.Packs > 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Use either packs or loose pcs, not both."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Use either packs or loose pcs, not both."))
 	}
 	if !loose && in.Packs <= 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Pack count must be greater than 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pack count must be greater than 0."))
 	}
 	if loose && in.PcsTotal < 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Total price must not be negative."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Total price must not be negative."))
 	}
 	if !loose && in.UnitPrice < 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Price per pack must not be negative."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Price per pack must not be negative."))
 	}
 
 	var unitsPerPack int
 	var periodID *string
-	if err := s.db.QueryRow(r.Context(),
+	if err := s.db.QueryRow(c.Context(),
 		`SELECT units_per_pack FROM shuttlecock_products WHERE id = $1`, in.ProductID).Scan(&unitsPerPack); err != nil {
-		httpx.WriteAppError(w, httpx.NotFound("Product not found."))
-		return
+		return httpx.WriteAppError(c, httpx.NotFound("Product not found."))
 	}
 	if in.SessionID != nil {
 		if _, err := uuid.Parse(*in.SessionID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
 		}
-		err := s.db.QueryRow(r.Context(),
+		err := s.db.QueryRow(c.Context(),
 			`SELECT period_id::text FROM mabar_sessions WHERE id = $1`, *in.SessionID).Scan(&periodID)
 		if err != nil {
-			httpx.WriteAppError(w, httpx.NotFound("Session not found."))
-			return
+			return httpx.WriteAppError(c, httpx.NotFound("Session not found."))
 		}
 	}
 
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	units := int64(in.Packs * unitsPerPack)
 	total := int64(in.Packs) * in.UnitPrice
@@ -303,66 +271,58 @@ func (s *Service) Purchase(w http.ResponseWriter, r *http.Request) {
 			storedPrice = total
 		}
 	}
-	if _, err := tx.Exec(r.Context(), `
+	if _, err := tx.Exec(c.Context(), `
 		INSERT INTO shuttlecock_transactions (id, product_id, type, units, unit_price, session_id, note)
 		VALUES (gen_random_uuid(), $1, 'PURCHASE', $2, $3, $4, $5)`,
 		in.ProductID, units, storedPrice, in.SessionID, in.Note); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
 	}
-	if _, err := tx.Exec(r.Context(), `
+	if _, err := tx.Exec(c.Context(), `
 		INSERT INTO expenses (id, session_id, period_id, product_id, category, amount, note)
 		VALUES (gen_random_uuid(), $1, $2, $4, 'SHUTTLECOCK_PURCHASE', $3, $5)`,
 		in.SessionID, periodID, total, in.ProductID, in.Note); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record purchase.")
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"units": units, "total": total})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"units": units, "total": total})
 }
 
 // Adjust handles stock corrections (broken tubes, count fixes) without
 // touching cash: an adjustment changes units, not money.
-func (s *Service) Adjust(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Adjust(c *fiber.Ctx) error {
 	var in struct {
 		ProductID string  `json:"product_id"`
 		Units     int     `json:"units"`
 		Note      *string `json:"note"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if _, err := uuid.Parse(in.ProductID); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
 	}
 	if in.Units == 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Adjustment amount must not be 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Adjustment amount must not be 0."))
 	}
-	if _, err := s.db.Exec(r.Context(), `
+	if _, err := s.db.Exec(c.Context(), `
 		INSERT INTO shuttlecock_transactions (id, product_id, type, units, note)
 		VALUES (gen_random_uuid(), $1, 'ADJUSTMENT', $2, $3)`, in.ProductID, in.Units, in.Note); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record adjustment.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record adjustment.")
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"units": in.Units})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"units": in.Units})
 }
 
-func (s *Service) Transactions(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) Transactions(c *fiber.Ctx) error {
+	rows, err := s.db.Query(c.Context(), `
 		SELECT t.id::text, t.product_id::text, p.name, t.type, t.units, t.unit_price, t.session_id::text,
 		       t.match_id::text, t.note, t.occurred_at::text
 		FROM shuttlecock_transactions t
 		JOIN shuttlecock_products p ON p.id = t.product_id
 		ORDER BY t.occurred_at DESC LIMIT 200`)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load transactions.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load transactions.")
 	}
 	defer rows.Close()
 	type tx struct {
@@ -385,5 +345,5 @@ func (s *Service) Transactions(w http.ResponseWriter, r *http.Request) {
 			list = append(list, t)
 		}
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }

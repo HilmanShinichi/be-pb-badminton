@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -98,15 +98,14 @@ func normalizeGender(in *string) (*string, error) {
 	return &g, nil
 }
 
-func (s *Service) List(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	search := strings.TrimSpace(q.Get("q"))
-	status := q.Get("status")
-	limit, _ := strconv.Atoi(q.Get("limit"))
+func (s *Service) List(c *fiber.Ctx) error {
+	search := strings.TrimSpace(c.Query("q"))
+	status := c.Query("status")
+	limit, _ := strconv.Atoi(c.Query("limit"))
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	offset, _ := strconv.Atoi(q.Get("offset"))
+	offset, _ := strconv.Atoi(c.Query("offset"))
 
 	sql := `SELECT id::text, name, phone, notes, status, grade, gender, created_at::text
 		FROM players WHERE status <> 'ARCHIVED'`
@@ -121,10 +120,9 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 	}
 	sql += ` ORDER BY name LIMIT ` + strconv.Itoa(limit) + ` OFFSET ` + strconv.Itoa(offset)
 
-	rows, err := s.db.Query(r.Context(), sql, args...)
+	rows, err := s.db.Query(c.Context(), sql, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
 	}
 	defer rows.Close()
 
@@ -135,24 +133,22 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 			players = append(players, p)
 		}
 	}
-	httpx.OKWithMeta(w, http.StatusOK, players, map[string]any{"limit": limit, "offset": offset})
+	return httpx.OKWithMeta(c, http.StatusOK, players, map[string]any{"limit": limit, "offset": offset})
 }
 
-func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) Get(c *fiber.Ctx) error {
+	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
-		return
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
 	}
 	var p Player
-	err := s.db.QueryRow(r.Context(),
+	err := s.db.QueryRow(c.Context(),
 		`SELECT id::text, name, phone, notes, status, grade, gender, created_at::text FROM players WHERE id = $1`, id,
 	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt)
 	if err != nil {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player not found.")
 	}
-	httpx.OK(w, http.StatusOK, p)
+	return httpx.OK(c, http.StatusOK, p)
 }
 
 func (s *Service) validate(in playerInput) error {
@@ -175,45 +171,39 @@ func (s *Service) validate(in playerInput) error {
 	return nil
 }
 
-func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Create(c *fiber.Ctx) error {
 	var in playerInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := s.validate(in); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	grade, _ := normalizeGrade(in.Grade)
 	gender, _ := normalizeGender(in.Gender)
 	var p Player
-	err := s.db.QueryRow(r.Context(),
+	err := s.db.QueryRow(c.Context(),
 		`INSERT INTO players (id, name, phone, notes, grade, gender) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
 		 RETURNING id::text, name, phone, notes, status, grade, gender, created_at::text`,
 		strings.TrimSpace(*in.Name), in.Phone, in.Notes, grade, gender,
 	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save player.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save player.")
 	}
-	httpx.OK(w, http.StatusCreated, p)
+	return httpx.OK(c, http.StatusCreated, p)
 }
 
-func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) Update(c *fiber.Ctx) error {
+	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
-		return
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
 	}
 	var in playerInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := s.validate(in); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	grade, _ := normalizeGrade(in.Grade)
 	gender, _ := normalizeGender(in.Gender)
@@ -221,19 +211,17 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 	// duplicate grade assignments surface as an explicit error.
 	if grade != nil {
 		var current *string
-		if err := s.db.QueryRow(r.Context(),
+		if err := s.db.QueryRow(c.Context(),
 			`SELECT grade FROM players WHERE id = $1`, id).Scan(&current); err != nil {
-			httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
-			return
+			return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player not found.")
 		}
 		if current != nil && *current == *grade {
-			httpx.WriteAppError(w, httpx.Conflict("GRADE_EXISTS",
+			return httpx.WriteAppError(c, httpx.Conflict("GRADE_EXISTS",
 				"Player already has grade "+*grade+"."))
-			return
 		}
 	}
 	var p Player
-	err := s.db.QueryRow(r.Context(),
+	err := s.db.QueryRow(c.Context(),
 		`UPDATE players SET name = $2, phone = $3, notes = $4,
 		 status = COALESCE($5, status), grade = COALESCE($6, grade), gender = COALESCE($7, gender), updated_at = now()
 		 WHERE id = $1
@@ -241,24 +229,22 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 		id, strings.TrimSpace(*in.Name), in.Phone, in.Notes, in.Status, grade, gender,
 	).Scan(&p.ID, &p.Name, &p.Phone, &p.Notes, &p.Status, &p.Grade, &p.Gender, &p.CreatedAt)
 	if err != nil {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player not found.")
 	}
-	httpx.OK(w, http.StatusOK, p)
+	return httpx.OK(c, http.StatusOK, p)
 }
 
 // Delete hard-deletes a player, but only when nothing references them:
 // attendance, matches, bills, payments, revenues, memberships, or recap
 // stats. A player with any history is refused so money trails and past
 // sessions stay intact.
-func (s *Service) Delete(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) Delete(c *fiber.Ctx) error {
+	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
-		return
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
 	}
 	var refs int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT (SELECT COUNT(*) FROM attendances WHERE player_id = $1)
 		     + (SELECT COUNT(*) FROM match_players WHERE player_id = $1)
 		     + (SELECT COUNT(*) FROM player_bills WHERE player_id = $1)
@@ -268,14 +254,12 @@ func (s *Service) Delete(w http.ResponseWriter, r *http.Request) {
 		     + (SELECT COUNT(*) FROM session_player_stats WHERE player_id = $1)`,
 		id).Scan(&refs)
 	if refs > 0 {
-		httpx.WriteAppError(w, httpx.Conflict("PLAYER_HAS_HISTORY",
+		return httpx.WriteAppError(c, httpx.Conflict("PLAYER_HAS_HISTORY",
 			"Player already has attendance, bills, or other history and cannot be deleted."))
-		return
 	}
-	tag, err := s.db.Exec(r.Context(), `DELETE FROM players WHERE id = $1`, id)
+	tag, err := s.db.Exec(c.Context(), `DELETE FROM players WHERE id = $1`, id)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Player not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player not found.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"id": id, "deleted": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"id": id, "deleted": true})
 }

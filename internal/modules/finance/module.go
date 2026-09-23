@@ -8,6 +8,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pb-kecebong/backend/internal/domain/finance"
+	"github.com/gofiber/fiber/v2"
+
 	"github.com/pb-kecebong/backend/internal/httpx"
 )
 
@@ -33,25 +35,22 @@ func idPtr(s string) any {
 
 // Summary gives the finance page its numbers for an optional period or
 // session scope. Revenue here counts recorded income, not billed amounts.
-func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	periodID := q.Get("period_id")
-	sessionID := q.Get("session_id")
+func (s *Service) Summary(c *fiber.Ctx) error {
+	periodID := c.Query("period_id")
+	sessionID := c.Query("session_id")
 
 	revWhere, expWhere := "TRUE", "TRUE"
 	args := []any{}
 	if periodID != "" {
 		if _, err := uuid.Parse(periodID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid period ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid period ID."))
 		}
 		args = append(args, periodID)
 		revWhere = "period_id = $" + strconv.Itoa(len(args))
 		expWhere = "period_id = $" + strconv.Itoa(len(args))
 	} else if sessionID != "" {
 		if _, err := uuid.Parse(sessionID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
 		}
 		args = append(args, sessionID)
 		revWhere = "session_id = $" + strconv.Itoa(len(args))
@@ -59,17 +58,15 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var totalRevenue int64
-	if err := s.db.QueryRow(r.Context(),
+	if err := s.db.QueryRow(c.Context(),
 		`SELECT COALESCE(SUM(amount), 0) FROM revenues WHERE `+revWhere, args...).Scan(&totalRevenue); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not compute revenue.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not compute revenue.")
 	}
 
-	rows, err := s.db.Query(r.Context(),
+	rows, err := s.db.Query(c.Context(),
 		`SELECT category, SUM(amount) FROM expenses WHERE `+expWhere+` GROUP BY category ORDER BY category`, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not compute expenses.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not compute expenses.")
 	}
 	defer rows.Close()
 	byCategory := map[string]int64{}
@@ -85,9 +82,9 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 
 	var unitsUsed int64
 	var avgPerUnit int64
-	if err := s.db.QueryRow(r.Context(), `
+	if err := s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(units), 0) FROM shuttlecock_transactions WHERE type = 'USAGE'`).Scan(&unitsUsed); err == nil {
-		_ = s.db.QueryRow(r.Context(), `
+		_ = s.db.QueryRow(c.Context(), `
 			SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
 			FROM shuttlecock_transactions t
 			JOIN shuttlecock_products pr ON pr.id = t.product_id
@@ -99,7 +96,7 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	operatingCost := venue + shuttleUsageCost
 	profit := totalRevenue - operatingCost
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"total_revenue":          totalRevenue,
 		"total_expense":          totalExpense,
 		"expense_by_category":    byCategory,
@@ -127,8 +124,8 @@ type txRow struct {
 	OccurredAt string  `json:"occurred_at"`
 }
 
-func (s *Service) Transactions(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) Transactions(c *fiber.Ctx) error {
+	rows, err := s.db.Query(c.Context(), `
 		SELECT rv.id::text, 'REVENUE', rv.source, rv.player_id::text, pl.name, rv.amount, rv.note,
 		       rv.session_id::text, rv.occurred_at::text
 		FROM revenues rv LEFT JOIN players pl ON pl.id = rv.player_id
@@ -138,8 +135,7 @@ func (s *Service) Transactions(w http.ResponseWriter, r *http.Request) {
 		FROM expenses ex
 		ORDER BY occurred_at DESC LIMIT 200`)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load transactions.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load transactions.")
 	}
 	defer rows.Close()
 	list := []txRow{}
@@ -150,7 +146,7 @@ func (s *Service) Transactions(w http.ResponseWriter, r *http.Request) {
 			list = append(list, t)
 		}
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 type revenueInput struct {
@@ -162,37 +158,32 @@ type revenueInput struct {
 	Note      string `json:"note"`
 }
 
-func (s *Service) CreateRevenue(w http.ResponseWriter, r *http.Request) {
+func (s *Service) CreateRevenue(c *fiber.Ctx) error {
 	var in revenueInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if !revenueSources[in.Source] {
-		httpx.WriteAppError(w, httpx.Unprocessable("Invalid revenue source."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Invalid revenue source."))
 	}
 	if in.Amount <= 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Amount must be greater than 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Amount must be greater than 0."))
 	}
 	if in.SessionID != "" {
 		if _, err := uuid.Parse(in.SessionID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
 		}
 	}
 	var id string
-	err := s.db.QueryRow(r.Context(), `
+	err := s.db.QueryRow(c.Context(), `
 		INSERT INTO revenues (id, session_id, period_id, source, player_id, amount, note)
 		VALUES (gen_random_uuid(), $1, $2, $3, NULLIF($4, '')::uuid, $5, NULLIF($6, ''))
 		RETURNING id::text`,
 		idPtr(in.SessionID), idPtr(in.PeriodID), in.Source, in.PlayerID, in.Amount, in.Note).Scan(&id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save revenue.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save revenue.")
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"id": id})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"id": id})
 }
 
 type expenseInput struct {
@@ -203,35 +194,30 @@ type expenseInput struct {
 	Note      string `json:"note"`
 }
 
-func (s *Service) CreateExpense(w http.ResponseWriter, r *http.Request) {
+func (s *Service) CreateExpense(c *fiber.Ctx) error {
 	var in expenseInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if !expenseCategories[in.Category] {
-		httpx.WriteAppError(w, httpx.Unprocessable("Invalid expense category."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Invalid expense category."))
 	}
 	if in.Amount <= 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Amount must be greater than 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Amount must be greater than 0."))
 	}
 	if in.SessionID != "" {
 		if _, err := uuid.Parse(in.SessionID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
 		}
 	}
 	var id string
-	err := s.db.QueryRow(r.Context(), `
+	err := s.db.QueryRow(c.Context(), `
 		INSERT INTO expenses (id, session_id, period_id, category, amount, note)
 		VALUES (gen_random_uuid(), $1, $2, $3, $4, NULLIF($5, ''))
 		RETURNING id::text`,
 		idPtr(in.SessionID), idPtr(in.PeriodID), in.Category, in.Amount, in.Note).Scan(&id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save expense.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save expense.")
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"id": id})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"id": id})
 }

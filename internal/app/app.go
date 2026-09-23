@@ -3,7 +3,6 @@ package app
 import (
 	"context"
 	"log"
-	"net/http"
 	"os/signal"
 	"syscall"
 	"time"
@@ -43,34 +42,26 @@ func Run(cfg config.Config) {
 		log.Fatalf("admin setup: %v", err)
 	}
 
-	r := httpapi.NewRouter(httpapi.Dependencies{
-		Auth:      authSvc,
-		Dashboard: dashboard.NewService(pool),
-		Finance:   financemod.NewService(pool),
-		Inventory: inventory.NewService(pool),
-		Mabar:     mabar.NewService(pool),
+	app := httpapi.NewRouter(httpapi.Dependencies{
+		Auth:       authSvc,
+		Dashboard:  dashboard.NewService(pool),
+		Finance:    financemod.NewService(pool),
+		Inventory:  inventory.NewService(pool),
+		Mabar:      mabar.NewService(pool),
 		MatchMaker: matchmaker.NewService(pool, cfg),
-		Period:    period.NewService(pool),
-		Player:    player.NewService(pool),
-		Report:    report.NewService(pool),
-		Venue:     venue.NewService(pool),
+		Period:     period.NewService(pool),
+		Player:     player.NewService(pool),
+		Report:     report.NewService(pool),
+		Venue:      venue.NewService(pool),
 	}, cfg)
-
-	srv := &http.Server{
-		Addr:              ":" + cfg.Port,
-		Handler:           r,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
 
 	go func() {
 		log.Printf("pb-kecebong backend listening on :%s", cfg.Port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := app.Listen(":" + cfg.Port); err != nil {
 			log.Fatalf("server failed: %v", err)
 		}
 	}()
 
 	<-ctx.Done()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	_ = app.ShutdownWithTimeout(10 * time.Second)
 }

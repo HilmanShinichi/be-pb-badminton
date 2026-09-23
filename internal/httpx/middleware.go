@@ -1,16 +1,12 @@
 package httpx
 
 import (
-	"context"
 	"net/http"
 	"strings"
 
+	"github.com/gofiber/fiber/v2"
 	"github.com/golang-jwt/jwt/v5"
 )
-
-type ctxKey int
-
-const userIDKey ctxKey = iota
 
 type Claims struct {
 	UserID   string `json:"uid"`
@@ -33,34 +29,30 @@ func ParseToken(secret, raw string) (*Claims, error) {
 	return token.Claims.(*Claims), nil
 }
 
-func RequireAuth(secret string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tokenStr := ""
-			header := r.Header.Get("Authorization")
-			if strings.HasPrefix(header, "Bearer ") {
-				tokenStr = strings.TrimPrefix(header, "Bearer ")
-			} else if qToken := r.URL.Query().Get("token"); qToken != "" {
-				tokenStr = qToken
-			}
-			if tokenStr == "" {
-				Err(w, http.StatusUnauthorized, "UNAUTHORIZED", "Login is required.")
-				return
-			}
-			claims, err := ParseToken(secret, tokenStr)
-			if err != nil {
-				Err(w, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid session.")
-				return
-			}
-			ctx := context.WithValue(r.Context(), userIDKey, claims)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
+func RequireAuth(secret string) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		tokenStr := ""
+		header := c.Get("Authorization")
+		if strings.HasPrefix(header, "Bearer ") {
+			tokenStr = strings.TrimPrefix(header, "Bearer ")
+		} else if qToken := c.Query("token"); qToken != "" {
+			tokenStr = qToken
+		}
+		if tokenStr == "" {
+			return Err(c, http.StatusUnauthorized, "UNAUTHORIZED", "Login is required.")
+		}
+		claims, err := ParseToken(secret, tokenStr)
+		if err != nil {
+			return Err(c, http.StatusUnauthorized, "UNAUTHORIZED", "Invalid session.")
+		}
+		c.Locals("claims", claims)
+		return c.Next()
 	}
 }
 
-func ClaimsFrom(ctx context.Context) *Claims {
-	if c, ok := ctx.Value(userIDKey).(*Claims); ok {
-		return c
+func ClaimsFrom(c *fiber.Ctx) *Claims {
+	if cl, ok := c.Locals("claims").(*Claims); ok {
+		return cl
 	}
 	return &Claims{}
 }

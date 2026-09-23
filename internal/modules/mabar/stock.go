@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
@@ -99,81 +99,71 @@ type allocationItem struct {
 // per-product split (e.g. 12 pcs from one tube brand, 1 pc from another).
 // The items must add up to the full session usage recorded in matches and
 // simple recap, and every bucket must actually hold its share.
-func (s *Service) SaveAllocation(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	sess, err := s.fetch(r, id)
+func (s *Service) SaveAllocation(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	var in struct {
 		Items []allocationItem `json:"items"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	seen := map[string]bool{}
 	total := 0
 	for _, it := range in.Items {
 		if _, err := uuid.Parse(it.ProductID); err != nil {
-			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
-			return
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid product ID."))
 		}
 		if it.Units <= 0 {
-			httpx.WriteAppError(w, httpx.Unprocessable("Allocation units must be greater than 0."))
-			return
+			return httpx.WriteAppError(c, httpx.Unprocessable("Allocation units must be greater than 0."))
 		}
 		if seen[it.ProductID] {
-			httpx.WriteAppError(w, httpx.Unprocessable("Each product can only appear once in an allocation."))
-			return
+			return httpx.WriteAppError(c, httpx.Unprocessable("Each product can only appear once in an allocation."))
 		}
 		seen[it.ProductID] = true
 		var active bool
 		var pname, purpose string
-		if err := s.db.QueryRow(r.Context(),
+		if err := s.db.QueryRow(c.Context(),
 			`SELECT active, name, purpose FROM shuttlecock_products WHERE id = $1`, it.ProductID).Scan(&active, &pname, &purpose); err != nil || !active {
-			httpx.WriteAppError(w, httpx.Unprocessable("Shuttlecock product not found or inactive."))
-			return
+			return httpx.WriteAppError(c, httpx.Unprocessable("Shuttlecock product not found or inactive."))
 		}
 		if !suitablePurpose(purpose, sess.Type) {
 			want := "daily"
 			if sess.Type == "PERIOD" {
 				want = "period"
 			}
-			httpx.WriteAppError(w, httpx.Unprocessable(fmt.Sprintf(
+			return httpx.WriteAppError(c, httpx.Unprocessable(fmt.Sprintf(
 				"'%s' is for %s sessions and cannot be used in this %s session.", pname, strings.ToLower(purpose), want)))
-			return
 		}
 		total += it.Units
 	}
 
 	var usage int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE((SELECT SUM(shuttlecock_used) FROM matches WHERE session_id = $1), 0)
 		     + COALESCE((SELECT SUM(shuttlecock_used) FROM session_player_stats WHERE session_id = $1), 0)`,
 		id).Scan(&usage)
 	if total != usage {
-		httpx.WriteAppError(w, httpx.Unprocessable(fmt.Sprintf(
+		return httpx.WriteAppError(c, httpx.Unprocessable(fmt.Sprintf(
 			"Allocation (%d pcs) must cover the full session usage of %d pcs.", total, usage)))
-		return
 	}
 
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	freed := map[string]int64{}
-	frows, err := tx.Query(r.Context(), `
+	frows, err := tx.Query(c.Context(), `
 		SELECT product_id::text, COALESCE(SUM(units), 0)
 		FROM shuttlecock_transactions
 		WHERE session_id = $1 AND type = 'USAGE' GROUP BY product_id`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
 	}
 	for frows.Next() {
 		var pid string
@@ -186,39 +176,34 @@ func (s *Service) SaveAllocation(w http.ResponseWriter, r *http.Request) {
 
 	names := map[string]string{}
 	for _, it := range in.Items {
-		name, stock, serr := productStock(r.Context(), tx, it.ProductID)
+		name, stock, serr := productStock(c.Context(), tx, it.ProductID)
 		if serr != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
 		}
 		if err := checkStockFit(name, stock, freed[it.ProductID], int64(it.Units)); err != nil {
-			httpx.WriteAppError(w, err)
-			return
+			return httpx.WriteAppError(c, err)
 		}
 		names[it.ProductID] = name
 	}
 
-	if _, err := tx.Exec(r.Context(),
+	if _, err := tx.Exec(c.Context(),
 		`DELETE FROM shuttlecock_transactions WHERE session_id = $1 AND type = 'USAGE'`, id); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
 	}
 	out := make([]map[string]any, 0, len(in.Items))
 	for _, it := range in.Items {
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO shuttlecock_transactions (id, product_id, type, units, session_id, match_id, note)
 			VALUES (gen_random_uuid(), $1, 'USAGE', $2, $3, NULL, 'manual-allocation')`,
 			it.ProductID, it.Units, id); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
 		}
 		out = append(out, map[string]any{
 			"product_id": it.ProductID, "product_name": names[it.ProductID], "units": it.Units,
 		})
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save allocation.")
 	}
-	httpx.OK(w, http.StatusOK, out)
+	return httpx.OK(c, http.StatusOK, out)
 }

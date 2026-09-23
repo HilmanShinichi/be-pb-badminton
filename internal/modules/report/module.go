@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -18,10 +18,10 @@ type Service struct{ db *pgxpool.Pool }
 func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
 
 // wantCSV lets every report double as a CSV download. PRD §67.
-func wantCSV(r *http.Request) bool { return r.URL.Query().Get("format") == "csv" }
+func wantCSV(c *fiber.Ctx) bool { return c.Query("format") == "csv" }
 
-func sendCSV(w http.ResponseWriter, r *http.Request, name string, header []string, rows [][]string) {
-	httpx.CSV(w, name, header, rows)
+func sendCSV(c *fiber.Ctx, name string, header []string, rows [][]string) error {
+	return httpx.CSV(c, name, header, rows)
 }
 
 type ScopeFilter struct {
@@ -30,12 +30,11 @@ type ScopeFilter struct {
 	SessionID string
 }
 
-func parseScopeFilter(r *http.Request) ScopeFilter {
-	q := r.URL.Query()
+func parseScopeFilter(c *fiber.Ctx) ScopeFilter {
 	f := ScopeFilter{
-		Scope:     q.Get("scope"),
-		PeriodID:  q.Get("period_id"),
-		SessionID: q.Get("session_id"),
+		Scope:     c.Query("scope"),
+		PeriodID:  c.Query("period_id"),
+		SessionID: c.Query("session_id"),
 	}
 	if f.PeriodID != "" {
 		if _, err := uuid.Parse(f.PeriodID); err != nil {
@@ -71,8 +70,8 @@ func sessionWhere(f ScopeFilter, alias string) (string, []any) {
 }
 
 // Attendance: per-player listed/present/cancelled/no-show with rate. PRD §17/§40.
-func (s *Service) Attendance(w http.ResponseWriter, r *http.Request) {
-	f := parseScopeFilter(r)
+func (s *Service) Attendance(c *fiber.Ctx) error {
+	f := parseScopeFilter(c)
 	cond, args := sessionWhere(f, "ms")
 
 	query := fmt.Sprintf(`
@@ -89,10 +88,9 @@ func (s *Service) Attendance(w http.ResponseWriter, r *http.Request) {
 		HAVING COUNT(*) FILTER (WHERE a.status <> 'NOT_LISTED') > 0
 		ORDER BY pl.name`, cond)
 
-	rows, err := s.db.Query(r.Context(), query, args...)
+	rows, err := s.db.Query(c.Context(), query, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load attendance report.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load attendance report.")
 	}
 	defer rows.Close()
 
@@ -114,17 +112,16 @@ func (s *Service) Attendance(w http.ResponseWriter, r *http.Request) {
 			csvRows = append(csvRows, []string{t.Name, it(t.Listed), it(t.Present), it(t.Cancelled), it(t.NoShow), fmt.Sprintf("%.1f%%", float64(t.RateBP)/100)})
 		}
 	}
-	if wantCSV(r) {
-		sendCSV(w, r, "attendance-report.csv",
+	if wantCSV(c) {
+		return sendCSV(c, "attendance-report.csv",
 			[]string{"Player", "Listed", "Present", "Cancelled", "No-show", "No-show rate"}, csvRows)
-		return
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 // NoShow ranks players by no-show count, highest first. PRD §40.
-func (s *Service) NoShow(w http.ResponseWriter, r *http.Request) {
-	f := parseScopeFilter(r)
+func (s *Service) NoShow(c *fiber.Ctx) error {
+	f := parseScopeFilter(c)
 	cond, args := sessionWhere(f, "ms")
 
 	query := fmt.Sprintf(`
@@ -140,10 +137,9 @@ func (s *Service) NoShow(w http.ResponseWriter, r *http.Request) {
 		HAVING COUNT(*) FILTER (WHERE a.status = 'NO_SHOW') > 0
 		ORDER BY COUNT(*) FILTER (WHERE a.status = 'NO_SHOW') DESC, pl.name`, cond)
 
-	rows, err := s.db.Query(r.Context(), query, args...)
+	rows, err := s.db.Query(c.Context(), query, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load no-show report.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load no-show report.")
 	}
 	defer rows.Close()
 
@@ -164,20 +160,18 @@ func (s *Service) NoShow(w http.ResponseWriter, r *http.Request) {
 			csvRows = append(csvRows, []string{t.Name, it(t.Listed), it(t.Present), it(t.NoShow), fmt.Sprintf("%.1f%%", float64(t.RateBP)/100)})
 		}
 	}
-	if wantCSV(r) {
-		sendCSV(w, r, "no-show-report.csv",
+	if wantCSV(c) {
+		return sendCSV(c, "no-show-report.csv",
 			[]string{"Player", "Listed", "Present", "No-show", "No-show rate"}, csvRows)
-		return
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 // NoShowTracker returns comprehensive no-show and cancellation records with
 // filtering by months (e.g. 3, 6, 9, 12 months) and scope (period, daily, or all).
-func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
+func (s *Service) NoShowTracker(c *fiber.Ctx) error {
 	months := 0
-	if mStr := q.Get("months"); mStr != "" {
+	if mStr := c.Query("months"); mStr != "" {
 		n := 0
 		for _, c := range mStr {
 			if c < '0' || c > '9' {
@@ -190,7 +184,7 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	f := parseScopeFilter(r)
+	f := parseScopeFilter(c)
 	cond, args := sessionWhere(f, "ms")
 
 	monthCond := "TRUE"
@@ -198,7 +192,7 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 		monthCond = fmt.Sprintf("ms.date >= CURRENT_DATE - make_interval(months => %d)", months)
 	}
 
-	statusFilter := q.Get("status")
+	statusFilter := c.Query("status")
 	statusCond := "a.status IN ('NO_SHOW', 'CANCELLED')"
 	if statusFilter == "NO_SHOW" {
 		statusCond = "a.status = 'NO_SHOW'"
@@ -227,10 +221,9 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 		WHERE %s AND %s AND %s
 		ORDER BY ms.date DESC, pl.name`, statusCond, cond, monthCond)
 
-	rows, err := s.db.Query(r.Context(), query, args...)
+	rows, err := s.db.Query(c.Context(), query, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load no-show tracker records.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load no-show tracker records.")
 	}
 	defer rows.Close()
 
@@ -267,7 +260,7 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 		GROUP BY a.player_id`, cond, monthCond)
 
 	listedMap := map[string]int{}
-	if lRows, err := s.db.Query(r.Context(), listedQuery, args...); err == nil {
+	if lRows, err := s.db.Query(c.Context(), listedQuery, args...); err == nil {
 		defer lRows.Close()
 		for lRows.Next() {
 			var pid string
@@ -336,7 +329,7 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 		return playerList[i].PlayerName < playerList[j].PlayerName
 	})
 
-	if wantCSV(r) {
+	if wantCSV(c) {
 		csvRows := [][]string{}
 		for _, it := range incidents {
 			csvRows = append(csvRows, []string{
@@ -349,12 +342,11 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 				it.Reason,
 			})
 		}
-		sendCSV(w, r, "no-show-tracker.csv",
+		return sendCSV(c, "no-show-tracker.csv",
 			[]string{"Date", "Type", "Period", "Venue", "Player", "Status", "Reason"}, csvRows)
-		return
 	}
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"months":          months,
 		"scope":           f.Scope,
 		"total_incidents": len(incidents),
@@ -365,59 +357,53 @@ func (s *Service) NoShowTracker(w http.ResponseWriter, r *http.Request) {
 
 // DeleteNoShowIncident removes or restores an attendance record marked as NO_SHOW or CANCELLED
 // (e.g. when an admin mistakenly recorded a player as no-show / wrong input).
-func (s *Service) DeleteNoShowIncident(w http.ResponseWriter, r *http.Request) {
-	attendanceID := chi.URLParam(r, "attendanceId")
+func (s *Service) DeleteNoShowIncident(c *fiber.Ctx) error {
+	attendanceID := c.Params("attendanceId")
 	if _, err := uuid.Parse(attendanceID); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "ID absensi tidak valid."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "ID absensi tidak valid."))
 	}
 
 	var sessionID, playerID, status string
-	err := s.db.QueryRow(r.Context(),
+	err := s.db.QueryRow(c.Context(),
 		`SELECT session_id::text, player_id::text, status
 		 FROM attendances
 		 WHERE id = $1`, attendanceID).Scan(&sessionID, &playerID, &status)
 	if err != nil {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Catatan absensi tidak ditemukan.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Catatan absensi tidak ditemukan.")
 	}
 
 	if status != "NO_SHOW" && status != "CANCELLED" {
-		httpx.WriteAppError(w, httpx.BadRequest("INVALID_STATUS", "Hanya catatan NO_SHOW atau CANCELLED yang dapat dihapus dari tracker."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("INVALID_STATUS", "Hanya catatan NO_SHOW atau CANCELLED yang dapat dihapus dari tracker."))
 	}
 
-	restorePresent := r.URL.Query().Get("restore_present") == "true"
+	restorePresent := c.Query("restore_present") == "true"
 
 	// Check if player has bills in this session
 	var bills int
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT COUNT(*) FROM player_bills WHERE session_id = $1 AND player_id = $2`,
 		sessionID, playerID).Scan(&bills)
 
 	if restorePresent || bills > 0 {
-		_, err = s.db.Exec(r.Context(),
+		_, err = s.db.Exec(c.Context(),
 			`UPDATE attendances
 			 SET status = 'PRESENT', no_show_reason = NULL, cancelled_at = NULL
 			 WHERE id = $1`, attendanceID)
 		if err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal memperbarui status absensi.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal memperbarui status absensi.")
 		}
-		httpx.OK(w, http.StatusOK, map[string]any{"ok": true, "action": "restored_present"})
-		return
+		return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "action": "restored_present"})
 	}
 
-	tag, err := s.db.Exec(r.Context(),
+	tag, err := s.db.Exec(c.Context(),
 		`DELETE FROM attendances WHERE id = $1`, attendanceID)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menghapus catatan absensi.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menghapus catatan absensi.")
 	}
 
 	deletedPlayer := false
 	var history int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT (SELECT COUNT(*) FROM attendances WHERE player_id = $1)
 		     + (SELECT COUNT(*) FROM match_players WHERE player_id = $1)
 		     + (SELECT COUNT(*) FROM player_bills WHERE player_id = $1)
@@ -427,18 +413,18 @@ func (s *Service) DeleteNoShowIncident(w http.ResponseWriter, r *http.Request) {
 		     + (SELECT COUNT(*) FROM session_player_stats WHERE player_id = $1)`,
 		playerID).Scan(&history)
 	if history == 0 {
-		tag, err := s.db.Exec(r.Context(), `DELETE FROM players WHERE id = $1`, playerID)
+		tag, err := s.db.Exec(c.Context(), `DELETE FROM players WHERE id = $1`, playerID)
 		if err == nil && tag.RowsAffected() > 0 {
 			deletedPlayer = true
 		}
 	}
 
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true, "action": "deleted", "player_deleted": deletedPlayer})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "action": "deleted", "player_deleted": deletedPlayer})
 }
 
 // Shuttlecock: player contribution ranking across all sessions. PRD §24.
-func (s *Service) Shuttlecock(w http.ResponseWriter, r *http.Request) {
-	f := parseScopeFilter(r)
+func (s *Service) Shuttlecock(c *fiber.Ctx) error {
+	f := parseScopeFilter(c)
 	cond, args := sessionWhere(f, "ms")
 
 	query := fmt.Sprintf(`
@@ -453,10 +439,9 @@ func (s *Service) Shuttlecock(w http.ResponseWriter, r *http.Request) {
 		GROUP BY pl.name
 		ORDER BY COALESCE(SUM(m.shuttlecock_used), 0) DESC, pl.name`, cond)
 
-	rows, err := s.db.Query(r.Context(), query, args...)
+	rows, err := s.db.Query(c.Context(), query, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load shuttlecock report.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load shuttlecock report.")
 	}
 	defer rows.Close()
 
@@ -476,18 +461,17 @@ func (s *Service) Shuttlecock(w http.ResponseWriter, r *http.Request) {
 			rank++
 		}
 	}
-	if wantCSV(r) {
-		sendCSV(w, r, "shuttlecock-report.csv",
+	if wantCSV(c) {
+		return sendCSV(c, "shuttlecock-report.csv",
 			[]string{"Rank", "Player", "Matches", "Player shuttlecocks"}, csvRows)
-		return
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 // PlayerUsage: attendance, matches and shuttlecock contribution per player
 // in one table. PRD §41.
-func (s *Service) PlayerUsage(w http.ResponseWriter, r *http.Request) {
-	f := parseScopeFilter(r)
+func (s *Service) PlayerUsage(c *fiber.Ctx) error {
+	f := parseScopeFilter(c)
 	cond, args := sessionWhere(f, "ms")
 
 	query := fmt.Sprintf(`
@@ -523,10 +507,9 @@ func (s *Service) PlayerUsage(w http.ResponseWriter, r *http.Request) {
 		  AND (COALESCE(att.present, 0) > 0 OR COALESCE(mm.matches, 0) > 0 OR COALESCE(us.usage, 0) > 0)
 		ORDER BY COALESCE(us.usage, 0) DESC, pl.name`, cond, cond, cond)
 
-	rows, err := s.db.Query(r.Context(), query, args...)
+	rows, err := s.db.Query(c.Context(), query, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load player report.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load player report.")
 	}
 	defer rows.Close()
 
@@ -545,17 +528,16 @@ func (s *Service) PlayerUsage(w http.ResponseWriter, r *http.Request) {
 			csvRows = append(csvRows, []string{t.Name, it(t.Present), it(t.Matches), it(int(t.Usage))})
 		}
 	}
-	if wantCSV(r) {
-		sendCSV(w, r, "player-report.csv",
+	if wantCSV(c) {
+		return sendCSV(c, "player-report.csv",
 			[]string{"Player", "Present", "Matches", "Player shuttlecocks"}, csvRows)
-		return
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 // Financial: revenue by source, expense by category, profit and cash flow.
-func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
-	f := parseScopeFilter(r)
+func (s *Service) Financial(c *fiber.Ctx) error {
+	f := parseScopeFilter(c)
 
 	revCond := "TRUE"
 	expCond := "TRUE"
@@ -578,7 +560,7 @@ func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var revenueBySource = map[string]int64{}
-	rows, err := s.db.Query(r.Context(),
+	rows, err := s.db.Query(c.Context(),
 		fmt.Sprintf(`SELECT r.source, SUM(r.amount)
 		             FROM revenues r
 		             LEFT JOIN mabar_sessions s ON s.id = r.session_id
@@ -586,8 +568,7 @@ func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
 		             GROUP BY r.source
 		             ORDER BY r.source`, revCond), args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load financial report.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load financial report.")
 	}
 	for rows.Next() {
 		var k string
@@ -599,7 +580,7 @@ func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
 	rows.Close()
 
 	var expenseByCategory = map[string]int64{}
-	rows, err = s.db.Query(r.Context(),
+	rows, err = s.db.Query(c.Context(),
 		fmt.Sprintf(`SELECT e.category, SUM(e.amount)
 		             FROM expenses e
 		             LEFT JOIN mabar_sessions s ON s.id = e.session_id
@@ -607,8 +588,7 @@ func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
 		             GROUP BY e.category
 		             ORDER BY e.category`, expCond), args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load financial report.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load financial report.")
 	}
 	defer rows.Close()
 	for rows.Next() {
@@ -639,11 +619,10 @@ func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
 	csvRows = append(csvRows, []string{"TOTAL", "Cash expenses", it(int(totalExpense))})
 	csvRows = append(csvRows, []string{"TOTAL", "Cash flow", it(int(totalRevenue - totalExpense))})
 
-	if wantCSV(r) {
-		sendCSV(w, r, "financial-report.csv", []string{"Type", "Category", "Amount"}, csvRows)
-		return
+	if wantCSV(c) {
+		return sendCSV(c, "financial-report.csv", []string{"Type", "Category", "Amount"}, csvRows)
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"revenue_by_source":   revenueBySource,
 		"expense_by_category": expenseByCategory,
 		"total_revenue":       totalRevenue,
@@ -654,9 +633,9 @@ func (s *Service) Financial(w http.ResponseWriter, r *http.Request) {
 
 // InactiveMembers flags players with no PRESENT attendance for the
 // configured threshold. PRD §39.
-func (s *Service) InactiveMembers(w http.ResponseWriter, r *http.Request) {
+func (s *Service) InactiveMembers(c *fiber.Ctx) error {
 	months := 6
-	if v := r.URL.Query().Get("months"); len(v) > 0 && (v[0] >= '1' && v[0] <= '9') {
+	if v := c.Query("months"); len(v) > 0 && (v[0] >= '1' && v[0] <= '9') {
 		n := 0
 		for _, c := range v {
 			if c < '0' || c > '9' {
@@ -668,7 +647,7 @@ func (s *Service) InactiveMembers(w http.ResponseWriter, r *http.Request) {
 			months = n
 		}
 	}
-	rows, err := s.db.Query(r.Context(), `
+	rows, err := s.db.Query(c.Context(), `
 		SELECT pl.name,
 		       COALESCE(TO_CHAR(MAX(a.present_at), 'YYYY-MM-DD'), '-'),
 		       COALESCE(cnt.total, 0),
@@ -685,8 +664,7 @@ func (s *Service) InactiveMembers(w http.ResponseWriter, r *http.Request) {
 		HAVING COALESCE(MAX(a.present_at), 'epoch') < now() - make_interval(months => $1)
 		ORDER BY MAX(a.present_at) NULLS FIRST`, months)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load inactive members.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load inactive members.")
 	}
 	defer rows.Close()
 
@@ -703,7 +681,7 @@ func (s *Service) InactiveMembers(w http.ResponseWriter, r *http.Request) {
 			list = append(list, t)
 		}
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"threshold_months": months, "players": list})
+	return httpx.OK(c, http.StatusOK, map[string]any{"threshold_months": months, "players": list})
 }
 
 func it(n int) string { return fmt.Sprintf("%d", n) }

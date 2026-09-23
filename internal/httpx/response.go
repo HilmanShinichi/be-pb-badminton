@@ -1,9 +1,10 @@
 package httpx
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
+
+	"github.com/gofiber/fiber/v2"
 )
 
 type Envelope struct {
@@ -16,31 +17,28 @@ type ErrorBody struct {
 	Details any    `json:"details"`
 }
 
-func OK(w http.ResponseWriter, status int, data any) {
-	writeJSON(w, status, Envelope{Data: data})
+func OK(c *fiber.Ctx, status int, data any) error {
+	return c.Status(status).JSON(Envelope{Data: data})
 }
 
-func OKWithMeta(w http.ResponseWriter, status int, data, meta any) {
-	writeJSON(w, status, Envelope{Data: data, Meta: meta})
+func OKWithMeta(c *fiber.Ctx, status int, data, meta any) error {
+	return c.Status(status).JSON(Envelope{Data: data, Meta: meta})
 }
 
-func Err(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, map[string]any{"error": ErrorBody{Code: code, Message: message}})
+func Err(c *fiber.Ctx, status int, code, message string) error {
+	return c.Status(status).JSON(map[string]any{"error": ErrorBody{Code: code, Message: message}})
 }
 
-func WriteAppError(w http.ResponseWriter, err error) {
+func WriteAppError(c *fiber.Ctx, err error) error {
 	ae := AsAppError(err)
-	Err(w, ae.Status, ae.Code, ae.Message)
+	return Err(c, ae.Status, ae.Code, ae.Message)
 }
 
-func Decode(r *http.Request, into any) error {
-	return json.NewDecoder(r.Body).Decode(into)
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+func Decode(c *fiber.Ctx, into any) error {
+	if len(c.Body()) == 0 {
+		return errors.New("empty body")
+	}
+	return c.BodyParser(into)
 }
 
 // AppError carries a stable error code from service layer to HTTP status.

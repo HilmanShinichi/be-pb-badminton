@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/gofiber/fiber/v2"
+
 	"github.com/pb-kecebong/backend/internal/httpx"
 )
 
@@ -26,24 +28,21 @@ type loginRequest struct {
 	Password string `json:"password"`
 }
 
-func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Login(c *fiber.Ctx) error {
 	var req loginRequest
-	if err := decode(r, &req); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &req); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if req.Username == "" || req.Password == "" {
-		httpx.Err(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Username and password are required.")
-		return
+		return httpx.Err(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "Username and password are required.")
 	}
 
 	var id, hash string
-	err := s.db.QueryRow(r.Context(),
+	err := s.db.QueryRow(c.Context(),
 		`SELECT id::text, password_hash FROM users WHERE username = $1`, req.Username,
 	).Scan(&id, &hash)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
-		httpx.Err(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Incorrect username or password.")
-		return
+		return httpx.Err(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Incorrect username or password.")
 	}
 
 	claims := &httpx.Claims{
@@ -52,19 +51,18 @@ func (s *Service) Login(w http.ResponseWriter, r *http.Request) {
 	}
 	token, err := httpx.SignToken(s.jwtSecret, claims)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create session.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create session.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"token": token, "username": req.Username, "role": "ADMIN"})
+	return httpx.OK(c, http.StatusOK, map[string]any{"token": token, "username": req.Username, "role": "ADMIN"})
 }
 
-func (s *Service) Me(w http.ResponseWriter, r *http.Request) {
-	c := httpx.ClaimsFrom(r.Context())
-	httpx.OK(w, http.StatusOK, map[string]any{"username": c.Username, "role": c.Role})
+func (s *Service) Me(c *fiber.Ctx) error {
+	cl := httpx.ClaimsFrom(c)
+	return httpx.OK(c, http.StatusOK, map[string]any{"username": cl.Username, "role": cl.Role})
 }
 
-func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+func (s *Service) Logout(c *fiber.Ctx) error {
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // EnsureAdminUser creates the default admin if no user exists, so a fresh
@@ -86,6 +84,3 @@ func (s *Service) EnsureAdminUser(ctx context.Context) error {
 	return err
 }
 
-func decode(r *http.Request, into any) error {
-	return httpx.Decode(r, into)
-}

@@ -1,12 +1,13 @@
 package period
 
 import (
+	"context"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -92,12 +93,11 @@ func scanPeriod(row pgx.Row) (Period, error) {
 	return p, err
 }
 
-func (s *Service) List(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(),
+func (s *Service) List(c *fiber.Ctx) error {
+	rows, err := s.db.Query(c.Context(),
 		`SELECT `+periodCols+` FROM membership_periods ORDER BY start_date DESC`)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load periods.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load periods.")
 	}
 	defer rows.Close()
 	periods := []Period{}
@@ -106,23 +106,22 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 			periods = append(periods, p)
 		}
 	}
-	httpx.OK(w, http.StatusOK, periods)
+	return httpx.OK(c, http.StatusOK, periods)
 }
 
-func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
-	p, err := s.fetch(r, chi.URLParam(r, "id"))
+func (s *Service) Get(c *fiber.Ctx) error {
+	p, err := s.fetch(c.Context(), c.Params("id"))
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
-	httpx.OK(w, http.StatusOK, p)
+	return httpx.OK(c, http.StatusOK, p)
 }
 
-func (s *Service) fetch(r *http.Request, id string) (Period, error) {
+func (s *Service) fetch(ctx context.Context, id string) (Period, error) {
 	if _, err := uuid.Parse(id); err != nil {
 		return Period{}, httpx.BadRequest("BAD_REQUEST", "Invalid period ID.")
 	}
-	p, err := scanPeriod(s.db.QueryRow(r.Context(),
+	p, err := scanPeriod(s.db.QueryRow(ctx,
 		`SELECT `+periodCols+` FROM membership_periods WHERE id = $1`, id))
 	if err != nil {
 		return Period{}, httpx.NotFound("Period not found.")
@@ -182,15 +181,13 @@ func (in periodInput) validate() error {
 	return nil
 }
 
-func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Create(c *fiber.Ctx) error {
 	var in periodInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := in.validate(); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	weekdays := weekdaysOr(in.SessionWeekdays)
 	// Session count is derived from the date range and picked weekdays, so a
@@ -200,7 +197,7 @@ func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
 		// Old periods without weekdays keep their manual session count.
 		sessions = *in.NumberOfSessions
 	}
-	p, err := scanPeriod(s.db.QueryRow(r.Context(),
+	p, err := scanPeriod(s.db.QueryRow(c.Context(),
 		`INSERT INTO membership_periods
 		 (id, name, start_date, end_date, number_of_sessions, max_members,
 		  commitment_fee, member_contribution, non_member_fee,
@@ -213,16 +210,15 @@ func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
 		val64(in.VenueCostTotal), valDef64(in.ShuttlePackPrice, 125000), valDefInt(in.ShuttleUnitsPerPack, 12), valDefInt(in.ShuttlePerSession, 24),
 		weekdays, in.DefaultStartTime, in.DefaultEndTime))
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save period.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save period.")
 	}
-	httpx.OK(w, http.StatusCreated, p)
+	return httpx.OK(c, http.StatusCreated, p)
 }
 
 // guardImmutable rejects edits on COMPLETED periods: history becomes
 // read-only and changes must go through an explicit reopen. PRD §50.
-func (s *Service) guardImmutable(r *http.Request, id string) error {
-	p, err := s.fetch(r, id)
+func (s *Service) guardImmutable(ctx context.Context, id string) error {
+	p, err := s.fetch(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -232,26 +228,23 @@ func (s *Service) guardImmutable(r *http.Request, id string) error {
 	return nil
 }
 
-func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if err := s.guardImmutable(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) Update(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if err := s.guardImmutable(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
 	var in periodInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := in.validate(); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	weekdays := weekdaysOr(in.SessionWeekdays)
 	if in.SessionWeekdays == nil {
 		// Partial edit (e.g. cost settings): keep existing weekdays, times,
 		// quota and status instead of wiping them.
-		cur, _ := s.fetch(r, id)
+		cur, _ := s.fetch(c.Context(), id)
 		weekdays = cur.SessionWeekdays
 		if in.DefaultStartTime == nil {
 			in.DefaultStartTime = cur.DefaultStartTime
@@ -272,7 +265,7 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 		}
 		status := *in.Status
 		// Keep existing cost settings when the edit form omits them.
-		p, err := scanPeriod(s.db.QueryRow(r.Context(),
+		p, err := scanPeriod(s.db.QueryRow(c.Context(),
 			`UPDATE membership_periods SET
 			 name = $2, start_date = $3, end_date = $4, number_of_sessions = $5,
 			 max_members = $6, commitment_fee = $7, member_contribution = $8,
@@ -292,11 +285,9 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 			status,
 			weekdays, in.DefaultStartTime, in.DefaultEndTime))
 		if err != nil {
-			httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Period not found.")
-			return
+			return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 		}
-		httpx.OK(w, http.StatusOK, p)
-		return
+		return httpx.OK(c, http.StatusOK, p)
 	}
 	sessions := countSessionDays(*in.StartDate, *in.EndDate, weekdays)
 	if sessions == 0 && in.NumberOfSessions != nil && *in.NumberOfSessions > 0 {
@@ -307,8 +298,8 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 		status = *in.Status
 	}
 	// Keep existing cost settings when the edit form omits them.
-	cur, _ := s.fetch(r, id)
-	p, err := scanPeriod(s.db.QueryRow(r.Context(),
+	cur, _ := s.fetch(c.Context(), id)
+	p, err := scanPeriod(s.db.QueryRow(c.Context(),
 		`UPDATE membership_periods SET
 		 name = $2, start_date = $3, end_date = $4, number_of_sessions = $5,
 		 max_members = $6, commitment_fee = $7, member_contribution = $8,
@@ -326,42 +317,38 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 		status,
 		weekdays, in.DefaultStartTime, in.DefaultEndTime))
 	if err != nil {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Period not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 	}
-	httpx.OK(w, http.StatusOK, p)
+	return httpx.OK(c, http.StatusOK, p)
 }
 
 // Delete removes a period. With sessions, members or money it refuses unless
 // ?force=true, which hard-deletes the whole period tree (sessions and their
 // histories, memberships, period money records).
-func (s *Service) Delete(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if _, err := s.fetch(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) Delete(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if _, err := s.fetch(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
 	var sessions, members, money int
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT COUNT(*) FROM mabar_sessions WHERE period_id = $1`, id).Scan(&sessions)
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT COUNT(*) FROM memberships WHERE period_id = $1 AND status <> 'WITHDRAWN'`, id).Scan(&members)
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT (SELECT COUNT(*) FROM revenues WHERE period_id = $1)
 		        + (SELECT COUNT(*) FROM expenses WHERE period_id = $1)`, id).Scan(&money)
-	if (sessions > 0 || members > 0 || money > 0) && r.URL.Query().Get("force") != "true" {
-		httpx.WriteAppError(w, httpx.Conflict("PERIOD_HAS_HISTORY",
+	if (sessions > 0 || members > 0 || money > 0) && c.Query("force") != "true" {
+		return httpx.WriteAppError(c, httpx.Conflict("PERIOD_HAS_HISTORY",
 			"Period already has sessions, members, or money. Delete with force to wipe everything."))
-		return
 	}
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete period.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete period.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 	exec := func(q string) error {
-		_, err := tx.Exec(r.Context(), q, id)
+		_, err := tx.Exec(c.Context(), q, id)
 		return err
 	}
 	// Wipe every session of this period exactly like a forced session delete.
@@ -380,44 +367,39 @@ func (s *Service) Delete(w http.ResponseWriter, r *http.Request) {
 		`DELETE FROM expenses WHERE period_id = $1`,
 	} {
 		if err := exec(q); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete period.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete period.")
 		}
 	}
-	tag, err := tx.Exec(r.Context(), `DELETE FROM membership_periods WHERE id = $1`, id)
+	tag, err := tx.Exec(c.Context(), `DELETE FROM membership_periods WHERE id = $1`, id)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Period not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete period.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete period.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *Service) Complete(w http.ResponseWriter, r *http.Request) {	id := chi.URLParam(r, "id")
-	if _, err := s.fetch(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) Complete(c *fiber.Ctx) error {	id := c.Params("id")
+	if _, err := s.fetch(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
-	tag, err := s.db.Exec(r.Context(),
+	tag, err := s.db.Exec(c.Context(),
 		`UPDATE membership_periods SET status = 'COMPLETED', updated_at = now() WHERE id = $1 AND status <> 'COMPLETED'`, id)
 	if err != nil || tag.RowsAffected() == 0 {
 		httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed.")
-		return
+		return nil
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"id": id, "status": "COMPLETED"})
+	return httpx.OK(c, http.StatusOK, map[string]any{"id": id, "status": "COMPLETED"})
 }
 
-func (s *Service) ListMembers(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	p, err := s.fetch(r, id)
+func (s *Service) ListMembers(c *fiber.Ctx) error {
+	id := c.Params("id")
+	p, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
-	rows, err := s.db.Query(r.Context(), `
+	rows, err := s.db.Query(c.Context(), `
 	SELECT m.id::text, m.period_id::text, m.player_id::text, pl.name, m.commitment_fee,
 	       m.joined_at::text, m.status, COALESCE(a.cnt, 0)
 		FROM memberships m
@@ -432,8 +414,7 @@ func (s *Service) ListMembers(w http.ResponseWriter, r *http.Request) {
 		WHERE m.period_id = $1 AND m.status <> 'WITHDRAWN'
 		ORDER BY pl.name`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load members.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load members.")
 	}
 	defer rows.Close()
 
@@ -451,7 +432,7 @@ func (s *Service) ListMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	// Attach per-member payment totals from finance revenues recorded with
 	// this period and player. A separate query keeps the main scan stable.
-	if prows, err := s.db.Query(r.Context(), `
+	if prows, err := s.db.Query(c.Context(), `
 		SELECT player_id::text, source, COALESCE(SUM(amount), 0)
 		FROM revenues
 		WHERE period_id = $1 AND player_id IS NOT NULL
@@ -476,7 +457,7 @@ func (s *Service) ListMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	// Visit payments collected per session (paid period-session bills) count
 	// toward the member balance under VISIT_BILLS.
-	if brows, err := s.db.Query(r.Context(), `
+	if brows, err := s.db.Query(c.Context(), `
 		SELECT b.player_id::text, COALESCE(SUM(b.total), 0)
 		FROM player_bills b
 		JOIN mabar_sessions ms ON ms.id = b.session_id
@@ -495,101 +476,88 @@ func (s *Service) ListMembers(w http.ResponseWriter, r *http.Request) {
 		}
 		brows.Close()
 	}
-	httpx.OK(w, http.StatusOK, members)
+	return httpx.OK(c, http.StatusOK, members)
 }
 
 type memberInput struct {
 	PlayerID string `json:"player_id"`
 }
 
-func (s *Service) AddMember(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if err := s.guardImmutable(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) AddMember(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if err := s.guardImmutable(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
 	var in memberInput
-	if err := httpx.Decode(r, &in); err != nil || in.PlayerID == "" {
-		httpx.Err(w, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "A player must be selected.")
-		return
+	if err := httpx.Decode(c, &in); err != nil || in.PlayerID == "" {
+		return httpx.Err(c, http.StatusUnprocessableEntity, "VALIDATION_ERROR", "A player must be selected.")
 	}
 	if _, err := uuid.Parse(in.PlayerID); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
-		return
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid player ID.")
 	}
-	p, _ := s.fetch(r, id)
+	p, _ := s.fetch(c.Context(), id)
 	if p.MaxMembers != nil {
 		var count int
-		_ = s.db.QueryRow(r.Context(),
+		_ = s.db.QueryRow(c.Context(),
 			`SELECT COUNT(*) FROM memberships WHERE period_id = $1 AND status <> 'WITHDRAWN'`, id).Scan(&count)
 		if count >= *p.MaxMembers {
-			httpx.WriteAppError(w, httpx.Conflict("MEMBERS_FULL", "Period member quota is full."))
-			return
+			return httpx.WriteAppError(c, httpx.Conflict("MEMBERS_FULL", "Period member quota is full."))
 		}
 	}
 	var mID, joinedAt string
-	err := s.db.QueryRow(r.Context(),
+	err := s.db.QueryRow(c.Context(),
 		`INSERT INTO memberships (id, period_id, player_id, commitment_fee)
 		 VALUES (gen_random_uuid(), $1, $2, $3)
 		 ON CONFLICT (period_id, player_id) DO UPDATE SET status = 'ACTIVE', commitment_fee = EXCLUDED.commitment_fee
 		 RETURNING id::text, joined_at::text`, id, in.PlayerID, p.CommitmentFee).Scan(&mID, &joinedAt)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not add member.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not add member.")
 	}
-	httpx.OK(w, http.StatusCreated, Membership{ID: mID, PeriodID: id, PlayerID: in.PlayerID, CommitmentFee: p.CommitmentFee, JoinedAt: joinedAt, Status: "ACTIVE", PaidBySource: map[string]int64{}})
+	return httpx.OK(c, http.StatusCreated, Membership{ID: mID, PeriodID: id, PlayerID: in.PlayerID, CommitmentFee: p.CommitmentFee, JoinedAt: joinedAt, Status: "ACTIVE", PaidBySource: map[string]int64{}})
 }
 
-func (s *Service) RemoveMember(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	playerID := chi.URLParam(r, "playerId")
-	if err := s.guardImmutable(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) RemoveMember(c *fiber.Ctx) error {
+	id := c.Params("id")
+	playerID := c.Params("playerId")
+	if err := s.guardImmutable(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
 	// ?hard=true permanently deletes the membership AND every payment
 	// recorded for this player in this period (revenues). Session history
 	// (attendance, session bills) is left untouched. Default is a reversible
 	// withdraw that keeps the money in finance.
-	if r.URL.Query().Get("hard") == "true" {
-		tx, err := s.db.Begin(r.Context())
+	if c.Query("hard") == "true" {
+		tx, err := s.db.Begin(c.Context())
 		if err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
 		}
-		defer tx.Rollback(r.Context())
+		defer tx.Rollback(c.Context())
 		var dropped int64
-		if err := tx.QueryRow(r.Context(),
+		if err := tx.QueryRow(c.Context(),
 			`WITH d AS (DELETE FROM revenues WHERE period_id = $1 AND player_id = $2 RETURNING 1)
 			 SELECT COUNT(*) FROM d`, id, playerID).Scan(&dropped); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
 		}
-		tag, err := tx.Exec(r.Context(),
+		tag, err := tx.Exec(c.Context(),
 			`DELETE FROM memberships WHERE period_id = $1 AND player_id = $2`, id, playerID)
 		if err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
 		}
 		if tag.RowsAffected() == 0 {
-			httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Membership not found.")
-			return
+			return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Membership not found.")
 		}
-		if err := tx.Commit(r.Context()); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
-			return
+		if err := tx.Commit(c.Context()); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete member.")
 		}
-		httpx.OK(w, http.StatusOK, map[string]any{"ok": true, "payments_deleted": dropped})
-		return
+		return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "payments_deleted": dropped})
 	}
-	tag, err := s.db.Exec(r.Context(),
+	tag, err := s.db.Exec(c.Context(),
 		`UPDATE memberships SET status = 'WITHDRAWN' WHERE period_id = $1 AND player_id = $2 AND status <> 'WITHDRAWN'`,
 		id, playerID)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Membership not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Membership not found.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
 
 // Summary is the period dashboard: profit, cash flow and shuttlecock totals
@@ -597,18 +565,17 @@ func (s *Service) RemoveMember(w http.ResponseWriter, r *http.Request) {
 // accrual at weighted average purchase price and never equals cash flow.
 // Projection (from period settings + members + attendance) is always returned
 // so a new period shows numbers before manual finance entries exist.
-func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	p, err := s.fetch(r, id)
+func (s *Service) Summary(c *fiber.Ctx) error {
+	id := c.Params("id")
+	p, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 
 	var revenue, venueCost, purchaseCost int64
 	var unitsUsed, unitsPurchased int64
 	var sessions int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE((SELECT SUM(amount) FROM revenues WHERE period_id = $1), 0),
 			COALESCE((SELECT SUM(amount) FROM expenses WHERE period_id = $1 AND category = 'VENUE'), 0),
@@ -620,7 +587,7 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 
 	// Per-unit avg: unit_price is stored per pack, so divide by pack size.
 	var avgPerUnit int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
 		FROM shuttlecock_transactions t
 		JOIN shuttlecock_products pr ON pr.id = t.product_id
@@ -640,10 +607,10 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	var memberCount int
 	var commitmentTotal int64
 	var memberPresent, nonMemberPresent int
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT COUNT(*), COALESCE(SUM(commitment_fee), 0) FROM memberships WHERE period_id = $1 AND status <> 'WITHDRAWN'`,
 		id).Scan(&memberCount, &commitmentTotal)
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE(COUNT(*) FILTER (WHERE a.status = 'PRESENT' AND a.is_member), 0),
 			COALESCE(COUNT(*) FILTER (WHERE a.status = 'PRESENT' AND NOT a.is_member), 0)
@@ -668,7 +635,7 @@ func (s *Service) Summary(w http.ResponseWriter, r *http.Request) {
 	// To-date projection uses setting venue prorated + actual billed.
 	projOperatingToDate := p.VenueCostTotal + shuttleCost
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"period":                    p,
 		"total_revenue":             revenue,
 		"billed_revenue":            billedRevenue,
@@ -718,9 +685,9 @@ func maxInt(a, b int) int {
 // match count (contribution metric, not inventory reduction, PRD §23).
 // Simple recap numbers live in their own session panel and are deliberately
 // kept out, so the two input modes never double-count each other.
-func (s *Service) ShuttlecockMatrix(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) ShuttlecockMatrix(c *fiber.Ctx) error {
+	id := c.Params("id")
+	rows, err := s.db.Query(c.Context(), `
 		SELECT pl.name, ms.date::text, SUM(m.shuttlecock_used::bigint)
 		FROM match_players mp
 		JOIN matches m ON m.id = mp.match_id
@@ -730,8 +697,7 @@ func (s *Service) ShuttlecockMatrix(w http.ResponseWriter, r *http.Request) {
 		GROUP BY pl.name, ms.date
 		ORDER BY pl.name, ms.date`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load shuttlecock matrix.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load shuttlecock matrix.")
 	}
 	defer rows.Close()
 
@@ -774,7 +740,7 @@ func (s *Service) ShuttlecockMatrix(w http.ResponseWriter, r *http.Request) {
 	for _, c := range matrix {
 		totalUnits += c.Total
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"dates":           sessionDates,
 		"rows":            matrix,
 		"total":           totalUnits,
@@ -786,11 +752,10 @@ func (s *Service) ShuttlecockMatrix(w http.ResponseWriter, r *http.Request) {
 // night's own revenue, cost and profit. It keeps per-session results
 // separate from the full-period totals: period-level income or costs that
 // are not linked to any session only appear in Summary, never here.
-func (s *Service) SessionBreakdown(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if _, err := s.fetch(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if _, err := s.fetch(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
 
 	type sess struct {
@@ -804,12 +769,11 @@ func (s *Service) SessionBreakdown(w http.ResponseWriter, r *http.Request) {
 		Units    int
 	}
 	sessions := []sess{}
-	srows, err := s.db.Query(r.Context(), `
+	srows, err := s.db.Query(c.Context(), `
 		SELECT id::text, date::text, court_cost, shuttle_pack_price, shuttle_units_per_pack
 		FROM mabar_sessions WHERE period_id = $1 ORDER BY date`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load sessions.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load sessions.")
 	}
 	for srows.Next() {
 		var x sess
@@ -823,8 +787,8 @@ func (s *Service) SessionBreakdown(w http.ResponseWriter, r *http.Request) {
 	for i := range sessions {
 		byID[sessions[i].ID] = &sessions[i]
 	}
-	collect := func(q string, into func(*sess, int64)) {
-		prows, err := s.db.Query(r.Context(), q, id)
+	collect := func(ctx context.Context, q string, into func(*sess, int64)) {
+		prows, err := s.db.Query(ctx, q, id)
 		if err != nil {
 			return
 		}
@@ -840,21 +804,21 @@ func (s *Service) SessionBreakdown(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	inPeriod := `IN (SELECT id FROM mabar_sessions WHERE period_id = $1)`
-	collect(`SELECT session_id::text, COUNT(*) FROM attendances
+	collect(c.Context(), `SELECT session_id::text, COUNT(*) FROM attendances
 		WHERE status = 'PRESENT' AND session_id `+inPeriod+` GROUP BY session_id`,
 		func(x *sess, n int64) { x.Present = int(n) })
-	collect(`SELECT session_id::text, COALESCE(SUM(amount), 0) FROM revenues
+	collect(c.Context(), `SELECT session_id::text, COALESCE(SUM(amount), 0) FROM revenues
 		WHERE session_id `+inPeriod+` GROUP BY session_id`,
 		func(x *sess, n int64) { x.Revenue += n })
-	collect(`SELECT session_id::text, COALESCE(SUM(total), 0) FROM player_bills
+	collect(c.Context(), `SELECT session_id::text, COALESCE(SUM(total), 0) FROM player_bills
 		WHERE payment_status = 'PAID' AND session_id `+inPeriod+` GROUP BY session_id`,
 		func(x *sess, n int64) { x.Revenue += n })
-	collect(`SELECT session_id::text, COALESCE(SUM(units), 0) FROM shuttlecock_transactions
+	collect(c.Context(), `SELECT session_id::text, COALESCE(SUM(units), 0) FROM shuttlecock_transactions
 		WHERE type = 'USAGE' AND session_id `+inPeriod+` GROUP BY session_id`,
 		func(x *sess, n int64) { x.Units = int(n) })
 
 	var avgPerUnit int64
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
 		FROM shuttlecock_transactions t
 		JOIN shuttlecock_products pr ON pr.id = t.product_id
@@ -889,41 +853,36 @@ func (s *Service) SessionBreakdown(w http.ResponseWriter, r *http.Request) {
 			Status: finance.FinancialStatus(x.Revenue, opCost),
 		})
 	}
-	httpx.OK(w, http.StatusOK, out)
+	return httpx.OK(c, http.StatusOK, out)
 }
 
 // GenerateSessions creates one PERIOD mabar session per picked weekday
 // between start and end. It is idempotent: dates that already have a session
 // for this period are skipped, so re-running after adding a weekday only
 // fills the gaps. Default start/end times are copied onto new sessions.
-func (s *Service) GenerateSessions(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if err := s.guardImmutable(r, id); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+func (s *Service) GenerateSessions(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if err := s.guardImmutable(c.Context(), id); err != nil {
+		return httpx.WriteAppError(c, err)
 	}
-	p, err := s.fetch(r, id)
+	p, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	if len(p.SessionWeekdays) == 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Pick at least one weekday on the period first."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pick at least one weekday on the period first."))
 	}
 	start, err1 := time.Parse("2006-01-02", p.StartDate)
 	end, err2 := time.Parse("2006-01-02", p.EndDate)
 	if err1 != nil || err2 != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Period dates are invalid.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Period dates are invalid.")
 	}
 
 	existing := map[string]bool{}
-	rows, err := s.db.Query(r.Context(),
+	rows, err := s.db.Query(c.Context(),
 		`SELECT date::text FROM mabar_sessions WHERE period_id = $1`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load existing sessions.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load existing sessions.")
 	}
 	for rows.Next() {
 		var d string
@@ -949,18 +908,17 @@ func (s *Service) GenerateSessions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		var newID string
-		if err := s.db.QueryRow(r.Context(), `
+		if err := s.db.QueryRow(c.Context(), `
 			INSERT INTO mabar_sessions (id, type, period_id, date, start_time, end_time, court_cost, shuttlecock_price, shuttle_pack_price, shuttle_units_per_pack)
 			VALUES (gen_random_uuid(), 'PERIOD', $1, $2, $3, $4, $5, $6, $7, $8)
 			RETURNING id::text`, id, date, p.DefaultStartTime, p.DefaultEndTime,
 			perSessionCourt, perUnitPrice(p.ShuttlePackPrice, p.ShuttleUnitsPerPack),
 			p.ShuttlePackPrice, maxInt(p.ShuttleUnitsPerPack, 1)).Scan(&newID); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create sessions.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create sessions.")
 		}
 		created = append(created, date)
 	}
-	httpx.OK(w, http.StatusCreated, map[string]any{"created": created, "count": len(created)})
+	return httpx.OK(c, http.StatusCreated, map[string]any{"created": created, "count": len(created)})
 }
 
 func perUnitPrice(packPrice int64, perPack int) int64 {
@@ -1070,23 +1028,21 @@ type MatrixNonMemberRow struct {
 // AttendanceMatrix aggregates attendance and kas kok data across all sessions
 // of a period for each active member, producing a matrix table matching the
 // club's weekly member recap spreadsheet.
-func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	p, err := s.fetch(r, id)
+func (s *Service) AttendanceMatrix(c *fiber.Ctx) error {
+	id := c.Params("id")
+	p, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 
 	// 1. Fetch all sessions for this period ordered by date
-	srows, err := s.db.Query(r.Context(), `
+	srows, err := s.db.Query(c.Context(), `
 		SELECT id::text, date::text, status
 		FROM mabar_sessions
 		WHERE period_id = $1
 		ORDER BY date ASC, created_at ASC`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load period sessions.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load period sessions.")
 	}
 	defer srows.Close()
 
@@ -1102,15 +1058,14 @@ func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
 	srows.Close()
 
 	// 2. Fetch active members for this period
-	mrows, err := s.db.Query(r.Context(), `
+	mrows, err := s.db.Query(c.Context(), `
 		SELECT m.player_id::text, pl.name, m.commitment_fee
 		FROM memberships m
 		JOIN players pl ON pl.id = m.player_id
 		WHERE m.period_id = $1 AND m.status <> 'WITHDRAWN'
 		ORDER BY pl.name ASC`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load members.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load members.")
 	}
 	defer mrows.Close()
 
@@ -1127,7 +1082,7 @@ func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
 	mrows.Close()
 
 	// 3. Fetch commitment payments per member
-	prows, err := s.db.Query(r.Context(), `
+	prows, err := s.db.Query(c.Context(), `
 		SELECT player_id::text, COALESCE(SUM(amount), 0)
 		FROM revenues
 		WHERE period_id = $1 AND source = 'COMMITMENT_FEE' AND player_id IS NOT NULL
@@ -1158,7 +1113,7 @@ func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Fetch attendance records for sessions in this period
-	arows, err := s.db.Query(r.Context(), `
+	arows, err := s.db.Query(c.Context(), `
 		SELECT a.session_id::text, a.player_id::text, a.status
 		FROM attendances a
 		JOIN mabar_sessions ms ON ms.id = a.session_id
@@ -1187,7 +1142,7 @@ func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
 	if nonMemberFee <= 0 {
 		nonMemberFee = 25000
 	}
-	nmRows, err := s.db.Query(r.Context(), `
+	nmRows, err := s.db.Query(c.Context(), `
 		SELECT a.session_id::text, a.player_id::text, pl.name,
 		       COALESCE(b.total, $2),
 		       COALESCE(b.payment_status, 'PAID'),
@@ -1225,7 +1180,7 @@ func (s *Service) AttendanceMatrix(w http.ResponseWriter, r *http.Request) {
 		totalKasKok += sessions[i].TotalKasKok
 	}
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"sessions":            sessions,
 		"rows":                rows,
 		"non_members":         nonMembers,

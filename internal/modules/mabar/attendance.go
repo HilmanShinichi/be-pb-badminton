@@ -3,7 +3,7 @@ package mabar
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 
 	"github.com/pb-kecebong/backend/internal/httpx"
@@ -27,9 +27,9 @@ type Attendance struct {
 	NoShowReason           *string `json:"no_show_reason"`
 }
 
-func (s *Service) ListAttendance(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	rows, err := s.db.Query(r.Context(), `
+func (s *Service) ListAttendance(c *fiber.Ctx) error {
+	id := c.Params("id")
+	rows, err := s.db.Query(c.Context(), `
 		SELECT a.id::text, a.session_id::text, a.player_id::text, pl.name, a.status,
 		       a.is_member, a.replacement_for_player_id::text, a.listed_at::text,
 		       a.cancelled_at::text, a.no_show_reason
@@ -37,8 +37,7 @@ func (s *Service) ListAttendance(w http.ResponseWriter, r *http.Request) {
 		JOIN players pl ON pl.id = a.player_id
 		WHERE a.session_id = $1 ORDER BY pl.name`, id)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load attendance.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load attendance.")
 	}
 	defer rows.Close()
 	list := []Attendance{}
@@ -49,7 +48,7 @@ func (s *Service) ListAttendance(w http.ResponseWriter, r *http.Request) {
 			list = append(list, a)
 		}
 	}
-	httpx.OK(w, http.StatusOK, list)
+	return httpx.OK(c, http.StatusOK, list)
 }
 
 type attendanceInput struct {
@@ -71,55 +70,49 @@ type bulkAttendanceInput struct {
 }
 
 // SetAttendance upserts the full attendance sheet of one session in one call.
-func (s *Service) SetAttendance(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	sess, err := s.fetch(r, id)
+func (s *Service) SetAttendance(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	if sess.PeriodID != nil {
 		var status string
-		_ = s.db.QueryRow(r.Context(),
+		_ = s.db.QueryRow(c.Context(),
 			`SELECT status FROM membership_periods WHERE id = $1`, *sess.PeriodID).Scan(&status)
 		if status == "COMPLETED" {
-			httpx.WriteAppError(w, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
-			return
+			return httpx.WriteAppError(c, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
 		}
 	}
 
 	var in bulkAttendanceInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 
 	if in.PresentAll {
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			UPDATE attendances SET status = 'PRESENT'
 			WHERE session_id = $1 AND status IN ('LISTED', 'CONFIRMED')`, id); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 		}
 	}
 
 	if in.SeedMembers && sess.PeriodID != nil {
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO attendances (id, session_id, player_id, status, is_member)
 			SELECT gen_random_uuid(), $1, m.player_id, 'PRESENT', true
 			FROM memberships m
 			JOIN players pl ON pl.id = m.player_id
 			WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'
 			ON CONFLICT (session_id, player_id) DO NOTHING`, id, *sess.PeriodID); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 		}
 	}
 
@@ -130,7 +123,7 @@ func (s *Service) SetAttendance(w http.ResponseWriter, r *http.Request) {
 		if !attendanceStatuses[it.Status] {
 			return httpx.Unprocessable("Invalid attendance status: " + it.Status)
 		}
-		_, err := tx.Exec(r.Context(), `
+		_, err := tx.Exec(c.Context(), `
 			INSERT INTO attendances (id, session_id, player_id, status, is_member,
 			                         replacement_for_player_id, cancelled_at, no_show_reason)
 			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5,
@@ -147,21 +140,18 @@ func (s *Service) SetAttendance(w http.ResponseWriter, r *http.Request) {
 
 	for _, it := range in.Players {
 		if err := apply(it); err != nil {
-			httpx.WriteAppError(w, err)
-			return
+			return httpx.WriteAppError(c, err)
 		}
 	}
 	for _, it := range in.Overrides {
 		if err := apply(it); err != nil {
-			httpx.WriteAppError(w, err)
-			return
+			return httpx.WriteAppError(c, err)
 		}
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 	}
-	s.ListAttendance(w, r)
+	return s.ListAttendance(c)
 }
 
 // RemoveAttendance deletes one player's attendance row from a session. It is
@@ -170,52 +160,46 @@ func (s *Service) SetAttendance(w http.ResponseWriter, r *http.Request) {
 // history anywhere (no attendance, matches, bills, payments, revenues,
 // memberships, or recap stats) the player row itself is hard-deleted too, so
 // a typo name added via quick-add disappears completely.
-func (s *Service) RemoveAttendance(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	playerID := chi.URLParam(r, "playerId")
+func (s *Service) RemoveAttendance(c *fiber.Ctx) error {
+	id := c.Params("id")
+	playerID := c.Params("playerId")
 	if _, err := uuid.Parse(id); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
 	}
 	if _, err := uuid.Parse(playerID); err != nil {
-		httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
-		return
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
 	}
-	sess, err := s.fetch(r, id)
+	sess, err := s.fetch(c.Context(), id)
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	if sess.PeriodID != nil {
 		var status string
-		_ = s.db.QueryRow(r.Context(),
+		_ = s.db.QueryRow(c.Context(),
 			`SELECT status FROM membership_periods WHERE id = $1`, *sess.PeriodID).Scan(&status)
 		if status == "COMPLETED" {
-			httpx.WriteAppError(w, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
-			return
+			return httpx.WriteAppError(c, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
 		}
 	}
 
 	var bills int
-	_ = s.db.QueryRow(r.Context(),
+	_ = s.db.QueryRow(c.Context(),
 		`SELECT COUNT(*) FROM player_bills WHERE session_id = $1 AND player_id = $2`,
 		id, playerID).Scan(&bills)
 	if bills > 0 {
-		httpx.WriteAppError(w, httpx.Conflict("ATTENDANCE_HAS_BILLS",
+		return httpx.WriteAppError(c, httpx.Conflict("ATTENDANCE_HAS_BILLS",
 			"Player already has bills in this session. Set status to CANCELLED instead of removing."))
-		return
 	}
 
-	tag, err := s.db.Exec(r.Context(),
+	tag, err := s.db.Exec(c.Context(),
 		`DELETE FROM attendances WHERE session_id = $1 AND player_id = $2`, id, playerID)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Attendance not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Attendance not found.")
 	}
 
 	deleted := false
 	var history int
-	_ = s.db.QueryRow(r.Context(), `
+	_ = s.db.QueryRow(c.Context(), `
 		SELECT (SELECT COUNT(*) FROM attendances WHERE player_id = $1)
 		     + (SELECT COUNT(*) FROM match_players WHERE player_id = $1)
 		     + (SELECT COUNT(*) FROM player_bills WHERE player_id = $1)
@@ -225,19 +209,19 @@ func (s *Service) RemoveAttendance(w http.ResponseWriter, r *http.Request) {
 		     + (SELECT COUNT(*) FROM session_player_stats WHERE player_id = $1)`,
 		playerID).Scan(&history)
 	if history == 0 {
-		tag, err := s.db.Exec(r.Context(), `DELETE FROM players WHERE id = $1`, playerID)
+		tag, err := s.db.Exec(c.Context(), `DELETE FROM players WHERE id = $1`, playerID)
 		if err == nil && tag.RowsAffected() > 0 {
 			deleted = true
 		}
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true, "player_deleted": deleted})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "player_deleted": deleted})
 }
 
 // AttendanceStats answers the no-show questions per session. PRD §17.
-func (s *Service) AttendanceStats(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) AttendanceStats(c *fiber.Ctx) error {
+	id := c.Params("id")
 	var listed, present, cancelled, noShow int
-	err := s.db.QueryRow(r.Context(), `
+	err := s.db.QueryRow(c.Context(), `
 		SELECT
 			COUNT(*) FILTER (WHERE status <> 'NOT_LISTED'),
 			COUNT(*) FILTER (WHERE status = 'PRESENT'),
@@ -245,10 +229,9 @@ func (s *Service) AttendanceStats(w http.ResponseWriter, r *http.Request) {
 			COUNT(*) FILTER (WHERE status = 'NO_SHOW')
 		FROM attendances WHERE session_id = $1`, id).Scan(&listed, &present, &cancelled, &noShow)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not compute statistics.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not compute statistics.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"listed":          listed,
 		"present":         present,
 		"cancelled":       cancelled,

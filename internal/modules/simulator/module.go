@@ -5,12 +5,14 @@ import (
 	"net/http"
 
 	"github.com/pb-kecebong/backend/internal/domain/finance"
+	"github.com/gofiber/fiber/v2"
+
 	"github.com/pb-kecebong/backend/internal/httpx"
 )
 
 // RunPeriod answers "is this period profitable?" from typed inputs, before any
 // data is committed. PRD §42.
-func RunPeriod(w http.ResponseWriter, r *http.Request) {
+func RunPeriod(c *fiber.Ctx) error {
 	var in struct {
 		Sessions            int   `json:"sessions"`
 		Members             int   `json:"members"`
@@ -24,16 +26,14 @@ func RunPeriod(w http.ResponseWriter, r *http.Request) {
 		PackPrice           int64 `json:"pack_price"`
 		UnitsPerPack        int64 `json:"units_per_pack"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := validatePositive(map[string]int64{
 		"Sessions": int64(in.Sessions), "Members": int64(in.Members), "Non-member rate": in.NonMemberFee,
 		"Court cost per session": in.VenueCostPerSession, "Shuttlecock pack": in.PackPrice, "Units per pack": in.UnitsPerPack,
 	}); err != "" {
-		httpx.WriteAppError(w, httpx.Unprocessable(err))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable(err))
 	}
 	attendance := in.Members
 	if in.AvgMemberAttendance > 0 {
@@ -78,7 +78,7 @@ func RunPeriod(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"revenue":               revenue,
 		"member_revenue":        memberRevenue,
 		"non_member_revenue":    nonMemberRevenue,
@@ -101,7 +101,7 @@ func RunPeriod(w http.ResponseWriter, r *http.Request) {
 
 // RunDailyEvent projects one daily/event mabar: equal court split plus
 // per-shuttlecock contribution. PRD §25/§26.
-func RunDailyEvent(w http.ResponseWriter, r *http.Request) {
+func RunDailyEvent(c *fiber.Ctx) error {
 	var in struct {
 		VenueCost           int64 `json:"venue_cost"`
 		Players             int   `json:"players"`
@@ -110,17 +110,14 @@ func RunDailyEvent(w http.ResponseWriter, r *http.Request) {
 		PackPrice           int64 `json:"pack_price"`
 		UnitsPerPack        int64 `json:"units_per_pack"`
 	}
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if in.Players <= 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Player count must be greater than 0."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Player count must be greater than 0."))
 	}
 	if in.VenueCost < 0 || in.PricePerShuttlecock < 0 {
-		httpx.WriteAppError(w, httpx.Unprocessable("Cost must not be negative."))
-		return
+		return httpx.WriteAppError(c, httpx.Unprocessable("Cost must not be negative."))
 	}
 
 	shares := finance.CourtShares(in.VenueCost, in.Players)
@@ -131,7 +128,7 @@ func RunDailyEvent(w http.ResponseWriter, r *http.Request) {
 	revenue := in.VenueCost + shuttleRevenue
 	operatingCost := in.VenueCost + shuttleCost
 
-	httpx.OK(w, http.StatusOK, map[string]any{
+	return httpx.OK(c, http.StatusOK, map[string]any{
 		"court_share":         shares[0],
 		"court_cost_total":    in.VenueCost,
 		"shuttlecock_units":   totalUnits,

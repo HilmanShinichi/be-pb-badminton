@@ -1,12 +1,13 @@
 package mabar
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -116,8 +117,7 @@ func (in sessionInput) validate() error {
 	return nil
 }
 
-func (s *Service) List(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
+func (s *Service) List(c *fiber.Ctx) error {
 	sql := `SELECT ` + sessionCols + ` FROM mabar_sessions s
 		LEFT JOIN membership_periods p ON p.id = s.period_id
 		LEFT JOIN venues v ON v.id = s.venue_id WHERE 1=1`
@@ -126,24 +126,23 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 		args = append(args, val)
 		sql += clause + strconv.Itoa(len(args))
 	}
-	if t := q.Get("type"); t != "" {
+	if t := c.Query("type"); t != "" {
 		add(` AND s.type = $`, t)
 	}
-	if pid := q.Get("period_id"); pid != "" {
+	if pid := c.Query("period_id"); pid != "" {
 		add(` AND s.period_id = $`, pid)
 	}
-	if from := q.Get("from"); from != "" {
+	if from := c.Query("from"); from != "" {
 		add(` AND s.date >= $`, from)
 	}
-	if to := q.Get("to"); to != "" {
+	if to := c.Query("to"); to != "" {
 		add(` AND s.date <= $`, to)
 	}
 	sql += ` ORDER BY s.date DESC LIMIT 100`
 
-	rows, err := s.db.Query(r.Context(), sql, args...)
+	rows, err := s.db.Query(c.Context(), sql, args...)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load sessions.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load sessions.")
 	}
 	defer rows.Close()
 	sessions := []Session{}
@@ -152,14 +151,14 @@ func (s *Service) List(w http.ResponseWriter, r *http.Request) {
 			sessions = append(sessions, sess)
 		}
 	}
-	httpx.OK(w, http.StatusOK, sessions)
+	return httpx.OK(c, http.StatusOK, sessions)
 }
 
-func (s *Service) fetch(r *http.Request, id string) (Session, error) {
+func (s *Service) fetch(ctx context.Context, id string) (Session, error) {
 	if _, err := uuid.Parse(id); err != nil {
 		return Session{}, httpx.BadRequest("BAD_REQUEST", "Invalid session ID.")
 	}
-	sess, err := scanSession(s.db.QueryRow(r.Context(),
+	sess, err := scanSession(s.db.QueryRow(ctx,
 		`SELECT `+sessionCols+` FROM mabar_sessions s
 		 LEFT JOIN membership_periods p ON p.id = s.period_id
 		 LEFT JOIN venues v ON v.id = s.venue_id WHERE s.id = $1`, id))
@@ -169,45 +168,39 @@ func (s *Service) fetch(r *http.Request, id string) (Session, error) {
 	return sess, nil
 }
 
-func (s *Service) Get(w http.ResponseWriter, r *http.Request) {
-	sess, err := s.fetch(r, chi.URLParam(r, "id"))
+func (s *Service) Get(c *fiber.Ctx) error {
+	sess, err := s.fetch(c.Context(), c.Params("id"))
 	if err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
-	httpx.OK(w, http.StatusOK, sess)
+	return httpx.OK(c, http.StatusOK, sess)
 }
 
-func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
+func (s *Service) Create(c *fiber.Ctx) error {
 	var in sessionInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := in.validate(); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
 	if in.PeriodID != nil {
 		var status string
-		if err := s.db.QueryRow(r.Context(),
+		if err := s.db.QueryRow(c.Context(),
 			`SELECT status FROM membership_periods WHERE id = $1`, *in.PeriodID).Scan(&status); err != nil {
-			httpx.WriteAppError(w, httpx.NotFound("Period not found."))
-			return
+			return httpx.WriteAppError(c, httpx.NotFound("Period not found."))
 		}
 		if status == "COMPLETED" {
-			httpx.WriteAppError(w, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
-			return
+			return httpx.WriteAppError(c, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
 		}
 	}
 	var newID string
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 	}
-	defer tx.Rollback(r.Context())
-	err = tx.QueryRow(r.Context(), `
+	defer tx.Rollback(c.Context())
+	err = tx.QueryRow(c.Context(), `
 		INSERT INTO mabar_sessions
 		(id, type, period_id, venue_id, date, start_time, end_time, duration_minutes,
 		 description, venue_description, court_cost, pricing_mode, shuttlecock_price,
@@ -221,43 +214,38 @@ func (s *Service) Create(w http.ResponseWriter, r *http.Request) {
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
 		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12)).Scan(&newID)
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 	}
 	// Period sessions start with every active member already PRESENT —
 	// the admin then only marks whoever didn't show up.
 	if in.PeriodID != nil {
-		if _, err := tx.Exec(r.Context(), `
+		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO attendances (id, session_id, player_id, status, is_member)
 			SELECT gen_random_uuid(), $1, m.player_id, 'PRESENT', true
 			FROM memberships m
 			JOIN players pl ON pl.id = m.player_id
 			WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'`,
 			newID, *in.PeriodID); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
-			return
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 		}
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 	}
-	sess, _ := s.fetch(r, newID)
-	httpx.OK(w, http.StatusCreated, sess)
+	sess, _ := s.fetch(c.Context(), newID)
+	return httpx.OK(c, http.StatusCreated, sess)
 }
 
-func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) Update(c *fiber.Ctx) error {
+	id := c.Params("id")
 	var in sessionInput
-	if err := httpx.Decode(r, &in); err != nil {
-		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
-		return
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := in.validate(); err != nil {
-		httpx.WriteAppError(w, err)
-		return
+		return httpx.WriteAppError(c, err)
 	}
-	tag, err := s.db.Exec(r.Context(), `
+	tag, err := s.db.Exec(c.Context(), `
 		UPDATE mabar_sessions SET
 		 type = $2, period_id = $3, venue_id = $4, date = $5, start_time = $6::time, end_time = $7::time,
 		 duration_minutes = CASE WHEN $6::time IS NOT NULL AND $7::time IS NOT NULL
@@ -270,32 +258,29 @@ func (s *Service) Update(w http.ResponseWriter, r *http.Request) {
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
 		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12))
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Session not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")
 	}
-	sess, _ := s.fetch(r, id)
-	httpx.OK(w, http.StatusOK, sess)
+	sess, _ := s.fetch(c.Context(), id)
+	return httpx.OK(c, http.StatusOK, sess)
 }
 
 // Delete refuses when matches or financial records exist, unless
 // ?force=true explicitly confirms wiping the whole session history
 // (matches, attendance, simple recap, bills, payments, stock usage and
 // session-scoped money records). PRD §50.
-func (s *Service) Delete(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
+func (s *Service) Delete(c *fiber.Ctx) error {
+	id := c.Params("id")
 	var matches, revs int
-	_ = s.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM matches WHERE session_id = $1`, id).Scan(&matches)
-	_ = s.db.QueryRow(r.Context(), `SELECT COUNT(*) FROM revenues WHERE session_id = $1`, id).Scan(&revs)
-	if (matches > 0 || revs > 0) && r.URL.Query().Get("force") != "true" {
-		httpx.WriteAppError(w, httpx.Conflict("SESSION_HAS_HISTORY", "Session already has matches or transactions. Delete with force to wipe its history."))
-		return
+	_ = s.db.QueryRow(c.Context(), `SELECT COUNT(*) FROM matches WHERE session_id = $1`, id).Scan(&matches)
+	_ = s.db.QueryRow(c.Context(), `SELECT COUNT(*) FROM revenues WHERE session_id = $1`, id).Scan(&revs)
+	if (matches > 0 || revs > 0) && c.Query("force") != "true" {
+		return httpx.WriteAppError(c, httpx.Conflict("SESSION_HAS_HISTORY", "Session already has matches or transactions. Delete with force to wipe its history."))
 	}
-	tx, err := s.db.Begin(r.Context())
+	tx, err := s.db.Begin(c.Context())
 	if err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete session.")
-		return
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete session.")
 	}
-	defer tx.Rollback(r.Context())
+	defer tx.Rollback(c.Context())
 	for _, q := range []string{
 		`DELETE FROM payments WHERE bill_id IN (SELECT id FROM player_bills WHERE session_id = $1)`,
 		`DELETE FROM player_bills WHERE session_id = $1`,
@@ -306,19 +291,16 @@ func (s *Service) Delete(w http.ResponseWriter, r *http.Request) {
 		`DELETE FROM revenues WHERE session_id = $1`,
 		`DELETE FROM expenses WHERE session_id = $1`,
 	} {
-		if _, err := tx.Exec(r.Context(), q, id); err != nil {
-			httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete session.")
-			return
+		if _, err := tx.Exec(c.Context(), q, id); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete session.")
 		}
 	}
-	tag, err := tx.Exec(r.Context(), `DELETE FROM mabar_sessions WHERE id = $1`, id)
+	tag, err := tx.Exec(c.Context(), `DELETE FROM mabar_sessions WHERE id = $1`, id)
 	if err != nil || tag.RowsAffected() == 0 {
-		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Session not found.")
-		return
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")
 	}
-	if err := tx.Commit(r.Context()); err != nil {
-		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete session.")
-		return
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete session.")
 	}
-	httpx.OK(w, http.StatusOK, map[string]any{"ok": true})
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
 }
