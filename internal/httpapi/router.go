@@ -61,6 +61,7 @@ func NewRouter(deps Dependencies, cfg config.Config) http.Handler {
 		// Public live view: no token needed, read-only.
 		r.Get("/public/match-events", deps.MatchMaker.PublicEvents)
 		r.Get("/public/match-events/{id}", deps.MatchMaker.PublicEvent)
+		r.Get("/public/schedule", deps.Mabar.List)
 
 		r.Group(func(r chi.Router) {
 			r.Use(httpx.RequireAuth(cfg.JWTSecret))
