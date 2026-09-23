@@ -54,6 +54,7 @@ type MatchEvent struct {
 	Name       string   `json:"name"`
 	Status     string   `json:"status"`
 	CourtCount int      `json:"court_count"`
+	BasePlayed int      `json:"base_played"`
 	IsPublic   bool     `json:"is_public"`
 	ShowGrades bool     `json:"show_grades"`
 	PlayerIDs  []string `json:"player_ids"`
@@ -207,6 +208,7 @@ func (s *Service) CreateEvent(w http.ResponseWriter, r *http.Request) {
 		Name       string   `json:"name"`
 		PlayerIDs  []string `json:"player_ids"`
 		CourtCount *int     `json:"court_count"`
+		BasePlayed *int     `json:"base_played"`
 	}
 	if err := httpx.Decode(r, &in); err != nil || strings.TrimSpace(in.Name) == "" {
 		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "Event name is required.")
@@ -219,6 +221,14 @@ func (s *Service) CreateEvent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		courts = *in.CourtCount
+	}
+	base := 0
+	if in.BasePlayed != nil {
+		if *in.BasePlayed < 0 || *in.BasePlayed > 999 {
+			httpx.WriteAppError(w, httpx.Unprocessable("Starting count must be between 0 and 999."))
+			return
+		}
+		base = *in.BasePlayed
 	}
 	ids := in.PlayerIDs
 	if len(ids) == 0 {
@@ -243,9 +253,9 @@ func (s *Service) CreateEvent(w http.ResponseWriter, r *http.Request) {
 	var ev MatchEvent
 	var poolRaw string
 	err := s.db.QueryRow(r.Context(), `
-		INSERT INTO match_events (id, name, court_count, player_ids) VALUES (gen_random_uuid(), $1, $2, $3)
-		RETURNING id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text`,
-		strings.TrimSpace(in.Name), courts, string(idsJSON)).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+		INSERT INTO match_events (id, name, court_count, base_played, player_ids) VALUES (gen_random_uuid(), $1, $2, $3, $4)
+		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text`,
+		strings.TrimSpace(in.Name), courts, base, string(idsJSON)).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
 	if err != nil {
 		httpx.Err(w, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create event.")
 		return
@@ -294,8 +304,8 @@ func (s *Service) GetEvent(w http.ResponseWriter, r *http.Request) {
 	var ev MatchEvent
 	var poolRaw string
 	if err := s.db.QueryRow(r.Context(),
-		`SELECT id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text FROM match_events WHERE id = $1`,
-		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
+		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text FROM match_events WHERE id = $1`,
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
 		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 		return
 	}
@@ -325,7 +335,7 @@ func (s *Service) GetEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	counts := []PlayerCount{}
 	for _, p := range pool {
-		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: played[p.ID]})
+		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID]})
 	}
 	httpx.OK(w, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
 }
@@ -336,9 +346,9 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 	var ev MatchEvent
 	var poolRaw string
 	if err := s.db.QueryRow(ctx,
-		`SELECT id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text
+		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text
 		 FROM match_events WHERE id = $1 AND is_public`,
-		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
 		return ev, nil, nil, err
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
@@ -379,7 +389,7 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 		if !ev.ShowGrades {
 			grade = nil
 		}
-		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: played[p.ID]})
+		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID]})
 	}
 	// Pool ids are an admin concern; the public payload carries names only.
 	ev.PlayerIDs = []string{}
@@ -713,6 +723,7 @@ func (s *Service) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Name       *string `json:"name"`
 		CourtCount *int    `json:"court_count"`
+		BasePlayed *int    `json:"base_played"`
 		IsPublic   *bool   `json:"is_public"`
 		ShowGrades *bool   `json:"show_grades"`
 	}
@@ -722,6 +733,10 @@ func (s *Service) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.Name != nil && strings.TrimSpace(*in.Name) == "" {
 		httpx.WriteAppError(w, httpx.Unprocessable("Event name must not be empty."))
+		return
+	}
+	if in.BasePlayed != nil && (*in.BasePlayed < 0 || *in.BasePlayed > 999) {
+		httpx.WriteAppError(w, httpx.Unprocessable("Starting count must be between 0 and 999."))
 		return
 	}
 	if in.CourtCount != nil && (*in.CourtCount < 0 || *in.CourtCount > 99) {
@@ -734,13 +749,62 @@ func (s *Service) UpdateEvent(w http.ResponseWriter, r *http.Request) {
 		UPDATE match_events
 		SET name = COALESCE(NULLIF(TRIM(COALESCE($2, '')), ''), name),
 		    court_count = COALESCE($3, court_count),
-		    is_public = COALESCE($4, is_public),
-		    show_grades = COALESCE($5, show_grades),
+		    base_played = COALESCE($4, base_played),
+		    is_public = COALESCE($5, is_public),
+		    show_grades = COALESCE($6, show_grades),
 		    updated_at = now()
 		WHERE id = $1
-		RETURNING id::text, name, status, court_count, is_public, show_grades, player_ids::text, created_at::text`,
-		id, in.Name, in.CourtCount, in.IsPublic, in.ShowGrades,
+		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text`,
+		id, in.Name, in.CourtCount, in.BasePlayed, in.IsPublic, in.ShowGrades,
 	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+	if err != nil {
+		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return
+	}
+	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	httpx.OK(w, http.StatusOK, ev)
+}
+
+// AddEventPlayers appends late arrivals to the pool (check-in order is the
+// given order). Existing pool members, matches, and history are untouched —
+// the next generated round simply includes the newcomers last.
+func (s *Service) AddEventPlayers(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var in struct {
+		PlayerIDs []string `json:"player_ids"`
+	}
+	if err := httpx.Decode(r, &in); err != nil || len(in.PlayerIDs) == 0 {
+		httpx.Err(w, http.StatusBadRequest, "BAD_REQUEST", "player_ids is required.")
+		return
+	}
+	for _, pid := range in.PlayerIDs {
+		if _, err := uuid.Parse(pid); err != nil {
+			httpx.WriteAppError(w, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
+			return
+		}
+	}
+	var ev MatchEvent
+	var poolRaw string
+	err := s.db.QueryRow(r.Context(), `
+		UPDATE match_events
+		SET player_ids = (
+			SELECT COALESCE(jsonb_agg(e ORDER BY o, n), '[]'::jsonb)
+			FROM (
+				SELECT DISTINCT ON (e) e, o, n FROM (
+					SELECT e, 0 AS o, ordinality AS n
+					FROM jsonb_array_elements_text(player_ids) WITH ORDINALITY AS j(e, ordinality)
+					UNION ALL
+					SELECT u.id, 1, u.ordinality
+					FROM unnest($2::text[]) WITH ORDINALITY AS u(id, ordinality)
+					JOIN players p ON p.id::text = u.id AND p.status = 'ACTIVE'
+				) all_rows ORDER BY e, o, n
+			) dedup
+		),
+		updated_at = now()
+		WHERE id = $1
+		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text`,
+		id, in.PlayerIDs,
+	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
 	if err != nil {
 		httpx.Err(w, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 		return

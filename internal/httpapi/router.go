@@ -125,6 +125,7 @@ func NewRouter(deps Dependencies, cfg config.Config) http.Handler {
 				r.Patch("/{id}", deps.MatchMaker.UpdateEvent)
 				r.Delete("/{id}", deps.MatchMaker.DeleteEvent)
 				r.Post("/{id}/generate", deps.MatchMaker.Generate)
+				r.Post("/{id}/players", deps.MatchMaker.AddEventPlayers)
 			})
 			r.Route("/generated-matches", func(r chi.Router) {
 				r.Patch("/{id}", deps.MatchMaker.UpdateMatch)

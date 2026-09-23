@@ -78,6 +78,9 @@ func gradeRank(g *string) int {
 const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. ` +
 	`Each player has a numeric rank where LOWER is STRONGER (1=A1 strongest … 9=C3 weakest, 99=ungraded). ` +
 	`Rules: every match is exactly 2v2; keep the sum of ranks on both sides as close as possible; ` +
+	`use as many players as possible each round, at most once per player per round; ` +
+	`if the pool is ODD, leave out the minimum (prefer the latest arrivals to sit out this round, ` +
+	`and rotate who sits out across rounds so no one sits out twice before everyone sat out once); ` +
 	`MIXED DOUBLES is mandatory for female players: any side containing a gender-P player must pair ` +
 	`her with exactly one gender-L player (P+P or P+unknown is forbidden; L may pair with L or P); ` +
 	`vary partnerships across rounds; within one round a player appears at most once; ` +
@@ -166,12 +169,15 @@ func parseAIOutput(raw string) (aiOutput, error) {
 }
 
 func callOpenAI(ctx context.Context, base, key, model, user string) (string, error) {
-	body, _ := json.Marshal(map[string]any{
-		"model":       model,
-		"temperature": 0.7,
-		// Strict JSON schema: the provider itself guarantees parseable output
-		// shaped exactly like aiOutput, instead of best-effort json_object.
-		"response_format": map[string]any{
+	messages := []map[string]any{
+		{"role": "system", "content": aiSystemPrompt},
+		{"role": "user", "content": user},
+	}
+	// Strict schema first (guaranteed-valid JSON on providers that support
+	// Structured Outputs); gateways that reject it fall back to lenient
+	// json_object, then to plain instructions — parseAIOutput tolerates fences.
+	modes := []map[string]any{
+		{
 			"type": "json_schema",
 			"json_schema": map[string]any{
 				"name":   "doubles_draw",
@@ -208,11 +214,44 @@ func callOpenAI(ctx context.Context, base, key, model, user string) (string, err
 				},
 			},
 		},
-		"messages": []map[string]any{
-			{"role": "system", "content": aiSystemPrompt},
-			{"role": "user", "content": user},
-		},
+		{"type": "json_object"},
+	}
+	var lastErr error
+	for _, mode := range modes {
+		// Only schema/format rejections fall through to the next mode.
+		body, _ := json.Marshal(map[string]any{
+			"model":           model,
+			"temperature":     0.7,
+			"response_format": mode,
+			"messages":        messages,
+		})
+		raw, err := doOpenAICall(ctx, base, key, body)
+		if err == nil {
+			return raw, nil
+		}
+		if !isSchemaRejection(err) {
+			return "", err
+		}
+		lastErr = err
+	}
+	_ = lastErr
+	// Plain instructions, no response_format at all.
+	body, _ := json.Marshal(map[string]any{
+		"model":       model,
+		"temperature": 0.7,
+		"messages":    messages,
 	})
+	return doOpenAICall(ctx, base, key, body)
+}
+
+func isSchemaRejection(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "json_validate_failed") ||
+		strings.Contains(msg, "response_format") ||
+		strings.Contains(msg, "json_schema")
+}
+
+func doOpenAICall(ctx context.Context, base, key string, body []byte) (string, error) {
 	var res struct {
 		Choices []struct {
 			Message struct {
