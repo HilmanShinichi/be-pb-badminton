@@ -58,6 +58,7 @@ type MatchEvent struct {
 	IsPublic   bool     `json:"is_public"`
 	ShowGrades bool     `json:"show_grades"`
 	PlayerIDs  []string `json:"player_ids"`
+	SourceSessionID *string `json:"source_session_id"`
 	CreatedAt  string   `json:"created_at"`
 }
 
@@ -209,6 +210,7 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 		PlayerIDs  []string `json:"player_ids"`
 		CourtCount *int     `json:"court_count"`
 		BasePlayed *int     `json:"base_played"`
+		SourceSessionID *string `json:"source_session_id"`
 	}
 	if err := httpx.Decode(c, &in); err != nil || strings.TrimSpace(in.Name) == "" {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Event name is required.")
@@ -219,6 +221,16 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 			return httpx.WriteAppError(c, httpx.Unprocessable("Court count must be between 0 and 99."))
 		}
 		courts = *in.CourtCount
+	}
+	var sourceSession *string
+	if in.SourceSessionID != nil && *in.SourceSessionID != "" {
+		if _, err := uuid.Parse(*in.SourceSessionID); err != nil {
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid source session ID."))
+		}
+		if err := s.db.QueryRow(c.Context(), `SELECT 1 FROM mabar_sessions WHERE id = $1`, *in.SourceSessionID).Scan(new(int)); err != nil {
+			return httpx.WriteAppError(c, httpx.NotFound("Source session not found."))
+		}
+		sourceSession = in.SourceSessionID
 	}
 	base := 0
 	if in.BasePlayed != nil {
@@ -248,9 +260,9 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 	var ev MatchEvent
 	var poolRaw string
 	err := s.db.QueryRow(c.Context(), `
-		INSERT INTO match_events (id, name, court_count, base_played, player_ids) VALUES (gen_random_uuid(), $1, $2, $3, $4)
-		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text`,
-		strings.TrimSpace(in.Name), courts, base, string(idsJSON)).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+		INSERT INTO match_events (id, name, court_count, base_played, player_ids, source_session_id) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
+		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text`,
+		strings.TrimSpace(in.Name), courts, base, string(idsJSON), sourceSession).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create event.")
 	}
@@ -297,8 +309,8 @@ func (s *Service) GetEvent(c *fiber.Ctx) error {
 	var ev MatchEvent
 	var poolRaw string
 	if err := s.db.QueryRow(c.Context(),
-		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text FROM match_events WHERE id = $1`,
-		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
+		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text FROM match_events WHERE id = $1`,
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
@@ -336,9 +348,9 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 	var ev MatchEvent
 	var poolRaw string
 	if err := s.db.QueryRow(ctx,
-		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text
+		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text
 		 FROM match_events WHERE id = $1 AND is_public`,
-		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt); err != nil {
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
 		return ev, nil, nil, err
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
@@ -429,8 +441,9 @@ func (s *Service) PublicEvent(c *fiber.Ctx) error {
 func (s *Service) Generate(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Rounds int `json:"rounds"`
-		Round  int `json:"round"`
+		Rounds int  `json:"rounds"`
+		Round  int  `json:"round"`
+		TopUp  bool `json:"topup"`
 	}
 	_ = httpx.Decode(c, &in)
 	if in.Rounds <= 0 {
@@ -488,12 +501,17 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		team1, team2 []TeamPlayer
 	}
 	pendings := []pending{}
+	coverageN := len(pool)
+	// borrowAllow marks round players borrowed to complete a top-up group
+	// (they may appear twice); requireNewcomers must all play.
+	borrowAllow := map[string]bool{}
+	requireNewcomers := []string{}
 
 	// validateRound checks one AI round: 2v2, pool members, mixed-doubles
 	// rule, one appearance per player, no repeat, and FULL coverage (every
 	// player plays except unavoidable sit-outs: used%4==0 and at most 3 out).
 	validateRound := func(ms []aiMatchup, roundNo int) ([]pending, error) {
-		used := map[string]bool{}
+		used := map[string]int{}
 		out := []pending{}
 		for _, mu := range ms {
 			if len(mu.Team1) != 2 || len(mu.Team2) != 2 {
@@ -504,10 +522,13 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				return nil, httpx.Unprocessable("AI used players outside this event (" + err.Error() + "). Try generating again.")
 			}
 			for _, pid := range append(append([]string{}, mu.Team1...), mu.Team2...) {
-				if used[pid] {
+				used[pid]++
+				if used[pid] > 1 && !borrowAllow[pid] {
 					return nil, httpx.Unprocessable("AI listed a player twice in one round. Try generating again.")
 				}
-				used[pid] = true
+				if used[pid] > 2 {
+					return nil, httpx.Unprocessable("AI listed a player three times in one round. Try generating again.")
+				}
 			}
 			key := matchupKey(mu.Team1, mu.Team2)
 			if seen[key] {
@@ -515,10 +536,18 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			}
 			out = append(out, pending{round: roundNo, team1: t1, team2: t2})
 		}
-		n := len(pool)
-		if len(used) == 0 || len(used)%4 != 0 || len(used) < n-3 {
+		for _, req := range requireNewcomers {
+			if used[req] == 0 {
+				return nil, httpx.Unprocessable("AI left out a late arrival. Try generating again.")
+			}
+		}
+		n := coverageN
+		if len(requireNewcomers) == 0 && (len(used) == 0 || len(used)%4 != 0 || len(used) < n-3) {
 			return nil, httpx.Unprocessable(
 				"AI covered only part of the pool. Try generating again.")
+		}
+		if len(requireNewcomers) > 0 && len(used)%4 != 0 {
+			return nil, httpx.Unprocessable("AI made an incomplete top-up group. Try generating again.")
 		}
 		for _, p := range out {
 			seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
@@ -529,7 +558,12 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	for i := 0; i < in.Rounds; i++ {
 		// Explicit round number fills one empty round (e.g. after deleting
 		// it); otherwise rounds append after the highest existing one.
+		// TopUp adds matches for pool members missing from a NON-empty round
+		// (late arrivals) without touching its existing matches.
 		roundNo := maxRound + i + 1
+		coverageN = len(pool)
+		borrowAllow = map[string]bool{}
+		requireNewcomers = []string{}
 		if in.Round > 0 {
 			if in.Rounds > 1 {
 				return httpx.WriteAppError(c, httpx.Unprocessable("Generate one round at a time when targeting a round number."))
@@ -543,7 +577,116 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				id, in.Round).Scan(&exists); err != nil {
 				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate.")
 			}
-			if exists {
+			if in.TopUp {
+				if !exists {
+					return httpx.WriteAppError(c, httpx.Unprocessable("That round is empty. Generate it normally instead."))
+				}
+				// Auto-pull: anyone PRESENT in the source session joins the
+				// pool first, so no manual picking is needed.
+				var source *string
+				if err := s.db.QueryRow(c.Context(),
+					`SELECT source_session_id::text FROM match_events WHERE id = $1`, id).Scan(&source); err == nil && source != nil {
+					rows, err := s.db.Query(c.Context(), `
+						SELECT a.player_id::text
+						FROM attendances a
+						JOIN players pl ON pl.id = a.player_id
+						WHERE a.session_id = $1 AND a.status IN ('PRESENT', 'LISTED', 'CONFIRMED')
+						  AND pl.status = 'ACTIVE'
+						ORDER BY a.listed_at`, *source)
+					if err == nil {
+						have := map[string]bool{}
+						for _, p := range pool {
+							have[p.ID] = true
+						}
+						merged := []string{}
+						for _, p := range pool {
+							merged = append(merged, p.ID)
+						}
+						added := false
+						for rows.Next() {
+							var pid string
+							if err := rows.Scan(&pid); err == nil && !have[pid] {
+								have[pid] = true
+								merged = append(merged, pid)
+								added = true
+							}
+						}
+						rows.Close()
+						if added {
+							idsJSON, _ := json.Marshal(merged)
+							if _, err := s.db.Exec(c.Context(),
+								`UPDATE match_events SET player_ids = $2, updated_at = now() WHERE id = $1`,
+								id, string(idsJSON)); err == nil {
+								if np, err := s.pool(c.Context(), id); err == nil {
+									pool = np
+								}
+							}
+							// Newcomers join the AI subset with pool-order arrival.
+							aiPlayers = []aiPlayer{}
+							for i, p := range pool {
+								aiPlayers = append(aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
+							}
+						}
+					}
+				}
+				inRound := map[string]bool{}
+				for _, m := range matches {
+					if m.Round != in.Round {
+						continue
+					}
+					for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+						inRound[t.PlayerID] = true
+					}
+				}
+				sub := []aiPlayer{}
+				for pos, p := range pool {
+					if inRound[p.ID] {
+						continue
+					}
+					sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: pos + 1})
+				}
+				// Fewer than 4 newcomers: borrow from this round's players so
+				// the group still makes 2v2. Earliest arrivals are borrowed
+				// first (they waited longest); each plays at most twice.
+				borrowAllow = map[string]bool{}
+				requireNewcomers = []string{}
+				for _, p := range sub {
+					requireNewcomers = append(requireNewcomers, p.ID)
+				}
+				if need := (4 - len(sub)%4) % 4; need > 0 {
+					borrowed := 0
+					for _, p := range pool {
+						if borrowed >= need {
+							break
+						}
+						if inRound[p.ID] && !borrowAllow[p.ID] {
+							borrowAllow[p.ID] = true
+							borrowed++
+						}
+					}
+					if borrowed < need {
+						return httpx.WriteAppError(c, httpx.Unprocessable("Not enough players to complete a top-up group."))
+					}
+					// Borrowed players join the AI subset with their real arrival.
+					for _, p := range pool {
+						if borrowAllow[p.ID] {
+							pos := 0
+							for i, q := range pool {
+								if q.ID == p.ID {
+									pos = i
+									break
+								}
+							}
+							sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: pos + 1})
+						}
+					}
+				}
+				if len(sub) < 4 {
+					return httpx.WriteAppError(c, httpx.Unprocessable("Fewer than 4 players are missing from this round."))
+				}
+				aiPlayers = sub
+				coverageN = len(sub)
+			} else if exists {
 				return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
 			}
 			roundNo = in.Round
@@ -726,11 +869,12 @@ func idsOf(team []TeamPlayer) []string {
 func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Name       *string `json:"name"`
-		CourtCount *int    `json:"court_count"`
-		BasePlayed *int    `json:"base_played"`
-		IsPublic   *bool   `json:"is_public"`
-		ShowGrades *bool   `json:"show_grades"`
+		Name            *string `json:"name"`
+		CourtCount      *int    `json:"court_count"`
+		BasePlayed      *int    `json:"base_played"`
+		IsPublic        *bool   `json:"is_public"`
+		ShowGrades      *bool   `json:"show_grades"`
+		SourceSessionID *string `json:"source_session_id"`
 	}
 	if err := httpx.Decode(c, &in); err != nil {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
@@ -740,6 +884,17 @@ func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 	}
 	if in.BasePlayed != nil && (*in.BasePlayed < 0 || *in.BasePlayed > 999) {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Starting count must be between 0 and 999."))
+	}
+	if in.SourceSessionID != nil {
+		if *in.SourceSessionID != "" {
+			if _, err := uuid.Parse(*in.SourceSessionID); err != nil {
+				return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid source session ID."))
+			}
+			var one int
+			if err := s.db.QueryRow(c.Context(), `SELECT 1 FROM mabar_sessions WHERE id = $1`, *in.SourceSessionID).Scan(&one); err != nil {
+				return httpx.WriteAppError(c, httpx.NotFound("Source session not found."))
+			}
+		}
 	}
 	if in.CourtCount != nil && (*in.CourtCount < 0 || *in.CourtCount > 99) {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Court count must be between 0 and 99."))
@@ -753,11 +908,12 @@ func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 		    base_played = COALESCE($4, base_played),
 		    is_public = COALESCE($5, is_public),
 		    show_grades = COALESCE($6, show_grades),
+		    source_session_id = COALESCE(NULLIF($7, '')::uuid, source_session_id),
 		    updated_at = now()
 		WHERE id = $1
-		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text`,
-		id, in.Name, in.CourtCount, in.BasePlayed, in.IsPublic, in.ShowGrades,
-	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text`,
+		id, in.Name, in.CourtCount, in.BasePlayed, in.IsPublic, in.ShowGrades, strOrEmpty(in.SourceSessionID),
+	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
@@ -832,8 +988,14 @@ func (s *Service) DeleteRound(c *fiber.Ctx) error {
 	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "round": round})
 }
 
-func parseRoundParam(raw string) (int, error) {
-	n := 0
+func strOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func parseRoundParam(raw string) (int, error) {	n := 0
 	for _, ch := range raw {
 		if ch < '0' || ch > '9' {
 			return 0, httpx.BadRequest("BAD_REQUEST", "Invalid round number.")
