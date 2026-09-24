@@ -181,7 +181,7 @@ func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, 
 		SELECT id::text, event_id::text, round, team1::text, team2::text, status, court,
 		       started_at::text, ended_at::text, shuttlecock_used,
 		       created_at::text, updated_at::text
-		FROM generated_matches WHERE event_id = $1 ORDER BY round, created_at`, eventID)
+		FROM generated_matches WHERE event_id = $1 ORDER BY round, created_at, id`, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +265,7 @@ func (s *Service) ListEvents(c *fiber.Ctx) error {
 		       COUNT(m.id)
 		FROM match_events e
 		LEFT JOIN generated_matches m ON m.event_id = e.id
-		GROUP BY e.id ORDER BY e.created_at DESC`)
+		GROUP BY e.id ORDER BY e.created_at DESC, e.id DESC`)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load events.")
 	}
@@ -430,6 +430,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
 		Rounds int `json:"rounds"`
+		Round  int `json:"round"`
 	}
 	_ = httpx.Decode(c, &in)
 	if in.Rounds <= 0 {
@@ -454,7 +455,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	}
 	aiPlayers := []aiPlayer{}
 	for i, p := range pool {
-		aiPlayers = append(aiPlayers, aiPlayer{ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
+		aiPlayers = append(aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
 	}
 	history := []aiHistoryMatch{}
 	seen := map[string]bool{}
@@ -487,49 +488,89 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		team1, team2 []TeamPlayer
 	}
 	pendings := []pending{}
-	for i := 0; i < in.Rounds; i++ {
-		roundNo := maxRound + i + 1
-		var aiRounds []aiRound
-		var genErr error
-		for attempt := 0; attempt < 2; attempt++ {
-			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, 1)
-			if genErr == nil && len(aiRounds) > 0 && len(aiRounds[0].Matches) > 0 {
-				break
-			}
-			if genErr == nil {
-				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
-			}
-		}
-		if genErr != nil {
-			return httpx.WriteAppError(c, genErr)
-		}
+
+	// validateRound checks one AI round: 2v2, pool members, mixed-doubles
+	// rule, one appearance per player, no repeat, and FULL coverage (every
+	// player plays except unavoidable sit-outs: used%4==0 and at most 3 out).
+	validateRound := func(ms []aiMatchup, roundNo int) ([]pending, error) {
 		used := map[string]bool{}
-		for _, mu := range aiRounds[0].Matches {
+		out := []pending{}
+		for _, mu := range ms {
 			if len(mu.Team1) != 2 || len(mu.Team2) != 2 {
-				return httpx.WriteAppError(c, httpx.Unprocessable("AI returned a non-2v2 matchup. Try generating again."))
+				return nil, httpx.Unprocessable("AI returned a non-2v2 matchup. Try generating again.")
 			}
 			t1, t2, err := s.resolveTeams(pool, mu.Team1, mu.Team2)
 			if err != nil {
-				return httpx.WriteAppError(c, httpx.Unprocessable("AI used players outside this event ("+err.Error()+"). Try generating again."))
+				return nil, httpx.Unprocessable("AI used players outside this event (" + err.Error() + "). Try generating again.")
 			}
 			for _, pid := range append(append([]string{}, mu.Team1...), mu.Team2...) {
 				if used[pid] {
-					return httpx.WriteAppError(c, httpx.Unprocessable("AI listed a player twice in one round. Try generating again."))
+					return nil, httpx.Unprocessable("AI listed a player twice in one round. Try generating again.")
 				}
 				used[pid] = true
 			}
 			key := matchupKey(mu.Team1, mu.Team2)
 			if seen[key] {
-				return httpx.WriteAppError(c, httpx.Unprocessable("AI repeated a previous matchup. Try generating again."))
+				return nil, httpx.Unprocessable("AI repeated a previous matchup. Try generating again.")
 			}
-			seen[key] = true
-			pendings = append(pendings, pending{round: roundNo, team1: t1, team2: t2})
+			out = append(out, pending{round: roundNo, team1: t1, team2: t2})
 		}
-		// Newly accepted matchups join the history for the next round call.
-		for _, p := range pendings {
-			if p.round != roundNo {
+		n := len(pool)
+		if len(used) == 0 || len(used)%4 != 0 || len(used) < n-3 {
+			return nil, httpx.Unprocessable(
+				"AI covered only part of the pool. Try generating again.")
+		}
+		for _, p := range out {
+			seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
+		}
+		return out, nil
+	}
+
+	for i := 0; i < in.Rounds; i++ {
+		// Explicit round number fills one empty round (e.g. after deleting
+		// it); otherwise rounds append after the highest existing one.
+		roundNo := maxRound + i + 1
+		if in.Round > 0 {
+			if in.Rounds > 1 {
+				return httpx.WriteAppError(c, httpx.Unprocessable("Generate one round at a time when targeting a round number."))
+			}
+			if in.Round < 1 || in.Round > 99 {
+				return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
+			}
+			var exists bool
+			if err := s.db.QueryRow(c.Context(),
+				`SELECT EXISTS (SELECT 1 FROM generated_matches WHERE event_id = $1 AND round = $2)`,
+				id, in.Round).Scan(&exists); err != nil {
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate.")
+			}
+			if exists {
+				return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
+			}
+			roundNo = in.Round
+		}
+		var accepted []pending
+		var genErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			var aiRounds []aiRound
+			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, 1)
+			if genErr != nil {
 				continue
 			}
+			if len(aiRounds) == 0 || len(aiRounds[0].Matches) == 0 {
+				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
+				continue
+			}
+			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo)
+			if genErr == nil {
+				break
+			}
+		}
+		if genErr != nil {
+			return httpx.WriteAppError(c, genErr)
+		}
+		pendings = append(pendings, accepted...)
+		// Newly accepted matchups join the history for the next round call.
+		for _, p := range accepted {
 			history = append(history, aiHistoryMatch{
 				Round: p.round,
 				Team1: []string{p.team1[0].Name, p.team1[1].Name},
@@ -769,7 +810,41 @@ func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 	return httpx.OK(c, http.StatusOK, ev)
 }
 
-// DeleteEvent removes the event and all its generated matches.
+// DeleteRound removes every match of one round group (e.g. a bad draw).
+// The round number stays free: generating with {"round": N} fills it again.
+func (s *Service) DeleteRound(c *fiber.Ctx) error {
+	eventID := c.Params("id")
+	round, err := parseRoundParam(c.Params("round"))
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	if _, err := uuid.Parse(eventID); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
+	}
+	tag, err := s.db.Exec(c.Context(),
+		`DELETE FROM generated_matches WHERE event_id = $1 AND round = $2`, eventID, round)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete round.")
+	}
+	if tag.RowsAffected() == 0 {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Round not found.")
+	}
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "round": round})
+}
+
+func parseRoundParam(raw string) (int, error) {
+	n := 0
+	for _, ch := range raw {
+		if ch < '0' || ch > '9' {
+			return 0, httpx.BadRequest("BAD_REQUEST", "Invalid round number.")
+		}
+		n = n*10 + int(ch-'0')
+	}
+	if n <= 0 || n > 99 {
+		return 0, httpx.BadRequest("BAD_REQUEST", "Invalid round number.")
+	}
+	return n, nil
+}
 func (s *Service) DeleteEvent(c *fiber.Ctx) error {
 	id := c.Params("id")
 	tag, err := s.db.Exec(c.Context(), `DELETE FROM match_events WHERE id = $1`, id)

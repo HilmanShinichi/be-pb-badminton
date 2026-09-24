@@ -20,12 +20,13 @@ import (
 // lower is stronger (A1=1 … C3=9, ungraded=99). Arrival is check-in order:
 // 1 arrived first. Gender L = male, P = female.
 type aiPlayer struct {
-	ID      string  `json:"id"`
-	Name    string  `json:"name"`
-	Grade   *string `json:"grade"`
-	Gender  *string `json:"gender"`
-	Rank    int     `json:"rank"`
-	Arrival int     `json:"arrival"`
+	Index  int     `json:"i"`
+	ID     string  `json:"-"`
+	Name   string  `json:"name"`
+	Grade  *string `json:"grade"`
+	Gender *string `json:"gender"`
+	Rank   int     `json:"rank"`
+	Arrival int    `json:"arrival"`
 }
 
 type aiHistoryMatch struct {
@@ -78,8 +79,9 @@ func gradeRank(g *string) int {
 const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. ` +
 	`Each player has a numeric rank where LOWER is STRONGER (1=A1 strongest … 9=C3 weakest, 99=ungraded). ` +
 	`Rules: every match is exactly 2v2; keep the sum of ranks on both sides as close as possible; ` +
-	`use as many players as possible each round, at most once per player per round; ` +
-	`if the pool is ODD, leave out the minimum (prefer the latest arrivals to sit out this round, ` +
+	`cover EVERY player every round: with N players make exactly floor(N/4) matches ` +
+	`(20 players = 5 matches, 13 players = 3 matches); leave out at most N mod 4 players, ` +
+	`preferring the latest arrivals to sit out this round, ` +
 	`and rotate who sits out across rounds so no one sits out twice before everyone sat out once); ` +
 	`MIXED DOUBLES is mandatory for female players: any side containing a gender-P player must pair ` +
 	`her with exactly one gender-L player (P+P or P+unknown is forbidden; L may pair with L or P); ` +
@@ -88,7 +90,9 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 	`but keep it fair: across all generated rounds no player may sit out more than one round extra ` +
 	`compared to anyone else; ` +
 	`NEVER repeat an exact matchup from history (same four players with the same sides). ` +
-	`Reply with JSON only, no prose: {"rounds": [{"round": N, "matches": [{"team1": ["<player-id>", "<player-id>"], "team2": ["<player-id>", "<player-id>"]}]}]}.`
+	`Players are numbered by "i": always reference players by their index number as a string ` +
+	`(e.g. team1 ["0","3"]), never by name or id. ` +
+	`Reply with JSON only, no prose: {"rounds": [{"round": N, "matches": [{"team1": ["<idx>", "<idx>"], "team2": ["<idx>", "<idx>"]}]}]}.`
 
 // generateMatchups asks the configured provider (openai|claude, model and
 // base URL from env) for balanced 2v2 rounds. Returns structured matchups or
@@ -123,8 +127,27 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 		return nil, httpx.Unprocessable("Unknown AI_PROVIDER '"+provider+"'. Use openai or claude.")
 	}
 
-	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (use every listed id, at most once per round):\n%s\nHistory to never repeat:\n%s",
-		rounds, mustJSON(players), mustJSON(history))
+	// Compact prompt: players as short lines keyed by index (no UUIDs on the
+	// wire), history as one line per past matchup. Keeps token usage low.
+	var pb strings.Builder
+	for _, p := range players {
+		grade := "-"
+		if p.Grade != nil && *p.Grade != "" {
+			grade = *p.Grade
+		}
+		gender := "-"
+		if p.Gender != nil && *p.Gender != "" {
+			gender = *p.Gender
+		}
+		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival)
+	}
+	var hb strings.Builder
+	for _, h := range history {
+		fmt.Fprintf(&hb, "R%d: %s+%s vs %s+%s\n", h.Round,
+			h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+	}
+	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
+		rounds, pb.String(), hb.String())
 
 	var raw string
 	var err error
@@ -142,6 +165,40 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 	}
 	if len(out.Rounds) == 0 {
 		return nil, httpx.Unprocessable("AI returned no rounds. Try generating again.")
+	}
+	// Resolve index references back to real player ids.
+	byIndex := map[int]string{}
+	for _, p := range players {
+		byIndex[p.Index] = p.ID
+	}
+	resolve := func(refs []string) ([]string, error) {
+		ids := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			n, err := strconv.Atoi(strings.TrimSpace(ref))
+			if err != nil {
+				return nil, fmt.Errorf("bad player reference %q", ref)
+			}
+			id, ok := byIndex[n]
+			if !ok {
+				return nil, fmt.Errorf("unknown player index %q", ref)
+			}
+			ids = append(ids, id)
+		}
+		return ids, nil
+	}
+	for ri := range out.Rounds {
+		for mi := range out.Rounds[ri].Matches {
+			t1, err := resolve(out.Rounds[ri].Matches[mi].Team1)
+			if err != nil {
+				return nil, httpx.Unprocessable("AI returned unusable matchups (" + err.Error() + "). Try generating again.")
+			}
+			t2, err := resolve(out.Rounds[ri].Matches[mi].Team2)
+			if err != nil {
+				return nil, httpx.Unprocessable("AI returned unusable matchups (" + err.Error() + "). Try generating again.")
+			}
+			out.Rounds[ri].Matches[mi].Team1 = t1
+			out.Rounds[ri].Matches[mi].Team2 = t2
+		}
 	}
 	return out.Rounds, nil
 }

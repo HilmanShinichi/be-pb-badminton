@@ -118,6 +118,18 @@ func (s *Service) List(c *fiber.Ctx) error {
 		args = append(args, status)
 		sql += ` AND status = $` + strconv.Itoa(len(args))
 	}
+	if g := strings.ToUpper(strings.TrimSpace(c.Query("grade"))); g != "" {
+		if g == "NONE" {
+			sql += ` AND grade IS NULL`
+		} else {
+			args = append(args, g)
+			sql += ` AND grade = $` + strconv.Itoa(len(args))
+		}
+	}
+	if g := strings.ToUpper(strings.TrimSpace(c.Query("gender"))); g != "" {
+		args = append(args, g)
+		sql += ` AND gender = $` + strconv.Itoa(len(args))
+	}
 	sql += ` ORDER BY name LIMIT ` + strconv.Itoa(limit) + ` OFFSET ` + strconv.Itoa(offset)
 
 	rows, err := s.db.Query(c.Context(), sql, args...)
