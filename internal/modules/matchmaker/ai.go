@@ -3,6 +3,8 @@ package matchmaker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pb-kecebong/backend/internal/config"
@@ -20,13 +23,13 @@ import (
 // lower is stronger (A1=1 … C3=9, ungraded=99). Arrival is check-in order:
 // 1 arrived first. Gender L = male, P = female.
 type aiPlayer struct {
-	Index  int     `json:"i"`
-	ID     string  `json:"-"`
-	Name   string  `json:"name"`
-	Grade  *string `json:"grade"`
-	Gender *string `json:"gender"`
-	Rank   int     `json:"rank"`
-	Arrival int    `json:"arrival"`
+	Index   int     `json:"i"`
+	ID      string  `json:"-"`
+	Name    string  `json:"name"`
+	Grade   *string `json:"grade"`
+	Gender  *string `json:"gender"`
+	Rank    int     `json:"rank"`
+	Arrival int     `json:"arrival"`
 }
 
 type aiHistoryMatch struct {
@@ -41,7 +44,7 @@ type aiMatchup struct {
 }
 
 type aiRound struct {
-	Round   int        `json:"round"`
+	Round   int         `json:"round"`
 	Matches []aiMatchup `json:"matches"`
 }
 
@@ -94,10 +97,86 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 	`(e.g. team1 ["0","3"]), never by name or id. ` +
 	`Reply with JSON only, no prose: {"rounds": [{"round": N, "matches": [{"team1": ["<idx>", "<idx>"], "team2": ["<idx>", "<idx>"]}]}]}.`
 
+// Free-tier AI providers (Groq 8k tokens/min on gpt-oss) rate-limit by a few
+// thousand tokens a minute, so calls are spaced out and identical prompts are
+// served from a short-lived cache instead of hitting the provider again.
+const (
+	aiMinCallGap = 8 * time.Second
+	aiCacheTTL   = 10 * time.Minute
+	aiMaxTokens  = 1500
+)
+
+var (
+	aiCallMu   sync.Mutex
+	aiLastCall time.Time
+	aiCacheMu  sync.Mutex
+	aiCache    = map[string]aiCacheEntry{}
+)
+
+type aiCacheEntry struct {
+	raw string
+	at  time.Time
+}
+
+func aiCacheKey(provider, model, user string) string {
+	sum := sha256.Sum256([]byte(provider + "|" + model + "|" + user))
+	return hex.EncodeToString(sum[:])
+}
+
+func aiCached(key string) (string, bool) {
+	aiCacheMu.Lock()
+	defer aiCacheMu.Unlock()
+	e, ok := aiCache[key]
+	if !ok || time.Since(e.at) > aiCacheTTL {
+		if ok {
+			delete(aiCache, key)
+		}
+		return "", false
+	}
+	return e.raw, true
+}
+
+func aiStore(key, raw string) {
+	aiCacheMu.Lock()
+	defer aiCacheMu.Unlock()
+	if len(aiCache) >= 24 {
+		oldestKey := ""
+		var oldest time.Time
+		for k, e := range aiCache {
+			if oldestKey == "" || e.at.Before(oldest) {
+				oldestKey, oldest = k, e.at
+			}
+		}
+		delete(aiCache, oldestKey)
+	}
+	aiCache[key] = aiCacheEntry{raw: raw, at: time.Now()}
+}
+
+// aiThrottle blocks until aiMinCallGap has passed since the previous
+// provider call, keeping requests inside the per-minute token budget.
+func aiThrottle(ctx context.Context) error {
+	aiCallMu.Lock()
+	wait := aiMinCallGap - time.Since(aiLastCall)
+	if wait < 0 {
+		wait = 0
+	}
+	aiLastCall = time.Now().Add(wait)
+	aiCallMu.Unlock()
+	if wait == 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(wait):
+		return nil
+	}
+}
+
 // generateMatchups asks the configured provider (openai|claude, model and
 // base URL from env) for balanced 2v2 rounds. Returns structured matchups or
 // an AppError the handler can write directly.
-func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, rounds int) ([]aiRound, error) {
+func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, rounds, attempt int) ([]aiRound, error) {
 	provider := strings.ToLower(strings.TrimSpace(cfg.AIProvider))
 	if provider == "" {
 		provider = "openai"
@@ -124,7 +203,7 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 			base = "https://api.anthropic.com"
 		}
 	default:
-		return nil, httpx.Unprocessable("Unknown AI_PROVIDER '"+provider+"'. Use openai or claude.")
+		return nil, httpx.Unprocessable("Unknown AI_PROVIDER '" + provider + "'. Use openai or claude.")
 	}
 
 	// Compact prompt: players as short lines keyed by index (no UUIDs on the
@@ -148,10 +227,16 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 	}
 	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
 		rounds, pb.String(), hb.String())
+	if attempt > 0 {
+		user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
+	}
 
+	cacheKey := aiCacheKey(provider, model, user)
 	var raw string
 	var err error
-	if provider == "claude" {
+	if cached, ok := aiCached(cacheKey); ok {
+		raw = cached
+	} else if provider == "claude" {
 		raw, err = callClaude(ctx, base, key, model, user)
 	} else {
 		raw, err = callOpenAI(ctx, base, key, model, user)
@@ -161,7 +246,7 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 	}
 	out, err := parseAIOutput(raw)
 	if err != nil {
-		return nil, httpx.Unprocessable("AI returned unusable matchups ("+err.Error()+"). Try generating again.")
+		return nil, httpx.Unprocessable("AI returned unusable matchups (" + err.Error() + "). Try generating again.")
 	}
 	if len(out.Rounds) == 0 {
 		return nil, httpx.Unprocessable("AI returned no rounds. Try generating again.")
@@ -200,6 +285,7 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 			out.Rounds[ri].Matches[mi].Team2 = t2
 		}
 	}
+	aiStore(cacheKey, raw)
 	return out.Rounds, nil
 }
 
@@ -279,6 +365,7 @@ func callOpenAI(ctx context.Context, base, key, model, user string) (string, err
 		body, _ := json.Marshal(map[string]any{
 			"model":           model,
 			"temperature":     0.7,
+			"max_tokens":      aiMaxTokens,
 			"response_format": mode,
 			"messages":        messages,
 		})
@@ -296,6 +383,7 @@ func callOpenAI(ctx context.Context, base, key, model, user string) (string, err
 	body, _ := json.Marshal(map[string]any{
 		"model":       model,
 		"temperature": 0.7,
+		"max_tokens":  aiMaxTokens,
 		"messages":    messages,
 	})
 	return doOpenAICall(ctx, base, key, body)
@@ -334,7 +422,7 @@ func doOpenAICall(ctx context.Context, base, key string, body []byte) (string, e
 func callClaude(ctx context.Context, base, key, model, user string) (string, error) {
 	body, _ := json.Marshal(map[string]any{
 		"model":      model,
-		"max_tokens": 3000,
+		"max_tokens": aiMaxTokens,
 		"system":     aiSystemPrompt,
 		"messages": []map[string]any{
 			{"role": "user", "content": user},
@@ -365,7 +453,9 @@ func callClaude(ctx context.Context, base, key, model, user string) (string, err
 
 func postJSON(ctx context.Context, url, bearer, apiKey string, body []byte, out any) error {
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	// One retry only: a 429 means the per-minute budget is spent, and the
+	// caller's local fallback is faster than waiting out the provider.
+	for attempt := 0; attempt < 2; attempt++ {
 		done, wait, err := postJSONOnce(ctx, url, bearer, apiKey, body, out)
 		if done {
 			return err
@@ -374,10 +464,8 @@ func postJSON(ctx context.Context, url, bearer, apiKey string, body []byte, out 
 			lastErr = err
 			break
 		}
-		// 429: wait as advised, then retry. Capped so the request
-		// still fits inside the server timeout.
-		if wait > 10*time.Second {
-			wait = 10 * time.Second
+		if wait > 5*time.Second {
+			wait = 5 * time.Second
 		}
 		select {
 		case <-ctx.Done():
@@ -400,6 +488,9 @@ func postJSONOnce(ctx context.Context, url, bearer, apiKey string, body []byte, 
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 	fail := func(err error) (bool, time.Duration, error) { return true, 0, err }
+	if err := aiThrottle(ctx); err != nil {
+		return fail(httpx.BadRequest("AI_PROVIDER_ERROR", "AI request was cancelled."))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return fail(httpx.BadRequest("AI_PROVIDER_ERROR", "Could not reach AI provider."))

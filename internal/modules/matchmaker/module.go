@@ -34,32 +34,39 @@ type TeamPlayer struct {
 	Gender   *string `json:"gender"`
 }
 
+type Referee struct {
+	PlayerID string `json:"player_id"`
+	Name     string `json:"name"`
+}
+
 type GenMatch struct {
-	ID             string       `json:"id"`
-	EventID        string       `json:"event_id"`
-	Round          int          `json:"round"`
-	Team1          []TeamPlayer `json:"team1"`
-	Team2          []TeamPlayer `json:"team2"`
-	Status         string       `json:"status"`
-	Court          int          `json:"court"`
-	StartedAt      *string      `json:"started_at"`
-	EndedAt        *string      `json:"ended_at"`
-	ShuttlecockUsed int         `json:"shuttlecock_used"`
-	CreatedAt      string       `json:"created_at"`
-	UpdatedAt      string       `json:"updated_at"`
+	ID              string       `json:"id"`
+	EventID         string       `json:"event_id"`
+	Round           int          `json:"round"`
+	Wave            int          `json:"wave"`
+	Team1           []TeamPlayer `json:"team1"`
+	Team2           []TeamPlayer `json:"team2"`
+	Referee         *Referee     `json:"referee"`
+	Status          string       `json:"status"`
+	Court           int          `json:"court"`
+	StartedAt       *string      `json:"started_at"`
+	EndedAt         *string      `json:"ended_at"`
+	ShuttlecockUsed int          `json:"shuttlecock_used"`
+	CreatedAt       string       `json:"created_at"`
+	UpdatedAt       string       `json:"updated_at"`
 }
 
 type MatchEvent struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Status     string   `json:"status"`
-	CourtCount int      `json:"court_count"`
-	BasePlayed int      `json:"base_played"`
-	IsPublic   bool     `json:"is_public"`
-	ShowGrades bool     `json:"show_grades"`
-	PlayerIDs  []string `json:"player_ids"`
-	SourceSessionID *string `json:"source_session_id"`
-	CreatedAt  string   `json:"created_at"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Status          string   `json:"status"`
+	CourtCount      int      `json:"court_count"`
+	BasePlayed      int      `json:"base_played"`
+	IsPublic        bool     `json:"is_public"`
+	ShowGrades      bool     `json:"show_grades"`
+	PlayerIDs       []string `json:"player_ids"`
+	SourceSessionID *string  `json:"source_session_id"`
+	CreatedAt       string   `json:"created_at"`
 }
 
 type PlayerCount struct {
@@ -69,6 +76,7 @@ type PlayerCount struct {
 	Gender   *string `json:"gender"`
 	Arrival  int     `json:"arrival"`
 	Played   int     `json:"played"`
+	Refereed int     `json:"refereed"`
 }
 
 func parseTeam(raw string) []TeamPlayer {
@@ -93,6 +101,15 @@ type poolPlayer struct {
 	Name   string
 	Grade  *string
 	Gender *string
+}
+
+// pending is one validated match waiting to be written: its round, its wave
+// (courts running at the same time), both sides, and the picked referee.
+type pending struct {
+	round        int
+	wave         int
+	team1, team2 []TeamPlayer
+	referee      *string
 }
 
 func (s *Service) pool(ctx context.Context, eventID string) ([]poolPlayer, error) {
@@ -177,12 +194,196 @@ func matchupKey(t1, t2 []string) string {
 	return strings.Join(sides, " vs ")
 }
 
+// assignReferees gives every match a referee from the pool: the player who
+// has played least so far (longest idle) and is not on a court in that
+// match's wave, so a referee never has to watch their own game while it runs.
+// One person can only hold one whistle per wave; matches in a full wave get
+// no referee and can be set by hand.
+func assignReferees(pool []poolPlayer, out []pending, waves map[int]int, played map[string]int) {
+	byWave := map[int][]int{}
+	for i := range out {
+		byWave[waves[i]] = append(byWave[waves[i]], i)
+	}
+	arrival := map[string]int{}
+	for i, p := range pool {
+		arrival[p.ID] = i
+	}
+	for _, idxs := range byWave {
+		onCourt := map[string]bool{}
+		for _, i := range idxs {
+			for _, id := range append(idsOf(out[i].team1), idsOf(out[i].team2)...) {
+				onCourt[id] = true
+			}
+		}
+		busy := map[string]bool{}
+		for _, i := range idxs {
+			best := ""
+			bestPlayed, bestArrival := 1<<30, -1
+			for _, p := range pool {
+				if onCourt[p.ID] || busy[p.ID] {
+					continue
+				}
+				pc, a := played[p.ID], arrival[p.ID]
+				if pc < bestPlayed || (pc == bestPlayed && a > bestArrival) {
+					best, bestPlayed, bestArrival = p.ID, pc, a
+				}
+			}
+			if best != "" {
+				busy[best] = true
+				out[i].referee = &best
+			}
+		}
+	}
+}
+
+// localMatchups draws one round locally under the same rules the AI has to
+// follow: 2v2, mixed doubles, no repeat, and the pool covered apart from the
+// unavoidable sit-outs. It is the fallback whenever the provider is
+// rate-limited or answers with something unusable, so generating never fails
+// just because the model could not be reached.
+func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[string]bool,
+	roundNo, waveBase, wavesPerRound int, played map[string]int,
+	newcomers []string, borrow map[string]bool) ([]pending, error) {
+
+	rank := map[string]int{}
+	gender := map[string]string{}
+	arrival := map[string]int{}
+	for i, p := range players {
+		rank[p.ID] = p.Rank
+		arrival[p.ID] = i
+		if p.Gender != nil {
+			gender[p.ID] = *p.Gender
+		}
+	}
+	// A side is legal when no female (P) is paired with P or unknown gender.
+	sideOK := func(a, b string) bool {
+		ga, gb := gender[a], gender[b]
+		return !((ga == "P" && gb != "L") || (gb == "P" && ga != "L"))
+	}
+	must := map[string]bool{}
+	for _, id := range newcomers {
+		must[id] = true
+	}
+	for id := range borrow {
+		must[id] = true
+	}
+	// Sit-outs go to whoever has played most (ties: latest arrival); late
+	// arrivals and borrowed top-up players always play.
+	optional := []string{}
+	for _, p := range players {
+		if !must[p.ID] {
+			optional = append(optional, p.ID)
+		}
+	}
+	sort.Slice(optional, func(i, j int) bool {
+		if played[optional[i]] != played[optional[j]] {
+			return played[optional[i]] > played[optional[j]]
+		}
+		return arrival[optional[i]] > arrival[optional[j]]
+	})
+	sitOut := len(players) % 4
+	if sitOut > len(optional) {
+		sitOut = len(optional)
+	}
+	sitting := map[string]bool{}
+	for _, id := range optional[:sitOut] {
+		sitting[id] = true
+	}
+	playing := []string{}
+	for _, p := range players {
+		if !sitting[p.ID] {
+			playing = append(playing, p.ID)
+		}
+	}
+	blocks := len(playing) / 4
+	if blocks == 0 {
+		return nil, httpx.Unprocessable("Not enough players to build a 2v2 matchup.")
+	}
+
+	seed := uint64(roundNo)*7919 + uint64(len(playing))*104729 + 1
+	rand64 := func() uint64 {
+		seed ^= seed << 13
+		seed ^= seed >> 7
+		seed ^= seed << 17
+		return seed
+	}
+	pairings := [][4]int{{0, 1, 2, 3}, {0, 2, 1, 3}, {0, 3, 1, 2}}
+	for try := 0; try < 80; try++ {
+		draw := append([]string{}, playing...)
+		for i := len(draw) - 1; i > 0; i-- {
+			j := int(rand64() % uint64(i+1))
+			draw[i], draw[j] = draw[j], draw[i]
+		}
+		matches := []aiMatchup{}
+		added := map[string]bool{}
+		ok := true
+		for b := 0; b < blocks; b++ {
+			q := draw[b*4 : b*4+4]
+			best := [4]int{}
+			bestDiff := 0
+			found := false
+			for _, pr := range pairings {
+				t1 := []string{q[pr[0]], q[pr[1]]}
+				t2 := []string{q[pr[2]], q[pr[3]]}
+				if !sideOK(t1[0], t1[1]) || !sideOK(t2[0], t2[1]) {
+					continue
+				}
+				diff := rank[t1[0]] + rank[t1[1]] - rank[t2[0]] - rank[t2[1]]
+				if diff < 0 {
+					diff = -diff
+				}
+				if !found || diff < bestDiff {
+					best, bestDiff, found = pr, diff, true
+				}
+			}
+			if !found {
+				ok = false
+				break
+			}
+			mu := aiMatchup{Team1: []string{q[best[0]], q[best[1]]}, Team2: []string{q[best[2]], q[best[3]]}}
+			key := matchupKey(mu.Team1, mu.Team2)
+			if seen[key] || added[key] {
+				ok = false
+				break
+			}
+			added[key] = true
+			matches = append(matches, mu)
+		}
+		if !ok {
+			continue
+		}
+		out := []pending{}
+		waves := map[int]int{}
+		for i, mu := range matches {
+			t1, t2, err := s.resolveTeams(pool, mu.Team1, mu.Team2)
+			if err != nil {
+				ok = false
+				break
+			}
+			waves[i] = waveBase + i/wavesPerRound + 1
+			out = append(out, pending{round: roundNo, wave: waves[i], team1: t1, team2: t2})
+		}
+		if !ok {
+			continue
+		}
+		for _, p := range out {
+			seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
+		}
+		assignReferees(pool, out, waves, played)
+		return out, nil
+	}
+	return nil, httpx.Unprocessable("Could not build a valid matchup. Try generating again.")
+}
+
 func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT id::text, event_id::text, round, team1::text, team2::text, status, court,
-		       started_at::text, ended_at::text, shuttlecock_used,
-		       created_at::text, updated_at::text
-		FROM generated_matches WHERE event_id = $1 ORDER BY round, created_at, id`, eventID)
+		SELECT m.id::text, m.event_id::text, m.round, m.wave, m.team1::text, m.team2::text, m.status, m.court,
+		       m.started_at::text, m.ended_at::text, m.shuttlecock_used,
+		       m.referee_id::text, pl.name,
+		       m.created_at::text, m.updated_at::text
+		FROM generated_matches m
+		LEFT JOIN players pl ON pl.id = m.referee_id
+		WHERE m.event_id = $1 ORDER BY m.round, m.created_at, m.id`, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -191,10 +392,19 @@ func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, 
 	for rows.Next() {
 		var m GenMatch
 		var t1, t2 string
-		if err := rows.Scan(&m.ID, &m.EventID, &m.Round, &t1, &t2, &m.Status, &m.Court,
-			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt); err == nil {
+		var refID, refName *string
+		if err := rows.Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
+			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed,
+			&refID, &refName, &m.CreatedAt, &m.UpdatedAt); err == nil {
 			m.Team1 = parseTeam(t1)
 			m.Team2 = parseTeam(t2)
+			if refID != nil {
+				name := ""
+				if refName != nil {
+					name = *refName
+				}
+				m.Referee = &Referee{PlayerID: *refID, Name: name}
+			}
 			matches = append(matches, m)
 		}
 	}
@@ -206,11 +416,11 @@ func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, 
 // (0 = unlimited).
 func (s *Service) CreateEvent(c *fiber.Ctx) error {
 	var in struct {
-		Name       string   `json:"name"`
-		PlayerIDs  []string `json:"player_ids"`
-		CourtCount *int     `json:"court_count"`
-		BasePlayed *int     `json:"base_played"`
-		SourceSessionID *string `json:"source_session_id"`
+		Name            string   `json:"name"`
+		PlayerIDs       []string `json:"player_ids"`
+		CourtCount      *int     `json:"court_count"`
+		BasePlayed      *int     `json:"base_played"`
+		SourceSessionID *string  `json:"source_session_id"`
 	}
 	if err := httpx.Decode(c, &in); err != nil || strings.TrimSpace(in.Name) == "" {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Event name is required.")
@@ -323,12 +533,16 @@ func (s *Service) GetEvent(c *fiber.Ctx) error {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
 	}
 	played := map[string]int{}
+	refereed := map[string]int{}
 	for _, m := range matches {
 		if m.Status != "ENDED" && m.Status != "PLAYING" {
 			continue
 		}
 		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
 			played[t.PlayerID]++
+		}
+		if m.Referee != nil {
+			refereed[m.Referee.PlayerID]++
 		}
 	}
 	arrival := map[string]int{}
@@ -337,7 +551,7 @@ func (s *Service) GetEvent(c *fiber.Ctx) error {
 	}
 	counts := []PlayerCount{}
 	for _, p := range pool {
-		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID]})
+		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID], Refereed: refereed[p.ID]})
 	}
 	return httpx.OK(c, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
 }
@@ -373,12 +587,16 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 		}
 	}
 	played := map[string]int{}
+	refereed := map[string]int{}
 	for _, m := range matches {
 		if m.Status != "ENDED" && m.Status != "PLAYING" {
 			continue
 		}
 		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
 			played[t.PlayerID]++
+		}
+		if m.Referee != nil {
+			refereed[m.Referee.PlayerID]++
 		}
 	}
 	arrival := map[string]int{}
@@ -391,7 +609,7 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 		if !ev.ShowGrades {
 			grade = nil
 		}
-		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID]})
+		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID], Refereed: refereed[p.ID]})
 	}
 	// Pool ids are an admin concern; the public payload carries names only.
 	ev.PlayerIDs = []string{}
@@ -462,6 +680,13 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	if len(pool) < 4 {
 		return httpx.WriteAppError(c, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles."))
 	}
+	// Matches per wave = courts running simultaneously (event cap, else 3).
+	wavesPerRound := 3
+	_ = s.db.QueryRow(c.Context(),
+		`SELECT COALESCE(NULLIF(court_count, 0), 3) FROM match_events WHERE id = $1`, id).Scan(&wavesPerRound)
+	if wavesPerRound <= 0 {
+		wavesPerRound = 3
+	}
 	matches, err := s.listMatches(c.Context(), id)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load history.")
@@ -473,6 +698,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	history := []aiHistoryMatch{}
 	seen := map[string]bool{}
 	maxRound := 0
+	// playedCounts drives referee duty: the least-played player referees.
+	playedCounts := map[string]int{}
 	for _, m := range matches {
 		names := func(team []TeamPlayer) []string {
 			out := []string{}
@@ -485,6 +712,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		ids := []string{}
 		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
 			ids = append(ids, t.PlayerID)
+			playedCounts[t.PlayerID]++
 		}
 		seen[matchupKey(ids[:2], ids[2:])] = true
 		if m.Round > maxRound {
@@ -496,23 +724,27 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// earlier round (existing or generated just now) joins the history of the
 	// next call, so nothing repeats. Nothing is stored until all rounds
 	// validate — existing rounds are never touched.
-	type pending struct {
-		round       int
-		team1, team2 []TeamPlayer
-	}
 	pendings := []pending{}
 	coverageN := len(pool)
 	// borrowAllow marks round players borrowed to complete a top-up group
 	// (they may appear twice); requireNewcomers must all play.
 	borrowAllow := map[string]bool{}
 	requireNewcomers := []string{}
+	// aiUnavailable latches once the provider fails so the remaining rounds
+	// are drawn locally instead of waiting on throttled calls.
+	aiUnavailable := false
 
 	// validateRound checks one AI round: 2v2, pool members, mixed-doubles
-	// rule, one appearance per player, no repeat, and FULL coverage (every
-	// player plays except unavoidable sit-outs: used%4==0 and at most 3 out).
-	validateRound := func(ms []aiMatchup, roundNo int) ([]pending, error) {
+	// rule, one appearance per player, no repeat, and FULL coverage. Waves
+	// chunk the returned order by courts that can run simultaneously; the
+	// referee of every match is picked afterwards from the same pool.
+	validateRound := func(ms []aiMatchup, roundNo, waveBase int) ([]pending, error) {
 		used := map[string]int{}
 		out := []pending{}
+		waves := map[int]int{}
+		for idx := range ms {
+			waves[idx] = waveBase + idx/wavesPerRound + 1
+		}
 		for _, mu := range ms {
 			if len(mu.Team1) != 2 || len(mu.Team2) != 2 {
 				return nil, httpx.Unprocessable("AI returned a non-2v2 matchup. Try generating again.")
@@ -534,7 +766,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			if seen[key] {
 				return nil, httpx.Unprocessable("AI repeated a previous matchup. Try generating again.")
 			}
-			out = append(out, pending{round: roundNo, team1: t1, team2: t2})
+			out = append(out, pending{round: roundNo, wave: waves[len(out)], team1: t1, team2: t2})
 		}
 		for _, req := range requireNewcomers {
 			if used[req] == 0 {
@@ -552,6 +784,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		for _, p := range out {
 			seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
 		}
+		assignReferees(pool, out, waves, playedCounts)
 		return out, nil
 	}
 
@@ -562,6 +795,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		// (late arrivals) without touching its existing matches.
 		roundNo := maxRound + i + 1
 		coverageN = len(pool)
+		waveBase := 0
 		borrowAllow = map[string]bool{}
 		requireNewcomers = []string{}
 		if in.Round > 0 {
@@ -581,6 +815,14 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				if !exists {
 					return httpx.WriteAppError(c, httpx.Unprocessable("That round is empty. Generate it normally instead."))
 				}
+				// Appended matches continue the wave sequence of the round.
+				existing := 0
+				for _, m := range matches {
+					if m.Round == in.Round {
+						existing++
+					}
+				}
+				waveBase = existing / wavesPerRound
 				// Auto-pull: anyone PRESENT in the source session joins the
 				// pool first, so no manual picking is needed.
 				var source *string
@@ -693,25 +935,49 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		}
 		var accepted []pending
 		var genErr error
-		for attempt := 0; attempt < 3; attempt++ {
+		// Two AI tries only: each one spends provider tokens, and when the
+		// model still cannot satisfy the rules the deterministic local draw
+		// below finishes the round instead of hammering the rate limit. A
+		// provider error (rate limit, auth, network) is not worth a second
+		// call, and once it happens the rest of the rounds stay local too.
+		for attempt := 0; attempt < 2; attempt++ {
+			if aiUnavailable {
+				genErr = httpx.BadRequest("AI_PROVIDER_ERROR", "AI provider unavailable.")
+				break
+			}
 			var aiRounds []aiRound
-			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, 1)
+			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, 1, attempt)
 			if genErr != nil {
+				if httpx.AsAppError(genErr).Code == "AI_PROVIDER_ERROR" {
+					aiUnavailable = true
+					break
+				}
 				continue
 			}
 			if len(aiRounds) == 0 || len(aiRounds[0].Matches) == 0 {
 				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
 				continue
 			}
-			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo)
+			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo, waveBase)
 			if genErr == nil {
 				break
+			}
+		}
+		if genErr != nil {
+			local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow)
+			if localErr == nil {
+				accepted, genErr = local, nil
 			}
 		}
 		if genErr != nil {
 			return httpx.WriteAppError(c, genErr)
 		}
 		pendings = append(pendings, accepted...)
+		for _, p := range accepted {
+			for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
+				playedCounts[id]++
+			}
+		}
 		// Newly accepted matchups join the history for the next round call.
 		for _, p := range accepted {
 			history = append(history, aiHistoryMatch{
@@ -734,18 +1000,23 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		var m GenMatch
 		var t1, t2 string
 		err := tx.QueryRow(c.Context(), `
-			INSERT INTO generated_matches (id, event_id, round, team1, team2, status)
-			VALUES (gen_random_uuid(), $1, $2, $3, $4, 'UPCOMING')
-			RETURNING id::text, event_id::text, round, team1::text, team2::text, status, court,
+			INSERT INTO generated_matches (id, event_id, round, wave, team1, team2, referee_id, status)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'UPCOMING')
+			RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
 			          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
-			id, p.round, mustTeamJSON(p.team1), mustTeamJSON(p.team2),
-		).Scan(&m.ID, &m.EventID, &m.Round, &t1, &t2, &m.Status, &m.Court,
+			id, p.round, p.wave, mustTeamJSON(p.team1), mustTeamJSON(p.team2), p.referee,
+		).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
 			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
 		if err != nil {
 			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
 		}
 		m.Team1 = parseTeam(t1)
 		m.Team2 = parseTeam(t2)
+		if p.referee != nil {
+			var refName string
+			_ = tx.QueryRow(c.Context(), `SELECT name FROM players WHERE id = $1`, *p.referee).Scan(&refName)
+			m.Referee = &Referee{PlayerID: *p.referee, Name: refName}
+		}
 		saved = append(saved, m)
 	}
 	if err := tx.Commit(c.Context()); err != nil {
@@ -755,8 +1026,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 }
 
 // UpdateMatch edits teams (by player ids, resolved to fresh name/grade
-// snapshots), the court number, and/or advances the status. Court is locked
-// once the match has ENDED.
+// snapshots), the court number, referee, shuttlecock count, and/or advances
+// the status. Court, referee, and shuttlecock count lock once ENDED.
 func (s *Service) UpdateMatch(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
@@ -765,16 +1036,19 @@ func (s *Service) UpdateMatch(c *fiber.Ctx) error {
 		Status          *string  `json:"status"`
 		Court           *int     `json:"court"`
 		ShuttlecockUsed *int     `json:"shuttlecock_used"`
+		RefereeID       *string  `json:"referee_id"`
 	}
 	if err := httpx.Decode(c, &in); err != nil {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	var eventID, status, t1raw, t2raw string
 	var court, courtCap, cocks int
+	var refID *string
 	if err := s.db.QueryRow(c.Context(),
-		`SELECT m.event_id::text, m.status, m.team1::text, m.team2::text, m.court, e.court_count, m.shuttlecock_used
+		`SELECT m.event_id::text, m.status, m.team1::text, m.team2::text, m.court, e.court_count, m.shuttlecock_used,
+		        m.referee_id::text
 		 FROM generated_matches m JOIN match_events e ON e.id = m.event_id WHERE m.id = $1`,
-		id).Scan(&eventID, &status, &t1raw, &t2raw, &court, &courtCap, &cocks); err != nil {
+		id).Scan(&eventID, &status, &t1raw, &t2raw, &court, &courtCap, &cocks, &refID); err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Match not found.")
 	}
 	prevStatus := status
@@ -814,6 +1088,34 @@ func (s *Service) UpdateMatch(c *fiber.Ctx) error {
 		}
 		court = *in.Court
 	}
+	if in.RefereeID != nil {
+		if prevStatus == "ENDED" {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Referee is locked once the match has ended."))
+		}
+		ref := strings.TrimSpace(*in.RefereeID)
+		if ref == "" {
+			refID = nil
+		} else {
+			if _, err := uuid.Parse(ref); err != nil {
+				return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid referee ID."))
+			}
+			pool, err := s.pool(c.Context(), eventID)
+			if err != nil {
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
+			}
+			found := false
+			for _, p := range pool {
+				if p.ID == ref {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return httpx.WriteAppError(c, httpx.Unprocessable("Referee must be in this event pool."))
+			}
+			refID = &ref
+		}
+	}
 	team1 := parseTeam(t1raw)
 	team2 := parseTeam(t2raw)
 	if in.Team1 != nil || in.Team2 != nil {
@@ -838,22 +1140,27 @@ func (s *Service) UpdateMatch(c *fiber.Ctx) error {
 	var t1, t2 string
 	err := s.db.QueryRow(c.Context(), `
 		UPDATE generated_matches
-		SET team1 = $2, team2 = $3, status = $4, court = $5, shuttlecock_used = $6,
+		SET team1 = $2, team2 = $3, status = $4, court = $5, shuttlecock_used = $6, referee_id = $11,
 		    started_at = CASE WHEN $10 THEN NULL WHEN $7 AND started_at IS NULL THEN now() ELSE started_at END,
 		    ended_at = CASE WHEN $8 THEN now() WHEN $9 THEN NULL ELSE ended_at END,
 		    updated_at = now()
 		WHERE id = $1
-		RETURNING id::text, event_id::text, round, team1::text, team2::text, status, court,
+		RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
 		          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
 		id, mustTeamJSON(team1), mustTeamJSON(team2), status, court, cocks,
-		startTimer, stopTimer, clearStop, resetTimer,
-	).Scan(&m.ID, &m.EventID, &m.Round, &t1, &t2, &m.Status, &m.Court,
+		startTimer, stopTimer, clearStop, resetTimer, refID,
+	).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
 		&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
 	}
 	m.Team1 = parseTeam(t1)
 	m.Team2 = parseTeam(t2)
+	if refID != nil {
+		var refName string
+		_ = s.db.QueryRow(c.Context(), `SELECT name FROM players WHERE id = $1`, *refID).Scan(&refName)
+		m.Referee = &Referee{PlayerID: *refID, Name: refName}
+	}
 	return httpx.OK(c, http.StatusOK, m)
 }
 
@@ -995,7 +1302,8 @@ func strOrEmpty(s *string) string {
 	return *s
 }
 
-func parseRoundParam(raw string) (int, error) {	n := 0
+func parseRoundParam(raw string) (int, error) {
+	n := 0
 	for _, ch := range raw {
 		if ch < '0' || ch > '9' {
 			return 0, httpx.BadRequest("BAD_REQUEST", "Invalid round number.")
