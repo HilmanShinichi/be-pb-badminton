@@ -62,6 +62,7 @@ type MatchEvent struct {
 	Status          string   `json:"status"`
 	CourtCount      int      `json:"court_count"`
 	BasePlayed      int      `json:"base_played"`
+	MaxRounds       int      `json:"max_rounds"`
 	IsPublic        bool     `json:"is_public"`
 	ShowGrades      bool     `json:"show_grades"`
 	PlayerIDs       []string `json:"player_ids"`
@@ -413,13 +414,14 @@ func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, 
 
 // CreateEvent opens a match night. Without player_ids the pool defaults to
 // every active player. court_count caps the court numbers usable on cards
-// (0 = unlimited).
+// (0 = unlimited), max_rounds is the planned number of rounds (0 = no limit).
 func (s *Service) CreateEvent(c *fiber.Ctx) error {
 	var in struct {
 		Name            string   `json:"name"`
 		PlayerIDs       []string `json:"player_ids"`
 		CourtCount      *int     `json:"court_count"`
 		BasePlayed      *int     `json:"base_played"`
+		MaxRounds       *int     `json:"max_rounds"`
 		SourceSessionID *string  `json:"source_session_id"`
 	}
 	if err := httpx.Decode(c, &in); err != nil || strings.TrimSpace(in.Name) == "" {
@@ -431,6 +433,13 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 			return httpx.WriteAppError(c, httpx.Unprocessable("Court count must be between 0 and 99."))
 		}
 		courts = *in.CourtCount
+	}
+	maxRounds := 0
+	if in.MaxRounds != nil {
+		if *in.MaxRounds < 0 || *in.MaxRounds > 99 {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Match limit must be between 0 and 99."))
+		}
+		maxRounds = *in.MaxRounds
 	}
 	var sourceSession *string
 	if in.SourceSessionID != nil && *in.SourceSessionID != "" {
@@ -470,9 +479,9 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 	var ev MatchEvent
 	var poolRaw string
 	err := s.db.QueryRow(c.Context(), `
-		INSERT INTO match_events (id, name, court_count, base_played, player_ids, source_session_id) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5)
-		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text`,
-		strings.TrimSpace(in.Name), courts, base, string(idsJSON), sourceSession).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt)
+		INSERT INTO match_events (id, name, court_count, base_played, max_rounds, player_ids, source_session_id) VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6)
+		RETURNING id::text, name, status, court_count, base_played, max_rounds, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text`,
+		strings.TrimSpace(in.Name), courts, base, maxRounds, string(idsJSON), sourceSession).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.MaxRounds, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create event.")
 	}
@@ -482,9 +491,9 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 
 func (s *Service) ListEvents(c *fiber.Ctx) error {
 	rows, err := s.db.Query(c.Context(), `
-		SELECT e.id::text, e.name, e.status, e.court_count, e.is_public, e.created_at::text,
+		SELECT e.id::text, e.name, e.status, e.court_count, e.max_rounds, e.is_public, e.created_at::text,
 		       COALESCE(jsonb_array_length(e.player_ids), 0),
-		       COUNT(m.id)
+		       COUNT(m.id), COUNT(DISTINCT m.round)
 		FROM match_events e
 		LEFT JOIN generated_matches m ON m.event_id = e.id
 		GROUP BY e.id ORDER BY e.created_at DESC, e.id DESC`)
@@ -497,15 +506,17 @@ func (s *Service) ListEvents(c *fiber.Ctx) error {
 		Name       string `json:"name"`
 		Status     string `json:"status"`
 		CourtCount int    `json:"court_count"`
+		MaxRounds  int    `json:"max_rounds"`
 		IsPublic   bool   `json:"is_public"`
 		CreatedAt  string `json:"created_at"`
 		Players    int    `json:"players"`
 		Matches    int    `json:"matches"`
+		Rounds     int    `json:"rounds"`
 	}
 	list := []row{}
 	for rows.Next() {
 		var t row
-		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CourtCount, &t.IsPublic, &t.CreatedAt, &t.Players, &t.Matches); err == nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CourtCount, &t.MaxRounds, &t.IsPublic, &t.CreatedAt, &t.Players, &t.Matches, &t.Rounds); err == nil {
 			list = append(list, t)
 		}
 	}
@@ -519,8 +530,8 @@ func (s *Service) GetEvent(c *fiber.Ctx) error {
 	var ev MatchEvent
 	var poolRaw string
 	if err := s.db.QueryRow(c.Context(),
-		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text FROM match_events WHERE id = $1`,
-		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
+		`SELECT id::text, name, status, court_count, base_played, max_rounds, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text FROM match_events WHERE id = $1`,
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.MaxRounds, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
@@ -532,6 +543,17 @@ func (s *Service) GetEvent(c *fiber.Ctx) error {
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load players.")
 	}
+	counts, err := s.playerCounts(c.Context(), ev, pool, matches)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load play counts.")
+	}
+	return httpx.OK(c, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
+}
+
+// playerCounts adds up each player's played and refereed matches and then
+// applies the manual corrections. Matches only count once they are PLAYING or
+// ENDED, and a correction can never push a count below zero.
+func (s *Service) playerCounts(ctx context.Context, ev MatchEvent, pool []poolPlayer, matches []GenMatch) ([]PlayerCount, error) {
 	played := map[string]int{}
 	refereed := map[string]int{}
 	for _, m := range matches {
@@ -545,15 +567,154 @@ func (s *Service) GetEvent(c *fiber.Ctx) error {
 			refereed[m.Referee.PlayerID]++
 		}
 	}
+	adjust, err := s.countAdjustments(ctx, ev.ID)
+	if err != nil {
+		return nil, err
+	}
 	arrival := map[string]int{}
 	for i, pid := range ev.PlayerIDs {
 		arrival[pid] = i + 1
 	}
-	counts := []PlayerCount{}
+	counts := make([]PlayerCount, 0, len(pool))
 	for _, p := range pool {
-		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID], Refereed: refereed[p.ID]})
+		a := adjust[p.ID]
+		pCount := ev.BasePlayed + played[p.ID] + a.Played
+		rCount := refereed[p.ID] + a.Refereed
+		if pCount < 0 {
+			pCount = 0
+		}
+		if rCount < 0 {
+			rCount = 0
+		}
+		counts = append(counts, PlayerCount{
+			PlayerID: p.ID,
+			Name:     p.Name,
+			Grade:    p.Grade,
+			Gender:   p.Gender,
+			Arrival:  arrival[p.ID],
+			Played:   pCount,
+			Refereed: rCount,
+		})
 	}
-	return httpx.OK(c, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
+	return counts, nil
+}
+
+type countAdjustment struct {
+	Played   int
+	Refereed int
+}
+
+func (s *Service) countAdjustments(ctx context.Context, eventID string) (map[string]countAdjustment, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT player_id::text, played_delta, refereed_delta FROM match_count_adjustments WHERE event_id = $1`, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]countAdjustment{}
+	for rows.Next() {
+		var pid string
+		var a countAdjustment
+		if err := rows.Scan(&pid, &a.Played, &a.Refereed); err == nil {
+			out[pid] = a
+		}
+	}
+	return out, nil
+}
+
+// AdjustCount moves one player's played or refereed count by a delta on top of
+// the counted matches, so notes can be corrected without editing match cards.
+// The resulting count may never drop below zero.
+func (s *Service) AdjustCount(c *fiber.Ctx) error {
+	id := c.Params("id")
+	playerID := c.Params("player_id")
+	var in struct {
+		PlayedDelta   int `json:"played_delta"`
+		RefereedDelta int `json:"refereed_delta"`
+	}
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+	}
+	if in.PlayedDelta == 0 && in.RefereedDelta == 0 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pick a change of at least 1."))
+	}
+	if in.PlayedDelta < -50 || in.PlayedDelta > 50 || in.RefereedDelta < -50 || in.RefereedDelta > 50 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("A single change may not pass 50."))
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
+	}
+	if _, err := uuid.Parse(playerID); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid player ID."))
+	}
+	pool, err := s.pool(c.Context(), id)
+	if err != nil {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+	}
+	inPool := false
+	for _, p := range pool {
+		if p.ID == playerID {
+			inPool = true
+			break
+		}
+	}
+	if !inPool {
+		return httpx.WriteAppError(c, httpx.Unprocessable("That player is not in this event."))
+	}
+	var ev MatchEvent
+	var poolRaw string
+	if err := s.db.QueryRow(c.Context(),
+		`SELECT id::text, name, status, court_count, base_played, max_rounds, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text
+		 FROM match_events WHERE id = $1`, id).
+		Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.MaxRounds, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+	}
+	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	matches, err := s.listMatches(c.Context(), id)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load matches.")
+	}
+	before, err := s.playerCounts(c.Context(), ev, pool, matches)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load play counts.")
+	}
+	current := PlayerCount{}
+	found := false
+	for _, pc := range before {
+		if pc.PlayerID == playerID {
+			current, found = pc, true
+			break
+		}
+	}
+	if !found {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player not found in this event.")
+	}
+	if current.Played+in.PlayedDelta < 0 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Played count is already 0."))
+	}
+	if current.Refereed+in.RefereedDelta < 0 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Refereed count is already 0."))
+	}
+	if _, err := s.db.Exec(c.Context(), `
+		INSERT INTO match_count_adjustments (event_id, player_id, played_delta, refereed_delta)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (event_id, player_id) DO UPDATE
+		SET played_delta = match_count_adjustments.played_delta + EXCLUDED.played_delta,
+		    refereed_delta = match_count_adjustments.refereed_delta + EXCLUDED.refereed_delta,
+		    updated_at = now()`,
+		id, playerID, in.PlayedDelta, in.RefereedDelta); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save the change.")
+	}
+	after, err := s.playerCounts(c.Context(), ev, pool, matches)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load play counts.")
+	}
+	for _, pc := range after {
+		if pc.PlayerID == playerID {
+			return httpx.OK(c, http.StatusOK, pc)
+		}
+	}
+	return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Player not found in this event.")
 }
 
 // publicEventDetail loads the read-only payload for the public live page.
@@ -562,9 +723,9 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 	var ev MatchEvent
 	var poolRaw string
 	if err := s.db.QueryRow(ctx,
-		`SELECT id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text
+		`SELECT id::text, name, status, court_count, base_played, max_rounds, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text
 		 FROM match_events WHERE id = $1 AND is_public`,
-		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
+		id).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.MaxRounds, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt); err != nil {
 		return ev, nil, nil, err
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
@@ -586,30 +747,14 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 			}
 		}
 	}
-	played := map[string]int{}
-	refereed := map[string]int{}
-	for _, m := range matches {
-		if m.Status != "ENDED" && m.Status != "PLAYING" {
-			continue
-		}
-		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
-			played[t.PlayerID]++
-		}
-		if m.Referee != nil {
-			refereed[m.Referee.PlayerID]++
-		}
+	counts, err := s.playerCounts(ctx, ev, pool, matches)
+	if err != nil {
+		return ev, nil, nil, err
 	}
-	arrival := map[string]int{}
-	for i, pid := range ev.PlayerIDs {
-		arrival[pid] = i + 1
-	}
-	counts := []PlayerCount{}
-	for _, p := range pool {
-		grade := p.Grade
-		if !ev.ShowGrades {
-			grade = nil
+	if !ev.ShowGrades {
+		for i := range counts {
+			counts[i].Grade = nil
 		}
-		counts = append(counts, PlayerCount{PlayerID: p.ID, Name: p.Name, Grade: grade, Gender: p.Gender, Arrival: arrival[p.ID], Played: ev.BasePlayed + played[p.ID], Refereed: refereed[p.ID]})
 	}
 	// Pool ids are an admin concern; the public payload carries names only.
 	ev.PlayerIDs = []string{}
@@ -619,7 +764,7 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 // PublicEvents lists events flagged public — the live index.
 func (s *Service) PublicEvents(c *fiber.Ctx) error {
 	rows, err := s.db.Query(c.Context(), `
-		SELECT e.id::text, e.name, e.created_at::text, COUNT(m.id)
+		SELECT e.id::text, e.name, e.created_at::text, COUNT(m.id), COUNT(DISTINCT m.round), e.max_rounds
 		FROM match_events e
 		LEFT JOIN generated_matches m ON m.event_id = e.id
 		WHERE e.is_public
@@ -633,11 +778,13 @@ func (s *Service) PublicEvents(c *fiber.Ctx) error {
 		Name      string `json:"name"`
 		CreatedAt string `json:"created_at"`
 		Matches   int    `json:"matches"`
+		Rounds    int    `json:"rounds"`
+		MaxRounds int    `json:"max_rounds"`
 	}
 	list := []row{}
 	for rows.Next() {
 		var t row
-		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.Matches); err == nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.Matches, &t.Rounds, &t.MaxRounds); err == nil {
 			list = append(list, t)
 		}
 	}
@@ -682,14 +829,21 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	}
 	// Matches per wave = courts running simultaneously (event cap, else 3).
 	wavesPerRound := 3
+	maxRounds := 0
 	_ = s.db.QueryRow(c.Context(),
-		`SELECT COALESCE(NULLIF(court_count, 0), 3) FROM match_events WHERE id = $1`, id).Scan(&wavesPerRound)
+		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds FROM match_events WHERE id = $1`, id).Scan(&wavesPerRound, &maxRounds)
 	if wavesPerRound <= 0 {
 		wavesPerRound = 3
 	}
 	matches, err := s.listMatches(c.Context(), id)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load history.")
+	}
+	// The event's match limit caps how many rounds this night may reach; one
+	// round is one match per player, so it also drives the count bars.
+	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds {
+		return httpx.WriteAppError(c, httpx.Unprocessable(
+			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
 	}
 	aiPlayers := []aiPlayer{}
 	for i, p := range pool {
@@ -717,6 +871,16 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		seen[matchupKey(ids[:2], ids[2:])] = true
 		if m.Round > maxRound {
 			maxRound = m.Round
+		}
+	}
+	if in.Round == 0 && maxRounds > 0 {
+		remaining := maxRounds - maxRound
+		if remaining <= 0 {
+			return httpx.WriteAppError(c, httpx.Unprocessable(
+				"This event already has all its planned matches ("+strconv.Itoa(maxRounds)+"). Raise the match limit in event settings to add more."))
+		}
+		if in.Rounds > remaining {
+			in.Rounds = remaining
 		}
 	}
 
@@ -1179,6 +1343,7 @@ func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 		Name            *string `json:"name"`
 		CourtCount      *int    `json:"court_count"`
 		BasePlayed      *int    `json:"base_played"`
+		MaxRounds       *int    `json:"max_rounds"`
 		IsPublic        *bool   `json:"is_public"`
 		ShowGrades      *bool   `json:"show_grades"`
 		SourceSessionID *string `json:"source_session_id"`
@@ -1206,6 +1371,9 @@ func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 	if in.CourtCount != nil && (*in.CourtCount < 0 || *in.CourtCount > 99) {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Court count must be between 0 and 99."))
 	}
+	if in.MaxRounds != nil && (*in.MaxRounds < 0 || *in.MaxRounds > 99) {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Match limit must be between 0 and 99."))
+	}
 	var ev MatchEvent
 	var poolRaw string
 	err := s.db.QueryRow(c.Context(), `
@@ -1213,14 +1381,15 @@ func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 		SET name = COALESCE(NULLIF(TRIM(COALESCE($2, '')), ''), name),
 		    court_count = COALESCE($3, court_count),
 		    base_played = COALESCE($4, base_played),
-		    is_public = COALESCE($5, is_public),
-		    show_grades = COALESCE($6, show_grades),
-		    source_session_id = COALESCE(NULLIF($7, '')::uuid, source_session_id),
+		    max_rounds = COALESCE($5, max_rounds),
+		    is_public = COALESCE($6, is_public),
+		    show_grades = COALESCE($7, show_grades),
+		    source_session_id = COALESCE(NULLIF($8, '')::uuid, source_session_id),
 		    updated_at = now()
 		WHERE id = $1
-		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text`,
-		id, in.Name, in.CourtCount, in.BasePlayed, in.IsPublic, in.ShowGrades, strOrEmpty(in.SourceSessionID),
-	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt)
+		RETURNING id::text, name, status, court_count, base_played, max_rounds, is_public, show_grades, player_ids::text, source_session_id::text, created_at::text`,
+		id, in.Name, in.CourtCount, in.BasePlayed, in.MaxRounds, in.IsPublic, in.ShowGrades, strOrEmpty(in.SourceSessionID),
+	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.MaxRounds, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.SourceSessionID, &ev.CreatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
@@ -1263,9 +1432,9 @@ func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 		),
 		updated_at = now()
 		WHERE id = $1
-		RETURNING id::text, name, status, court_count, base_played, is_public, show_grades, player_ids::text, created_at::text`,
+		RETURNING id::text, name, status, court_count, base_played, max_rounds, is_public, show_grades, player_ids::text, created_at::text`,
 		id, in.PlayerIDs,
-	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
+	).Scan(&ev.ID, &ev.Name, &ev.Status, &ev.CourtCount, &ev.BasePlayed, &ev.MaxRounds, &ev.IsPublic, &ev.ShowGrades, &poolRaw, &ev.CreatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
