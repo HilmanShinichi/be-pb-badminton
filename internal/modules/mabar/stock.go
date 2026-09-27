@@ -144,7 +144,7 @@ func (s *Service) SaveAllocation(c *fiber.Ctx) error {
 	var usage int
 	_ = s.db.QueryRow(c.Context(), `
 		SELECT COALESCE((SELECT SUM(shuttlecock_used) FROM matches WHERE session_id = $1), 0)
-		     + COALESCE((SELECT SUM(shuttlecock_used) FROM session_player_stats WHERE session_id = $1), 0)`,
+		     + COALESCE((SELECT (SUM(shuttlecock_used) + 2) / 4 FROM session_player_stats WHERE session_id = $1), 0)`,
 		id).Scan(&usage)
 	if total != usage {
 		return httpx.WriteAppError(c, httpx.Unprocessable(fmt.Sprintf(

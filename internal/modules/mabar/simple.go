@@ -113,12 +113,13 @@ func (s *Service) SaveSimpleStats(c *fiber.Ctx) error {
 		}
 	}
 
-	var totalSimple int
+	var sumSimple int
 	if err := tx.QueryRow(c.Context(),
 		`SELECT COALESCE(SUM(shuttlecock_used), 0) FROM session_player_stats WHERE session_id = $1`,
-		id).Scan(&totalSimple); err != nil {
+		id).Scan(&sumSimple); err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save recap.")
 	}
+	totalSimple := (sumSimple + 2) / 4
 
 	// Keep stock in sync: one session-level USAGE row, match_id NULL.
 	// Per-match USAGE rows (match_id NOT NULL) are untouched.
