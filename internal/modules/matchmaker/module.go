@@ -1562,6 +1562,24 @@ func (s *Service) DeleteRound(c *fiber.Ctx) error {
 	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "round": round})
 }
 
+// DeleteMatch removes one generated card. Players freed by the deletion
+// become missing from their round, so TopUp (or a round regenerate) can fill
+// the round again afterwards with freshly drawn matchups.
+func (s *Service) DeleteMatch(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid match ID."))
+	}
+	tag, err := s.db.Exec(c.Context(), `DELETE FROM generated_matches WHERE id = $1`, id)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete match.")
+	}
+	if tag.RowsAffected() == 0 {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Match not found.")
+	}
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
+}
+
 func strOrEmpty(s *string) string {
 	if s == nil {
 		return ""

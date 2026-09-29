@@ -131,6 +131,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 
 	genMatches := authed.Group("/generated-matches")
 	genMatches.Patch("/:id", deps.MatchMaker.UpdateMatch)
+	genMatches.Delete("/:id", deps.MatchMaker.DeleteMatch)
 
 	inv := authed.Group("/inventory/shuttlecock")
 	inv.Get("/", deps.Inventory.ListProducts)
