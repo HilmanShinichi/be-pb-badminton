@@ -33,6 +33,13 @@ func Run(cfg config.Config) {
 	}
 	defer pool.Close()
 
+	// A rotating/default JWT_SECRET invalidates every stored session on each
+	// deploy (frontend then sees 401 UNAUTHORIZED). Keep one persistent
+	// secret in production instead of regenerating it per release.
+	if cfg.JWTSecret == "" || cfg.JWTSecret == "dev-only-secret" || cfg.JWTSecret == "change-me-in-production" {
+		log.Printf("WARNING: JWT_SECRET is insecure/default; sessions will not survive redeploys. Set a persistent JWT_SECRET in production.")
+	}
+
 	if err := database.Migrate(ctx, pool); err != nil {
 		log.Fatalf("migration failed: %v", err)
 	}
