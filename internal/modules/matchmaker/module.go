@@ -412,6 +412,67 @@ func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, 
 	return matches, nil
 }
 
+// eventPeriodID resolves the membership period of an event through its
+// source session (match_events -> mabar_sessions.period_id). Events without
+// a source session have no period link.
+func (s *Service) eventPeriodID(ctx context.Context, eventID string) (string, bool) {
+	var periodID *string
+	if err := s.db.QueryRow(ctx, `
+		SELECT ms.period_id::text
+		FROM match_events e
+		LEFT JOIN mabar_sessions ms ON ms.id = e.source_session_id
+		WHERE e.id = $1`, eventID).Scan(&periodID); err != nil {
+		return "", false
+	}
+	if periodID == nil || *periodID == "" {
+		return "", false
+	}
+	return *periodID, true
+}
+
+// periodLastRoundSoft loads the final round of every OTHER event in the same
+// period as soft-avoid history: generate should not repeat these matchups
+// unless no other valid 2v2 exists ("kecuali terpaksa").
+func (s *Service) periodLastRoundSoft(ctx context.Context, periodID, currentEventID string) (map[string]bool, []aiHistoryMatch) {
+	softSeen := map[string]bool{}
+	softHistory := []aiHistoryMatch{}
+	rows, err := s.db.Query(ctx, `
+		SELECT m.round, m.team1::text, m.team2::text
+		FROM generated_matches m
+		JOIN match_events e ON e.id = m.event_id
+		JOIN mabar_sessions ms ON ms.id = e.source_session_id
+		WHERE ms.period_id = $1
+		  AND m.event_id <> $2
+		  AND m.round = (SELECT MAX(m2.round) FROM generated_matches m2 WHERE m2.event_id = m.event_id)`, periodID, currentEventID)
+	if err != nil {
+		return softSeen, softHistory
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var round int
+		var t1raw, t2raw string
+		if err := rows.Scan(&round, &t1raw, &t2raw); err != nil {
+			continue
+		}
+		t1 := parseTeam(t1raw)
+		t2 := parseTeam(t2raw)
+		if len(t1) != 2 || len(t2) != 2 {
+			continue
+		}
+		ids1, ids2 := idsOf(t1), idsOf(t2)
+		softSeen[matchupKey(ids1, ids2)] = true
+		names := func(team []TeamPlayer) []string {
+			out := []string{}
+			for _, t := range team {
+				out = append(out, t.Name)
+			}
+			return out
+		}
+		softHistory = append(softHistory, aiHistoryMatch{Round: round, Team1: names(t1), Team2: names(t2)})
+	}
+	return softSeen, softHistory
+}
+
 // CreateEvent opens a match night. Without player_ids the pool defaults to
 // every active player. court_count caps the court numbers usable on cards
 // (0 = unlimited), max_rounds is the planned number of rounds (0 = no limit).
@@ -873,6 +934,18 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			maxRound = m.Round
 		}
 	}
+	// Soft cross-week guard: final round(s) of other events in the same
+	// period (via source_session -> mabar_sessions.period_id). Attempt 0 must
+	// avoid them; retries and local fallback may repeat when forced.
+	softSeen := map[string]bool{}
+	softHistory := []aiHistoryMatch{}
+	if periodID, ok := s.eventPeriodID(c.Context(), id); ok {
+		softSeen, softHistory = s.periodLastRoundSoft(c.Context(), periodID, id)
+		// Keys already covered by this event need no soft treatment.
+		for k := range seen {
+			delete(softSeen, k)
+		}
+	}
 	if in.Round == 0 && maxRounds > 0 {
 		remaining := maxRounds - maxRound
 		if remaining <= 0 {
@@ -902,7 +975,9 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// rule, one appearance per player, no repeat, and FULL coverage. Waves
 	// chunk the returned order by courts that can run simultaneously; the
 	// referee of every match is picked afterwards from the same pool.
-	validateRound := func(ms []aiMatchup, roundNo, waveBase int) ([]pending, error) {
+	// strictSoft also rejects last week's final round(s) from the same
+	// period; lenient mode (retry) allows repeating them when forced.
+	validateRound := func(ms []aiMatchup, roundNo, waveBase int, strictSoft bool) ([]pending, error) {
 		used := map[string]int{}
 		out := []pending{}
 		waves := map[int]int{}
@@ -929,6 +1004,9 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			key := matchupKey(mu.Team1, mu.Team2)
 			if seen[key] {
 				return nil, httpx.Unprocessable("AI repeated a previous matchup. Try generating again.")
+			}
+			if strictSoft && softSeen[key] {
+				return nil, httpx.Unprocessable("AI repeated last week's final round in the same period. Try generating again.")
 			}
 			out = append(out, pending{round: roundNo, wave: waves[len(out)], team1: t1, team2: t2})
 		}
@@ -1110,7 +1188,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				break
 			}
 			var aiRounds []aiRound
-			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, 1, attempt)
+			strictSoft := attempt == 0 && len(softSeen) > 0
+			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, softHistory, 1, attempt)
 			if genErr != nil {
 				if httpx.AsAppError(genErr).Code == "AI_PROVIDER_ERROR" {
 					aiUnavailable = true
@@ -1122,15 +1201,34 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
 				continue
 			}
-			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo, waveBase)
+			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo, waveBase, strictSoft)
 			if genErr == nil {
 				break
 			}
 		}
 		if genErr != nil {
-			local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow)
-			if localErr == nil {
-				accepted, genErr = local, nil
+			// Local fallback tries strict first (avoid last week's final
+			// round too) and only repeats it when no other 2v2 exists.
+			if len(softSeen) > 0 {
+				strictSeen := make(map[string]bool, len(seen)+len(softSeen))
+				for k := range seen {
+					strictSeen[k] = true
+				}
+				for k := range softSeen {
+					strictSeen[k] = true
+				}
+				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow); localErr == nil {
+					for _, p := range local {
+						seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
+					}
+					accepted, genErr = local, nil
+				}
+			}
+			if genErr != nil {
+				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow)
+				if localErr == nil {
+					accepted, genErr = local, nil
+				}
 			}
 		}
 		if genErr != nil {

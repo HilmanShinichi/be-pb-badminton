@@ -176,7 +176,10 @@ func aiThrottle(ctx context.Context) error {
 // generateMatchups asks the configured provider (openai|claude, model and
 // base URL from env) for balanced 2v2 rounds. Returns structured matchups or
 // an AppError the handler can write directly.
-func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, rounds, attempt int) ([]aiRound, error) {
+// softHistory holds last-round matchups from other events in the same period:
+// the model should avoid repeating them if possible, but may repeat when
+// forced (attempt > 0 drops the soft section entirely).
+func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int) ([]aiRound, error) {
 	provider := strings.ToLower(strings.TrimSpace(cfg.AIProvider))
 	if provider == "" {
 		provider = "openai"
@@ -222,11 +225,27 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 	}
 	var hb strings.Builder
 	for _, h := range history {
-		fmt.Fprintf(&hb, "R%d: %s+%s vs %s+%s\n", h.Round,
-			h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+		if len(h.Team1) == 2 && len(h.Team2) == 2 {
+			fmt.Fprintf(&hb, "R%d: %s+%s vs %s+%s\n", h.Round,
+				h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+		}
 	}
 	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
 		rounds, pb.String(), hb.String())
+	// Soft cross-week guard: last round(s) of other events in the same
+	// period. Avoid them on the first try; retries may repeat when forced.
+	if attempt == 0 && len(softHistory) > 0 {
+		var sb strings.Builder
+		for _, h := range softHistory {
+			if len(h.Team1) == 2 && len(h.Team2) == 2 {
+				fmt.Fprintf(&sb, "R%d: %s+%s vs %s+%s\n", h.Round,
+					h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+			}
+		}
+		if sb.Len() > 0 {
+			user += "Last week's final round(s) in the same period (avoid repeating these if possible, repeat only if no other valid 2v2 exists):\n" + sb.String()
+		}
+	}
 	if attempt > 0 {
 		user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
 	}
