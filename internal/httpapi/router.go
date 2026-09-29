@@ -66,6 +66,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 
 	authed := v1.Group("", httpx.RequireAuth(cfg.JWTSecret))
 	authed.Get("/auth/me", deps.Auth.Me)
+	authed.Patch("/auth/password", deps.Auth.ChangePassword)
 	authed.Post("/auth/logout", deps.Auth.Logout)
 	authed.Get("/dashboard", deps.Dashboard.Get)
 

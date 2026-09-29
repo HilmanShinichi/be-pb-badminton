@@ -31,12 +31,13 @@ func ParseToken(secret, raw string) (*Claims, error) {
 
 func RequireAuth(secret string) fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		// Tokens travel in the Authorization header only. A previous
+		// ?token= query fallback was removed so session tokens never leak
+		// into browser history, bookmarks, or server access logs (CSV
+		// exports now download via an authenticated fetch instead).
 		tokenStr := ""
-		header := c.Get("Authorization")
-		if strings.HasPrefix(header, "Bearer ") {
+		if header := c.Get("Authorization"); strings.HasPrefix(header, "Bearer ") {
 			tokenStr = strings.TrimPrefix(header, "Bearer ")
-		} else if qToken := c.Query("token"); qToken != "" {
-			tokenStr = qToken
 		}
 		if tokenStr == "" {
 			return Err(c, http.StatusUnauthorized, "UNAUTHORIZED", "Login is required.")
