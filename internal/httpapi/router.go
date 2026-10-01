@@ -127,6 +127,8 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	events.Delete("/:id", deps.MatchMaker.DeleteEvent)
 	events.Patch("/:id/counts/:player_id", deps.MatchMaker.AdjustCount)
 	events.Post("/:id/generate", deps.MatchMaker.Generate)
+	events.Post("/:id/generate-prompt", deps.MatchMaker.GeneratePrompt)
+	events.Post("/:id/generate-manual", deps.MatchMaker.ManualGenerate)
 	events.Post("/:id/players", deps.MatchMaker.AddEventPlayers)
 	events.Delete("/:id/rounds/:round", deps.MatchMaker.DeleteRound)
 

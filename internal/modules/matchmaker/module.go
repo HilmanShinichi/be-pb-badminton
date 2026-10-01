@@ -861,6 +861,189 @@ func (s *Service) PublicEvent(c *fiber.Ctx) error {
 	return httpx.OK(c, http.StatusOK, map[string]any{"event": ev, "matches": matches, "counts": counts})
 }
 
+// genBase is everything loaded once per generate call: pool, history,
+// soft guards, and play counts. API generate, prompt preview, and manual
+// paste share it so all three see identical state.
+type genBase struct {
+	pool          []poolPlayer
+	aiPlayers     []aiPlayer
+	history       []aiHistoryMatch
+	seen          map[string]bool
+	softSeen      map[string]bool
+	softHistory   []aiHistoryMatch
+	playedCounts  map[string]int
+	matches       []GenMatch
+	wavesPerRound int
+	maxRounds     int
+	maxRound      int
+}
+
+func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) {
+	pool, err := s.pool(ctx, id)
+	if err != nil {
+		return nil, &httpx.AppError{Status: http.StatusNotFound, Code: "NOT_FOUND", Message: "Event not found."}
+	}
+	if len(pool) < 4 {
+		return nil, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles.")
+	}
+	gb := &genBase{pool: pool, seen: map[string]bool{}, playedCounts: map[string]int{}}
+	// Matches per wave = courts running simultaneously (event cap, else 3).
+	gb.wavesPerRound = 3
+	_ = s.db.QueryRow(ctx,
+		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds FROM match_events WHERE id = $1`, id).Scan(&gb.wavesPerRound, &gb.maxRounds)
+	if gb.wavesPerRound <= 0 {
+		gb.wavesPerRound = 3
+	}
+	matches, err := s.listMatches(ctx, id)
+	if err != nil {
+		return nil, &httpx.AppError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "Could not load history."}
+	}
+	gb.matches = matches
+	for i, p := range pool {
+		gb.aiPlayers = append(gb.aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
+	}
+	for _, m := range matches {
+		names := func(team []TeamPlayer) []string {
+			out := []string{}
+			for _, t := range team {
+				out = append(out, t.Name)
+			}
+			return out
+		}
+		gb.history = append(gb.history, aiHistoryMatch{Round: m.Round, Team1: names(m.Team1), Team2: names(m.Team2)})
+		ids := []string{}
+		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+			ids = append(ids, t.PlayerID)
+			gb.playedCounts[t.PlayerID]++
+		}
+		gb.seen[matchupKey(ids[:2], ids[2:])] = true
+		if m.Round > gb.maxRound {
+			gb.maxRound = m.Round
+		}
+	}
+	// Soft cross-week guard: final round(s) of other events in the same
+	// period (via source_session -> mabar_sessions.period_id).
+	gb.softSeen = map[string]bool{}
+	if periodID, ok := s.eventPeriodID(ctx, id); ok {
+		gb.softSeen, gb.softHistory = s.periodLastRoundSoft(ctx, periodID, id)
+		// Keys already covered by this event need no soft treatment.
+		for k := range gb.seen {
+			delete(gb.softSeen, k)
+		}
+	}
+	return gb, nil
+}
+
+// genValidator carries per-round validation state. seen is shared by
+// reference so accepted matchups join the no-repeat set immediately.
+type genValidator struct {
+	pool             []poolPlayer
+	borrowAllow      map[string]bool
+	requireNewcomers []string
+	seen             map[string]bool
+	softSeen         map[string]bool
+	coverageN        int
+	wavesPerRound    int
+	playedCounts     map[string]int
+}
+
+// validateGenRound checks one AI round: 2v2, pool members, mixed-doubles
+// rule, one appearance per player, no repeat, and FULL coverage. Waves
+// chunk the returned order by courts that can run simultaneously; the
+// referee of every match is picked afterwards from the same pool.
+// strictSoft also rejects last week's final round(s) from the same
+// period; lenient mode (retry) allows repeating them when forced.
+func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, waveBase int, strictSoft bool) ([]pending, error) {
+	used := map[string]int{}
+	out := []pending{}
+	waves := map[int]int{}
+	for idx := range ms {
+		waves[idx] = waveBase + idx/v.wavesPerRound + 1
+	}
+	for _, mu := range ms {
+		if len(mu.Team1) != 2 || len(mu.Team2) != 2 {
+			return nil, httpx.Unprocessable("AI returned a non-2v2 matchup. Try generating again.")
+		}
+		t1, t2, err := s.resolveTeams(v.pool, mu.Team1, mu.Team2)
+		if err != nil {
+			return nil, httpx.Unprocessable("AI used players outside this event (" + err.Error() + "). Try generating again.")
+		}
+		for _, pid := range append(append([]string{}, mu.Team1...), mu.Team2...) {
+			used[pid]++
+			if used[pid] > 1 && !v.borrowAllow[pid] {
+				return nil, httpx.Unprocessable("AI listed a player twice in one round. Try generating again.")
+			}
+			if used[pid] > 2 {
+				return nil, httpx.Unprocessable("AI listed a player three times in one round. Try generating again.")
+			}
+		}
+		key := matchupKey(mu.Team1, mu.Team2)
+		if v.seen[key] {
+			return nil, httpx.Unprocessable("AI repeated a previous matchup. Try generating again.")
+		}
+		if strictSoft && v.softSeen[key] {
+			return nil, httpx.Unprocessable("AI repeated last week's final round in the same period. Try generating again.")
+		}
+		out = append(out, pending{round: roundNo, wave: waves[len(out)], team1: t1, team2: t2})
+	}
+	for _, req := range v.requireNewcomers {
+		if used[req] == 0 {
+			return nil, httpx.Unprocessable("AI left out a late arrival. Try generating again.")
+		}
+	}
+	n := v.coverageN
+	if len(v.requireNewcomers) == 0 && (len(used) == 0 || len(used)%4 != 0 || len(used) < n-3) {
+		return nil, httpx.Unprocessable(
+			"AI covered only part of the pool. Try generating again.")
+	}
+	if len(v.requireNewcomers) > 0 && len(used)%4 != 0 {
+		return nil, httpx.Unprocessable("AI made an incomplete top-up group. Try generating again.")
+	}
+	for _, p := range out {
+		v.seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
+	}
+	assignReferees(v.pool, out, waves, v.playedCounts)
+	return out, nil
+}
+
+// savePendings stores validated matchups as UPCOMING in one transaction.
+func (s *Service) savePendings(ctx context.Context, id string, pendings []pending) ([]GenMatch, error) {
+	fail := &httpx.AppError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "Could not save matchups."}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fail
+	}
+	defer tx.Rollback(ctx)
+	saved := []GenMatch{}
+	for _, p := range pendings {
+		var m GenMatch
+		var t1, t2 string
+		err := tx.QueryRow(ctx, `
+			INSERT INTO generated_matches (id, event_id, round, wave, team1, team2, referee_id, status)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'UPCOMING')
+			RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
+			          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
+			id, p.round, p.wave, mustTeamJSON(p.team1), mustTeamJSON(p.team2), p.referee,
+		).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
+			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
+		if err != nil {
+			return nil, fail
+		}
+		m.Team1 = parseTeam(t1)
+		m.Team2 = parseTeam(t2)
+		if p.referee != nil {
+			var refName string
+			_ = tx.QueryRow(ctx, `SELECT name FROM players WHERE id = $1`, *p.referee).Scan(&refName)
+			m.Referee = &Referee{PlayerID: *p.referee, Name: refName}
+		}
+		saved = append(saved, m)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fail
+	}
+	return saved, nil
+}
+
 // Generate asks the AI for balanced rounds, validates every matchup (2v2,
 // pool members, one appearance per player per round, no repeat of any
 // previous matchup in this event), and stores them as UPCOMING.
@@ -881,70 +1064,19 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	if _, err := uuid.Parse(id); err != nil {
 		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
 	}
-	pool, err := s.pool(c.Context(), id)
+	gb, err := s.loadGenBase(c.Context(), id)
 	if err != nil {
-		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+		return httpx.WriteAppError(c, err)
 	}
-	if len(pool) < 4 {
-		return httpx.WriteAppError(c, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles."))
-	}
-	// Matches per wave = courts running simultaneously (event cap, else 3).
-	wavesPerRound := 3
-	maxRounds := 0
-	_ = s.db.QueryRow(c.Context(),
-		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds FROM match_events WHERE id = $1`, id).Scan(&wavesPerRound, &maxRounds)
-	if wavesPerRound <= 0 {
-		wavesPerRound = 3
-	}
-	matches, err := s.listMatches(c.Context(), id)
-	if err != nil {
-		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load history.")
-	}
+	pool, aiPlayers, history := gb.pool, gb.aiPlayers, gb.history
+	seen, softSeen, softHistory := gb.seen, gb.softSeen, gb.softHistory
+	playedCounts, matches := gb.playedCounts, gb.matches
+	wavesPerRound, maxRounds, maxRound := gb.wavesPerRound, gb.maxRounds, gb.maxRound
 	// The event's match limit caps how many rounds this night may reach; one
 	// round is one match per player, so it also drives the count bars.
 	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
-	}
-	aiPlayers := []aiPlayer{}
-	for i, p := range pool {
-		aiPlayers = append(aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
-	}
-	history := []aiHistoryMatch{}
-	seen := map[string]bool{}
-	maxRound := 0
-	// playedCounts drives referee duty: the least-played player referees.
-	playedCounts := map[string]int{}
-	for _, m := range matches {
-		names := func(team []TeamPlayer) []string {
-			out := []string{}
-			for _, t := range team {
-				out = append(out, t.Name)
-			}
-			return out
-		}
-		history = append(history, aiHistoryMatch{Round: m.Round, Team1: names(m.Team1), Team2: names(m.Team2)})
-		ids := []string{}
-		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
-			ids = append(ids, t.PlayerID)
-			playedCounts[t.PlayerID]++
-		}
-		seen[matchupKey(ids[:2], ids[2:])] = true
-		if m.Round > maxRound {
-			maxRound = m.Round
-		}
-	}
-	// Soft cross-week guard: final round(s) of other events in the same
-	// period (via source_session -> mabar_sessions.period_id). Attempt 0 must
-	// avoid them; retries and local fallback may repeat when forced.
-	softSeen := map[string]bool{}
-	softHistory := []aiHistoryMatch{}
-	if periodID, ok := s.eventPeriodID(c.Context(), id); ok {
-		softSeen, softHistory = s.periodLastRoundSoft(c.Context(), periodID, id)
-		// Keys already covered by this event need no soft treatment.
-		for k := range seen {
-			delete(softSeen, k)
-		}
 	}
 	if in.Round == 0 && maxRounds > 0 {
 		remaining := maxRounds - maxRound
@@ -982,64 +1114,10 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// of silently using the local draw.
 	aiErrMsg := ""
 
-	// validateRound checks one AI round: 2v2, pool members, mixed-doubles
-	// rule, one appearance per player, no repeat, and FULL coverage. Waves
-	// chunk the returned order by courts that can run simultaneously; the
-	// referee of every match is picked afterwards from the same pool.
-	// strictSoft also rejects last week's final round(s) from the same
-	// period; lenient mode (retry) allows repeating them when forced.
-	validateRound := func(ms []aiMatchup, roundNo, waveBase int, strictSoft bool) ([]pending, error) {
-		used := map[string]int{}
-		out := []pending{}
-		waves := map[int]int{}
-		for idx := range ms {
-			waves[idx] = waveBase + idx/wavesPerRound + 1
-		}
-		for _, mu := range ms {
-			if len(mu.Team1) != 2 || len(mu.Team2) != 2 {
-				return nil, httpx.Unprocessable("AI returned a non-2v2 matchup. Try generating again.")
-			}
-			t1, t2, err := s.resolveTeams(pool, mu.Team1, mu.Team2)
-			if err != nil {
-				return nil, httpx.Unprocessable("AI used players outside this event (" + err.Error() + "). Try generating again.")
-			}
-			for _, pid := range append(append([]string{}, mu.Team1...), mu.Team2...) {
-				used[pid]++
-				if used[pid] > 1 && !borrowAllow[pid] {
-					return nil, httpx.Unprocessable("AI listed a player twice in one round. Try generating again.")
-				}
-				if used[pid] > 2 {
-					return nil, httpx.Unprocessable("AI listed a player three times in one round. Try generating again.")
-				}
-			}
-			key := matchupKey(mu.Team1, mu.Team2)
-			if seen[key] {
-				return nil, httpx.Unprocessable("AI repeated a previous matchup. Try generating again.")
-			}
-			if strictSoft && softSeen[key] {
-				return nil, httpx.Unprocessable("AI repeated last week's final round in the same period. Try generating again.")
-			}
-			out = append(out, pending{round: roundNo, wave: waves[len(out)], team1: t1, team2: t2})
-		}
-		for _, req := range requireNewcomers {
-			if used[req] == 0 {
-				return nil, httpx.Unprocessable("AI left out a late arrival. Try generating again.")
-			}
-		}
-		n := coverageN
-		if len(requireNewcomers) == 0 && (len(used) == 0 || len(used)%4 != 0 || len(used) < n-3) {
-			return nil, httpx.Unprocessable(
-				"AI covered only part of the pool. Try generating again.")
-		}
-		if len(requireNewcomers) > 0 && len(used)%4 != 0 {
-			return nil, httpx.Unprocessable("AI made an incomplete top-up group. Try generating again.")
-		}
-		for _, p := range out {
-			seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
-		}
-		assignReferees(pool, out, waves, playedCounts)
-		return out, nil
-	}
+	// Shared validation state; per-round fields (pool, borrowAllow,
+	// requireNewcomers, coverageN) are synced at the top of each iteration
+	// because top-up can grow the pool mid-loop.
+	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts}
 
 	for i := 0; i < in.Rounds; i++ {
 		// Explicit round number fills one empty round (e.g. after deleting
@@ -1186,6 +1264,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			}
 			roundNo = in.Round
 		}
+		// Sync per-round validation state (top-up may have rebuilt the pool).
+		v.pool, v.borrowAllow, v.requireNewcomers, v.coverageN = pool, borrowAllow, requireNewcomers, coverageN
 		var accepted []pending
 		var genErr error
 		// Two AI tries only: each one spends provider tokens, and when the
@@ -1222,7 +1302,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
 				continue
 			}
-			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo, waveBase, strictSoft)
+			accepted, genErr = s.validateGenRound(v, aiRounds[0].Matches, roundNo, waveBase, strictSoft)
 			if genErr == nil {
 				if !usedAISet {
 					usedAI, usedAISet = ep, true
@@ -1286,37 +1366,9 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	if len(pendings) == 0 {
 		return httpx.WriteAppError(c, httpx.Unprocessable("AI returned no usable matchups. Try generating again."))
 	}
-	tx, err := s.db.Begin(c.Context())
+	saved, err := s.savePendings(c.Context(), id, pendings)
 	if err != nil {
-		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
-	}
-	defer tx.Rollback(c.Context())
-	saved := []GenMatch{}
-	for _, p := range pendings {
-		var m GenMatch
-		var t1, t2 string
-		err := tx.QueryRow(c.Context(), `
-			INSERT INTO generated_matches (id, event_id, round, wave, team1, team2, referee_id, status)
-			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'UPCOMING')
-			RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
-			          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
-			id, p.round, p.wave, mustTeamJSON(p.team1), mustTeamJSON(p.team2), p.referee,
-		).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
-			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
-		if err != nil {
-			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
-		}
-		m.Team1 = parseTeam(t1)
-		m.Team2 = parseTeam(t2)
-		if p.referee != nil {
-			var refName string
-			_ = tx.QueryRow(c.Context(), `SELECT name FROM players WHERE id = $1`, *p.referee).Scan(&refName)
-			m.Referee = &Referee{PlayerID: *p.referee, Name: refName}
-		}
-		saved = append(saved, m)
-	}
-	if err := tx.Commit(c.Context()); err != nil {
-		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
+		return httpx.WriteAppError(c, err)
 	}
 	// Tell the UI which AI produced the draw so the loading modal can show
 	// "Berhasil diproses AI 2 (model ...)". Local draw reports source lokal.
@@ -1338,6 +1390,135 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			"error":          aiErrMsg,
 		}
 	}
+	return httpx.OK(c, http.StatusCreated, map[string]any{"matches": saved, "ai": aiMeta})
+}
+
+// GeneratePrompt returns the exact prompt the API flow would send for one
+// round, so it can be copied into a web AI (ChatGPT/Groq web) that has no
+// API key. No AI is called and nothing is stored. Only the next round or
+// one empty round number is supported (one paste = one round).
+func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
+	id := c.Params("id")
+	var in struct {
+		Round int `json:"round"`
+	}
+	_ = httpx.Decode(c, &in)
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
+	}
+	gb, err := s.loadGenBase(c.Context(), id)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	roundNo := gb.maxRound + 1
+	if in.Round > 0 {
+		if in.Round < 1 || in.Round > 99 {
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
+		}
+		var exists bool
+		if err := s.db.QueryRow(c.Context(),
+			`SELECT EXISTS (SELECT 1 FROM generated_matches WHERE event_id = $1 AND round = $2)`,
+			id, in.Round).Scan(&exists); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load round.")
+		}
+		if exists {
+			return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
+		}
+		roundNo = in.Round
+	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds {
+		return httpx.WriteAppError(c, httpx.Unprocessable(
+			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
+	}
+	prompt := aiSystemPrompt + "\n\n" + buildUserPrompt(gb.aiPlayers, gb.history, gb.softHistory, 1, 0)
+	return httpx.OK(c, http.StatusOK, map[string]any{"round": roundNo, "prompt": prompt})
+}
+
+// ManualGenerate validates a pasted web-AI answer through the same pipeline
+// as API generate and stores it on success:
+//  1. valid JSON (or a readable team table) — else 422,
+//  2. index refs resolve to pool players — else 422,
+//  3. full rules incl. no-repeat and coverage — else 422 with the reason.
+// There is deliberately no local fallback: a bad paste is reported so the
+// user can re-ask the web AI, never silently replaced.
+func (s *Service) ManualGenerate(c *fiber.Ctx) error {
+	id := c.Params("id")
+	var in struct {
+		Round int    `json:"round"`
+		Raw   string `json:"raw"`
+	}
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Paste the AI answer as text.")
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
+	}
+	raw := strings.TrimSpace(in.Raw)
+	if raw == "" {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Tempel jawaban AI web dulu sebelum disimpan."))
+	}
+	gb, err := s.loadGenBase(c.Context(), id)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	roundNo := gb.maxRound + 1
+	if in.Round > 0 {
+		if in.Round < 1 || in.Round > 99 {
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
+		}
+		var exists bool
+		if err := s.db.QueryRow(c.Context(),
+			`SELECT EXISTS (SELECT 1 FROM generated_matches WHERE event_id = $1 AND round = $2)`,
+			id, in.Round).Scan(&exists); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load round.")
+		}
+		if exists {
+			return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
+		}
+		roundNo = in.Round
+	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds {
+		return httpx.WriteAppError(c, httpx.Unprocessable(
+			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
+	}
+	// 1) Valid JSON (or a readable team table)?
+	out, perr := parseAIOutput(raw)
+	if perr != nil {
+		if md, mderr := parseMarkdownDraw(raw, gb.aiPlayers); mderr == nil && len(md) > 0 {
+			out = aiOutput{Rounds: []aiRound{{Round: 1, Matches: md}}}
+		} else {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Tempelannya bukan JSON valid dan tidak terbaca sebagai tabel pasangan. Minta AI web balas HANYA JSON lalu tempel ulang."))
+		}
+	}
+	if len(out.Rounds) == 0 || len(out.Rounds[0].Matches) == 0 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Jawaban tidak berisi ronde/match. Minta AI web balas dengan bentuk yang diminta di prompt."))
+	}
+	// 2) Index refs resolve to pool players?
+	resolve := resolveIdxRefs(gb.aiPlayers)
+	for mi := range out.Rounds[0].Matches {
+		t1, err := resolve(out.Rounds[0].Matches[mi].Team1)
+		if err != nil {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Referensi pemain tidak dikenal ("+err.Error()+"). Pakai nomor index 0.."+strconv.Itoa(len(gb.aiPlayers)-1)+" seperti di prompt."))
+		}
+		t2, err := resolve(out.Rounds[0].Matches[mi].Team2)
+		if err != nil {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Referensi pemain tidak dikenal ("+err.Error()+"). Pakai nomor index 0.."+strconv.Itoa(len(gb.aiPlayers)-1)+" seperti di prompt."))
+		}
+		out.Rounds[0].Matches[mi].Team1 = t1
+		out.Rounds[0].Matches[mi].Team2 = t2
+	}
+	// 3) Full rules: 2v2, mixed doubles, one appearance, no repeat, coverage.
+	v := &genValidator{pool: gb.pool, borrowAllow: map[string]bool{}, requireNewcomers: []string{},
+		seen: gb.seen, softSeen: gb.softSeen, coverageN: len(gb.pool),
+		wavesPerRound: gb.wavesPerRound, playedCounts: gb.playedCounts}
+	accepted, verr := s.validateGenRound(v, out.Rounds[0].Matches, roundNo, 0, len(gb.softSeen) > 0)
+	if verr != nil {
+		return httpx.WriteAppError(c, verr)
+	}
+	saved, err := s.savePendings(c.Context(), id, accepted)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	aiMeta := map[string]any{"label": "AI Web", "provider": "manual", "model": "tempel-manual",
+		"fallback": false, "local_fallback": false, "error": ""}
 	return httpx.OK(c, http.StatusCreated, map[string]any{"matches": saved, "ai": aiMeta})
 }
 

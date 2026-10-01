@@ -236,6 +236,74 @@ func isProviderError(err error) bool {
 	return httpx.AsAppError(err).Code == "AI_PROVIDER_ERROR"
 }
 
+// buildUserPrompt renders the exact user message sent to the model: player
+// lines keyed by index (no UUIDs on the wire), history as one line per past
+// matchup, plus the soft cross-week guard on attempt 0. generateMatchups and
+// the manual "AI web" prompt preview share it so both show identical text.
+func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int) string {
+	var pb strings.Builder
+	for _, p := range players {
+		grade := "-"
+		if p.Grade != nil && *p.Grade != "" {
+			grade = *p.Grade
+		}
+		gender := "-"
+		if p.Gender != nil && *p.Gender != "" {
+			gender = *p.Gender
+		}
+		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival)
+	}
+	var hb strings.Builder
+	for _, h := range history {
+		if len(h.Team1) == 2 && len(h.Team2) == 2 {
+			fmt.Fprintf(&hb, "R%d: %s+%s vs %s+%s\n", h.Round,
+				h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+		}
+	}
+	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
+		rounds, pb.String(), hb.String())
+	if attempt == 0 && len(softHistory) > 0 {
+		var sb strings.Builder
+		for _, h := range softHistory {
+			if len(h.Team1) == 2 && len(h.Team2) == 2 {
+				fmt.Fprintf(&sb, "R%d: %s+%s vs %s+%s\n", h.Round,
+					h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+			}
+		}
+		if sb.Len() > 0 {
+			user += "Last week's final round(s) in the same period (avoid repeating these if possible, repeat only if no other valid 2v2 exists):\n" + sb.String()
+		}
+	}
+	if attempt > 0 {
+		user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
+	}
+	return user
+}
+
+// resolveIdxRefs maps player index references ("0", "3") back to real
+// player ids. Shared by the API chain and the manual paste flow.
+func resolveIdxRefs(players []aiPlayer) func([]string) ([]string, error) {
+	byIndex := map[int]string{}
+	for _, p := range players {
+		byIndex[p.Index] = p.ID
+	}
+	return func(refs []string) ([]string, error) {
+		ids := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			n, err := strconv.Atoi(strings.TrimSpace(ref))
+			if err != nil {
+				return nil, fmt.Errorf("bad player reference %q", ref)
+			}
+			id, ok := byIndex[n]
+			if !ok {
+				return nil, fmt.Errorf("unknown player index %q", ref)
+			}
+			ids = append(ids, id)
+		}
+		return ids, nil
+	}
+}
+
 // generateMatchups asks the configured providers in order (AI 1, then
 // AI 2, then AI 3 from env) for balanced 2v2 rounds. The first endpoint
 // that returns usable JSON wins; provider errors (rate-limit, auth,
@@ -259,65 +327,10 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 
 	// Compact prompt: players as short lines keyed by index (no UUIDs on the
 	// wire), history as one line per past matchup. Keeps token usage low.
-	var pb strings.Builder
-	for _, p := range players {
-		grade := "-"
-		if p.Grade != nil && *p.Grade != "" {
-			grade = *p.Grade
-		}
-		gender := "-"
-		if p.Gender != nil && *p.Gender != "" {
-			gender = *p.Gender
-		}
-		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival)
-	}
-	var hb strings.Builder
-	for _, h := range history {
-		if len(h.Team1) == 2 && len(h.Team2) == 2 {
-			fmt.Fprintf(&hb, "R%d: %s+%s vs %s+%s\n", h.Round,
-				h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
-		}
-	}
-	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
-		rounds, pb.String(), hb.String())
-	// Soft cross-week guard: last round(s) of other events in the same
-	// period. Avoid them on the first try; retries may repeat when forced.
-	if attempt == 0 && len(softHistory) > 0 {
-		var sb strings.Builder
-		for _, h := range softHistory {
-			if len(h.Team1) == 2 && len(h.Team2) == 2 {
-				fmt.Fprintf(&sb, "R%d: %s+%s vs %s+%s\n", h.Round,
-					h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
-			}
-		}
-		if sb.Len() > 0 {
-			user += "Last week's final round(s) in the same period (avoid repeating these if possible, repeat only if no other valid 2v2 exists):\n" + sb.String()
-		}
-	}
-	if attempt > 0 {
-		user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
-	}
+	user := buildUserPrompt(players, history, softHistory, rounds, attempt)
 
 	// Resolve index references back to real player ids.
-	byIndex := map[int]string{}
-	for _, p := range players {
-		byIndex[p.Index] = p.ID
-	}
-	resolve := func(refs []string) ([]string, error) {
-		ids := make([]string, 0, len(refs))
-		for _, ref := range refs {
-			n, err := strconv.Atoi(strings.TrimSpace(ref))
-			if err != nil {
-				return nil, fmt.Errorf("bad player reference %q", ref)
-			}
-			id, ok := byIndex[n]
-			if !ok {
-				return nil, fmt.Errorf("unknown player index %q", ref)
-			}
-			ids = append(ids, id)
-		}
-		return ids, nil
-	}
+	resolve := resolveIdxRefs(players)
 
 	// Try endpoints in order. Provider errors fall through to the next AI;
 	// unusable JSON also tries the next AI before giving up, so one bad
