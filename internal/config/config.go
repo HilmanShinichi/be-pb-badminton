@@ -23,6 +23,19 @@ type Config struct {
 	AIModel         string
 	AIBaseURL       string
 	AIAPIKey        string
+	// Fallback chain: AI 2 dipakai kalau AI 1 gagal (provider error /
+	// rate-limit / tidak bisa dihubungi), AI 3 kalau AI 2 juga gagal.
+	AIProvider2 string
+	AIModel2    string
+	AIBaseURL2  string
+	AIAPIKey2   string
+	AIProvider3 string
+	AIModel3    string
+	AIBaseURL3  string
+	AIAPIKey3   string
+	// AIDebug logs truncated raw AI responses (AI_DEBUG=1). For diagnosing
+	// why an endpoint's answer was unusable. Off by default.
+	AIDebug bool
 }
 
 // LoadDotEnv reads KEY=VALUE lines from path into the environment. Existing
@@ -61,6 +74,15 @@ func Load() Config {
 		AIModel:         env("AI_MODEL", ""),
 		AIBaseURL:       env("AI_BASE_URL", ""),
 		AIAPIKey:        env("AI_API_KEY", ""),
+		AIProvider2:     env("AI_PROVIDER_2", ""),
+		AIModel2:        env("AI_MODEL_2", ""),
+		AIBaseURL2:      env("AI_BASE_URL_2", ""),
+		AIAPIKey2:       env("AI_API_KEY_2", ""),
+		AIProvider3:     env("AI_PROVIDER_3", ""),
+		AIModel3:        env("AI_MODEL_3", ""),
+		AIBaseURL3:      env("AI_BASE_URL_3", ""),
+		AIAPIKey3:       env("AI_API_KEY_3", ""),
+		AIDebug:         envBool("AI_DEBUG", false),
 	}
 }
 
@@ -80,6 +102,18 @@ func (c Config) DatabaseConnectionString() string {
 func env(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envBool(key string, fallback bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
 	}
 	return fallback
 }

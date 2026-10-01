@@ -967,9 +967,20 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// (they may appear twice); requireNewcomers must all play.
 	borrowAllow := map[string]bool{}
 	requireNewcomers := []string{}
-	// aiUnavailable latches once the provider fails so the remaining rounds
+	// aiUnavailable latches once ALL providers fail so the remaining rounds
 	// are drawn locally instead of waiting on throttled calls.
 	aiUnavailable := false
+	// usedAI tracks which endpoint produced the draw, shown in the loading
+	// UI ("Berhasil diproses AI 2"). usedFallback is true when any round
+	// came from AI 2/3, usedLocal when the deterministic draw was used.
+	usedAI := aiEndpoint{}
+	usedAISet := false
+	usedFallback := false
+	usedLocal := false
+	// aiErrMsg keeps the first AI failure message so the UI can show WHY the
+	// draw fell back (e.g. "AI provider HTTP 401: Invalid API Key") instead
+	// of silently using the local draw.
+	aiErrMsg := ""
 
 	// validateRound checks one AI round: 2v2, pool members, mixed-doubles
 	// rule, one appearance per player, no repeat, and FULL coverage. Waves
@@ -1180,18 +1191,28 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		// Two AI tries only: each one spends provider tokens, and when the
 		// model still cannot satisfy the rules the deterministic local draw
 		// below finishes the round instead of hammering the rate limit. A
-		// provider error (rate limit, auth, network) is not worth a second
-		// call, and once it happens the rest of the rounds stay local too.
+		// provider error means the whole chain (AI 1 -> AI 2 -> AI 3) failed,
+		// and once it happens the rest of the rounds stay local too.
 		for attempt := 0; attempt < 2; attempt++ {
 			if aiUnavailable {
 				genErr = httpx.BadRequest("AI_PROVIDER_ERROR", "AI provider unavailable.")
 				break
 			}
 			var aiRounds []aiRound
+			var ep aiEndpoint
+			var skips []string
 			strictSoft := attempt == 0 && len(softSeen) > 0
-			aiRounds, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, softHistory, 1, attempt)
+			aiRounds, ep, skips, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, softHistory, 1, attempt)
+			// Skipped primaries are worth reporting even when a fallback AI
+			// succeeds, so the UI can show why AI 1 was not used.
+			if len(skips) > 0 && aiErrMsg == "" {
+				aiErrMsg = strings.Join(skips, "; ")
+			}
 			if genErr != nil {
 				if httpx.AsAppError(genErr).Code == "AI_PROVIDER_ERROR" {
+					if aiErrMsg == "" {
+						aiErrMsg = httpx.AsAppError(genErr).Message
+					}
 					aiUnavailable = true
 					break
 				}
@@ -1203,10 +1224,21 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			}
 			accepted, genErr = validateRound(aiRounds[0].Matches, roundNo, waveBase, strictSoft)
 			if genErr == nil {
+				if !usedAISet {
+					usedAI, usedAISet = ep, true
+				}
+				if ep.Label != "" && ep.Label != "AI 1" {
+					usedFallback = true
+					// Last writer wins so the UI names the actual AI used.
+					usedAI = ep
+				}
 				break
 			}
 		}
 		if genErr != nil {
+			if ae := httpx.AsAppError(genErr); aiErrMsg == "" {
+				aiErrMsg = ae.Message
+			}
 			// Local fallback tries strict first (avoid last week's final
 			// round too) and only repeats it when no other 2v2 exists.
 			if len(softSeen) > 0 {
@@ -1222,12 +1254,14 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 						seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
 					}
 					accepted, genErr = local, nil
+					usedLocal = true
 				}
 			}
 			if genErr != nil {
 				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow)
 				if localErr == nil {
 					accepted, genErr = local, nil
+					usedLocal = true
 				}
 			}
 		}
@@ -1284,7 +1318,27 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	if err := tx.Commit(c.Context()); err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save matchups.")
 	}
-	return httpx.OK(c, http.StatusCreated, saved)
+	// Tell the UI which AI produced the draw so the loading modal can show
+	// "Berhasil diproses AI 2 (model ...)". Local draw reports source lokal.
+	aiMeta := map[string]any{
+		"label":          "Lokal",
+		"provider":       "local",
+		"model":          "local-draw",
+		"fallback":       usedFallback,
+		"local_fallback": true,
+		"error":          aiErrMsg,
+	}
+	if usedAISet {
+		aiMeta = map[string]any{
+			"label":          usedAI.Label,
+			"provider":       usedAI.Provider,
+			"model":          usedAI.Model,
+			"fallback":       usedFallback,
+			"local_fallback": usedLocal,
+			"error":          aiErrMsg,
+		}
+	}
+	return httpx.OK(c, http.StatusCreated, map[string]any{"matches": saved, "ai": aiMeta})
 }
 
 // UpdateMatch edits teams (by player ids, resolved to fresh name/grade
