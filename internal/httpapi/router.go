@@ -112,6 +112,9 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	mabar.Get("/:id/billing", deps.Mabar.ListBilling)
 	mabar.Post("/:id/billing", deps.Mabar.GenerateBilling)
 	mabar.Patch("/:id/billing/:playerId", deps.Mabar.UpdateBillingStatus)
+	mabar.Get("/:id/expenses", deps.Mabar.ListExpenses)
+	mabar.Post("/:id/expenses", deps.Mabar.AddExpense)
+	mabar.Delete("/:id/expenses/:expenseId", deps.Mabar.DeleteExpense)
 
 	matches := authed.Group("/matches")
 	matches.Patch("/:id", deps.Mabar.UpdateMatch)

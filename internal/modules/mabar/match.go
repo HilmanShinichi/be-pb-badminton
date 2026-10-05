@@ -287,7 +287,7 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 	_ = s.db.QueryRow(c.Context(), `
 		SELECT
 			COALESCE((SELECT SUM(amount) FROM revenues WHERE session_id = $1), 0),
-			COALESCE((SELECT SUM(amount) FROM expenses WHERE session_id = $1 AND category <> 'VENUE' AND category <> 'SHUTTLECOCK_PURCHASE'), 0),
+			COALESCE((SELECT SUM(amount) FROM expenses WHERE session_id = $1 AND category <> 'SHUTTLECOCK_PURCHASE'), 0),
 			COALESCE((SELECT SUM(units) FROM shuttlecock_transactions WHERE session_id = $1 AND type = 'USAGE'), 0),
 			COALESCE((SELECT SUM(total) FROM player_bills WHERE session_id = $1 AND payment_status = 'PAID'), 0)`, id).
 		Scan(&revenue, &otherExpense, &unitsUsed, &billedPaid)

@@ -27,11 +27,12 @@ type sessionRow struct {
 	Revenue       int64   `json:"revenue"`
 	ShuttleUsed   int64   `json:"shuttlecock_used"`
 	ShuttleCost   int64   `json:"shuttlecock_cost"`
-	Profit        int64   `json:"profit"`
-	Status        string  `json:"status"`
-	BillsTotal    int     `json:"bills_total"`
-	BillsPaid     int     `json:"bills_paid"`
-	PaymentStatus string  `json:"payment_status"`
+	Profit            int64   `json:"profit"`
+	OperationalProfit int64   `json:"operational_profit"`
+	Status            string  `json:"status"`
+	BillsTotal        int     `json:"bills_total"`
+	BillsPaid         int     `json:"bills_paid"`
+	PaymentStatus     string  `json:"payment_status"`
 }
 
 // Get is the landing overview: what is happening, what is next, is the club
@@ -305,6 +306,28 @@ func (s *Service) Get(c *fiber.Ctx) error {
 					fundRemainder += st.Profit
 					st.Remainder = fundRemainder
 					fundSteps = append(fundSteps, st)
+				}
+			}
+		}
+	}
+
+	stepByDate := map[string]fundStep{}
+	for _, st := range fundSteps {
+		stepByDate[st.Date] = st
+	}
+
+	for i := range recent {
+		recent[i].OperationalProfit = recent[i].Profit
+		if recent[i].Type == "PERIOD" {
+			if st, ok := stepByDate[recent[i].Date]; ok && fundPlanned > fundCollected {
+				// Upfront court fund deficit: reflect the remaining deficit for this session.
+				recent[i].Profit = st.Remainder
+				if recent[i].Profit < 0 {
+					recent[i].Status = "LOSS"
+				} else if recent[i].Profit > 0 {
+					recent[i].Status = "PROFIT"
+				} else {
+					recent[i].Status = "BREAK_EVEN"
 				}
 			}
 		}
