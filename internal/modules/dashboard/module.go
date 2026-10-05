@@ -254,6 +254,62 @@ func (s *Service) Get(c *fiber.Ctx) error {
 	monthScope["period"]["revenue"] += pBilled
 	monthRevenue += dBilled + pBilled
 
+	// Court fund: how much of the period's planned courts the collected
+	// commitment fees cover. Falls back to the latest period when none is
+	// ACTIVE (funds still explain the rows).
+	var fundPeriodID, fundPeriodName *string
+	var fundPlanned, fundCollected int64
+	_ = s.db.QueryRow(c.Context(),
+		`SELECT p.id::text, p.name, COALESCE(p.venue_cost_total, 0),
+		        COALESCE((SELECT SUM(amount) FROM revenues WHERE period_id = p.id AND source = 'COMMITMENT_FEE'), 0)
+		 FROM membership_periods p
+		 WHERE p.id = COALESCE($1::uuid, (SELECT id FROM membership_periods ORDER BY start_date DESC LIMIT 1))`,
+		activePeriodID).Scan(&fundPeriodID, &fundPeriodName, &fundPlanned, &fundCollected)
+
+	// Court fund walk: the commitment gap is paid down by each held PERIOD
+	// session's kok-only profit (cross-subsidy the club approved). Sessions
+	// in date order; remainder starts at collected - planned.
+	type fundStep struct {
+		Date      string `json:"date"`
+		Profit    int64  `json:"profit"`
+		Remainder int64  `json:"remainder"`
+	}
+	fundSteps := []fundStep{}
+	fundRemainder := fundCollected - fundPlanned
+	if fundPeriodID != nil {
+		srows, err := s.db.Query(c.Context(), `
+			WITH avg_unit AS (
+				SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0) AS price
+				FROM shuttlecock_transactions t
+				JOIN shuttlecock_products pr ON pr.id = t.product_id
+				WHERE t.type = 'PURCHASE'
+			)
+			SELECT s.date::text,
+			       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0)
+			           - ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
+			           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float))
+			FROM mabar_sessions s
+			LEFT JOIN avg_unit a ON TRUE
+			LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM revenues GROUP BY session_id) rv ON rv.session_id = s.id
+			LEFT JOIN (SELECT session_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE payment_status = 'PAID') AS paid,
+			                  SUM(total) FILTER (WHERE payment_status = 'PAID') AS paid_total
+			           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
+			LEFT JOIN (SELECT session_id, SUM(units) AS units FROM shuttlecock_transactions WHERE type = 'USAGE' GROUP BY session_id) sh_u ON sh_u.session_id = s.id
+			WHERE s.period_id = $1 AND s.type = 'PERIOD' AND s.date < CURRENT_DATE
+			ORDER BY s.date`, *fundPeriodID)
+		if err == nil {
+			defer srows.Close()
+			for srows.Next() {
+				var st fundStep
+				if err := srows.Scan(&st.Date, &st.Profit); err == nil {
+					fundRemainder += st.Profit
+					st.Remainder = fundRemainder
+					fundSteps = append(fundSteps, st)
+				}
+			}
+		}
+	}
+
 	return httpx.OK(c, http.StatusOK, map[string]any{
 		"active_period": map[string]any{
 			"id": activePeriodID, "name": activePeriodName, "members": members,
@@ -279,6 +335,12 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		"month_general": map[string]any{
 			"revenue": monthScope["general"]["revenue"], "expense": monthScope["general"]["expense"],
 			"cash_flow": monthScope["general"]["revenue"] - monthScope["general"]["expense"],
+		},
+		"court_fund": map[string]any{
+			"period_id": fundPeriodID, "period_name": fundPeriodName,
+			"planned": fundPlanned, "collected": fundCollected,
+			"gap": fundCollected - fundPlanned,
+			"remainder": fundRemainder, "sessions": fundSteps,
 		},
 	})
 }
