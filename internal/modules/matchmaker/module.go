@@ -1933,6 +1933,28 @@ func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	// Late arrivals show up in person: mark them PRESENT on the source
+	// session so attendance (and billing) follows the pool. LISTED and
+	// CONFIRMED flip to PRESENT; ABSENT/CANCELLED rows are left alone,
+	// mirroring the session's own PresentAll behavior.
+	var source *string
+	if err := s.db.QueryRow(c.Context(),
+		`SELECT source_session_id::text FROM match_events WHERE id = $1`, id).Scan(&source); err == nil && source != nil && *source != "" {
+		if _, err := s.db.Exec(c.Context(), `
+			INSERT INTO attendances (id, session_id, player_id, status, is_member, listed_at)
+			SELECT gen_random_uuid(), $1, u.id::uuid, 'PRESENT',
+			       EXISTS (SELECT 1 FROM memberships m
+			               JOIN mabar_sessions ms ON ms.period_id = m.period_id
+			               WHERE ms.id = $1 AND m.player_id::text = u.id AND m.status <> 'WITHDRAWN'),
+			       now()
+			FROM unnest($2::text[]) WITH ORDINALITY AS u(id, ordinality)
+			JOIN players p ON p.id::text = u.id AND p.status = 'ACTIVE'
+			ON CONFLICT (session_id, player_id) DO UPDATE SET
+			    status = 'PRESENT', listed_at = now()
+			WHERE attendances.status IN ('LISTED', 'CONFIRMED')`, *source, in.PlayerIDs); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Pool updated, but attendance could not be synced.")
+		}
+	}
 	return httpx.OK(c, http.StatusOK, ev)
 }
 
@@ -1974,6 +1996,131 @@ func (s *Service) DeleteMatch(c *fiber.Ctx) error {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Match not found.")
 	}
 	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
+}
+
+// CreateMatch records one hand-made card (e.g. games already played before
+// the event was created). Teams go through the same 2v2 / pool /
+// mixed-doubles checks as generated ones, and the card lands in the round's
+// last wave. No-repeat is deliberately NOT enforced: reality is recorded
+// as-is, and the card joins the history future AI draws avoid.
+func (s *Service) CreateMatch(c *fiber.Ctx) error {
+	var in struct {
+		EventID         string   `json:"event_id"`
+		Round           int      `json:"round"`
+		Team1           []string `json:"team1"`
+		Team2           []string `json:"team2"`
+		Court           *int     `json:"court"`
+		RefereeID       *string  `json:"referee_id"`
+		Status          *string  `json:"status"`
+		ShuttlecockUsed *int     `json:"shuttlecock_used"`
+	}
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+	}
+	if _, err := uuid.Parse(in.EventID); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
+	}
+	if in.Round < 1 || in.Round > 99 {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
+	}
+	pool, err := s.pool(c.Context(), in.EventID)
+	if err != nil {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
+	}
+	wavesPerRound, maxRounds, courtCap := 3, 0, 0
+	_ = s.db.QueryRow(c.Context(),
+		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds, court_count FROM match_events WHERE id = $1`,
+		in.EventID).Scan(&wavesPerRound, &maxRounds, &courtCap)
+	if wavesPerRound <= 0 {
+		wavesPerRound = 3
+	}
+	if maxRounds > 0 && in.Round > maxRounds {
+		return httpx.WriteAppError(c, httpx.Unprocessable(
+			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
+	}
+	t1, t2, err := s.resolveTeams(pool, in.Team1, in.Team2)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	seenIDs := map[string]bool{}
+	for _, pid := range append(append([]string{}, in.Team1...), in.Team2...) {
+		if seenIDs[pid] {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Satu pemain tidak boleh di dua tim sekaligus."))
+		}
+		seenIDs[pid] = true
+	}
+	court := 0
+	if in.Court != nil {
+		court = *in.Court
+	}
+	maxCourt := 99
+	if courtCap > 0 {
+		maxCourt = courtCap
+	}
+	if court < 0 || court > maxCourt {
+		return httpx.WriteAppError(c, httpx.Unprocessable(
+			"Court must be between 0 and "+strconv.Itoa(maxCourt)+" for this event."))
+	}
+	status := "UPCOMING"
+	if in.Status != nil {
+		status = strings.ToUpper(strings.TrimSpace(*in.Status))
+	}
+	if !validStatuses[status] {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Invalid status. Use UPCOMING, PLAYING, or ENDED."))
+	}
+	cocks := 0
+	if in.ShuttlecockUsed != nil {
+		cocks = *in.ShuttlecockUsed
+	}
+	if cocks < 0 || cocks > 999 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Shuttlecock count must be between 0 and 999."))
+	}
+	var refID *string
+	if in.RefereeID != nil && strings.TrimSpace(*in.RefereeID) != "" {
+		ref := strings.TrimSpace(*in.RefereeID)
+		if _, err := uuid.Parse(ref); err != nil {
+			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid referee ID."))
+		}
+		found := false
+		for _, p := range pool {
+			if p.ID == ref {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Referee must be in this event pool."))
+		}
+		refID = &ref
+	}
+	var existing int
+	_ = s.db.QueryRow(c.Context(),
+		`SELECT COUNT(*) FROM generated_matches WHERE event_id = $1 AND round = $2`,
+		in.EventID, in.Round).Scan(&existing)
+	wave := existing/wavesPerRound + 1
+	var m GenMatch
+	var t1raw, t2raw string
+	err = s.db.QueryRow(c.Context(), `
+		INSERT INTO generated_matches (id, event_id, round, wave, team1, team2, referee_id, status, court, shuttlecock_used, started_at, ended_at)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9,
+		        CASE WHEN $7 IN ('PLAYING', 'ENDED') THEN now() END,
+		        CASE WHEN $7 = 'ENDED' THEN now() END)
+		RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
+		          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
+		in.EventID, in.Round, wave, mustTeamJSON(t1), mustTeamJSON(t2), refID, status, court, cocks,
+	).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1raw, &t2raw, &m.Status, &m.Court,
+		&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
+	}
+	m.Team1 = parseTeam(t1raw)
+	m.Team2 = parseTeam(t2raw)
+	if refID != nil {
+		var refName string
+		_ = s.db.QueryRow(c.Context(), `SELECT name FROM players WHERE id = $1`, *refID).Scan(&refName)
+		m.Referee = &Referee{PlayerID: *refID, Name: refName}
+	}
+	return httpx.OK(c, http.StatusCreated, m)
 }
 
 func strOrEmpty(s *string) string {

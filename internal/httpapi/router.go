@@ -133,6 +133,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	events.Delete("/:id/rounds/:round", deps.MatchMaker.DeleteRound)
 
 	genMatches := authed.Group("/generated-matches")
+	genMatches.Post("/", deps.MatchMaker.CreateMatch)
 	genMatches.Patch("/:id", deps.MatchMaker.UpdateMatch)
 	genMatches.Delete("/:id", deps.MatchMaker.DeleteMatch)
 
