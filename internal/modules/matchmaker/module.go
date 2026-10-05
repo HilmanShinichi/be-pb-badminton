@@ -921,6 +921,10 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 			gb.maxRound = m.Round
 		}
 	}
+	// Load signal for the AI: lowest played count plays first.
+	for i := range gb.aiPlayers {
+		gb.aiPlayers[i].Played = gb.playedCounts[gb.aiPlayers[i].ID]
+	}
 	// Soft cross-week guard: final round(s) of other events in the same
 	// period (via source_session -> mabar_sessions.period_id).
 	gb.softSeen = map[string]bool{}
@@ -934,14 +938,95 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 	return gb, nil
 }
 
+// liveSetFor collects players whose matches are still PLAYING in the latest
+// round: their games haven't finished, so the prepared next round must let
+// them rest afterwards. Only the latest round counts, so a forgotten status
+// on an old round never pollutes future draws.
+func liveSetFor(matches []GenMatch, maxRound int) map[string]bool {
+	live := map[string]bool{}
+	if maxRound <= 0 {
+		return live
+	}
+	for _, m := range matches {
+		if m.Round == maxRound && m.Status == "PLAYING" {
+			for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
+				live[id] = true
+			}
+		}
+	}
+	return live
+}
+
+// restSetFor collects players from the last wave of the previous round:
+// they just played with no break, so the next round must rest them first
+// (bench when slots allow, else schedule them in the last waves).
+func restSetFor(matches []GenMatch, pendings []pending, roundNo int) map[string]bool {
+	rest := map[string]bool{}
+	if roundNo <= 1 {
+		return rest
+	}
+	prev := roundNo - 1
+	maxWave := 0
+	for _, m := range matches {
+		if m.Round == prev && m.Wave > maxWave {
+			maxWave = m.Wave
+		}
+	}
+	for _, p := range pendings {
+		if p.round == prev && p.wave > maxWave {
+			maxWave = p.wave
+		}
+	}
+	if maxWave == 0 {
+		return rest
+	}
+	for _, m := range matches {
+		if m.Round == prev && m.Wave == maxWave {
+			for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
+				rest[id] = true
+			}
+		}
+	}
+	for _, p := range pendings {
+		if p.round == prev && p.wave == maxWave {
+			for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
+				rest[id] = true
+			}
+		}
+	}
+	return rest
+}
+
+// orderMatchesByRest stable-sorts matchups so sides with fewer just-played
+// players run first: tired players land in the last waves, gaining a break.
+func orderMatchesByRest(ms []aiMatchup, rest map[string]bool) []aiMatchup {
+	if len(rest) == 0 || len(ms) < 2 {
+		return ms
+	}
+	count := func(mu aiMatchup) int {
+		n := 0
+		for _, id := range append(append([]string{}, mu.Team1...), mu.Team2...) {
+			if rest[id] {
+				n++
+			}
+		}
+		return n
+	}
+	out := append([]aiMatchup{}, ms...)
+	sort.SliceStable(out, func(i, j int) bool { return count(out[i]) < count(out[j]) })
+	return out
+}
+
 // genValidator carries per-round validation state. seen is shared by
 // reference so accepted matchups join the no-repeat set immediately.
 type genValidator struct {
 	pool             []poolPlayer
+	players          []aiPlayer
 	borrowAllow      map[string]bool
 	requireNewcomers []string
 	seen             map[string]bool
 	softSeen         map[string]bool
+	rest             map[string]bool
 	coverageN        int
 	wavesPerRound    int
 	playedCounts     map[string]int
@@ -998,6 +1083,36 @@ func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, wav
 	}
 	if len(v.requireNewcomers) > 0 && len(used)%4 != 0 {
 		return nil, httpx.Unprocessable("AI made an incomplete top-up group. Try generating again.")
+	}
+	// Leveling (non-topup only): nobody sits out while someone who played
+	// more takes the round. With odd pools someone must go ahead first, but
+	// a lower-played player may never be benched for a higher-played one.
+	if len(v.requireNewcomers) == 0 && len(v.players) > 0 {
+		maxPlaying := -1
+		for _, ap := range v.players {
+			if used[ap.ID] > 0 && v.playedCounts[ap.ID] > maxPlaying {
+				maxPlaying = v.playedCounts[ap.ID]
+			}
+		}
+		if maxPlaying >= 0 {
+			for _, ap := range v.players {
+				if used[ap.ID] == 0 && v.playedCounts[ap.ID] < maxPlaying {
+					return nil, httpx.Unprocessable(ap.Name + " played " + strconv.Itoa(v.playedCounts[ap.ID]) + "x but sat out while others with more games played. Level play counts first (lowest plays).")
+				}
+			}
+			// Rest priority (equal counts): a rested player never sits out
+			// for someone coming straight off the previous round's last wave.
+			for _, ap := range v.players {
+				if used[ap.ID] != 0 || v.playedCounts[ap.ID] != maxPlaying || v.rest[ap.ID] {
+					continue
+				}
+				for _, bp := range v.players {
+					if used[bp.ID] > 0 && v.playedCounts[bp.ID] == maxPlaying && v.rest[bp.ID] {
+						return nil, httpx.Unprocessable(bp.Name + " just played the last wave with no break — rest them before " + ap.Name + ".")
+					}
+				}
+			}
+		}
 	}
 	for _, p := range out {
 		v.seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
@@ -1118,6 +1233,10 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// requireNewcomers, coverageN) are synced at the top of each iteration
 	// because top-up can grow the pool mid-loop.
 	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts}
+	// Live players (still PLAYING in the latest round) rest in every round
+	// prepared while their games run. Static per request: statuses here
+	// never change mid-loop (new rounds are stored UPCOMING).
+	liveSet := liveSetFor(matches, maxRound)
 
 	for i := 0; i < in.Rounds; i++ {
 		// Explicit round number fills one empty round (e.g. after deleting
@@ -1264,8 +1383,29 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			}
 			roundNo = in.Round
 		}
+		// Rest set: players from the previous round's last wave get a break
+		// (bench first, else last waves), plus anyone still PLAYING live.
+		// Skipped for top-up: borrowed players are mid-round by design.
+		rest := map[string]bool{}
+		if !in.TopUp {
+			rest = restSetFor(matches, pendings, roundNo)
+			for id := range liveSet {
+				rest[id] = true
+			}
+		}
+		restNames := []string{}
+		for _, p := range pool {
+			if rest[p.ID] {
+				restNames = append(restNames, p.Name)
+			}
+		}
+		// Refresh load counts (earlier rounds generated just now count too).
+		for i := range aiPlayers {
+			aiPlayers[i].Played = playedCounts[aiPlayers[i].ID]
+		}
 		// Sync per-round validation state (top-up may have rebuilt the pool).
 		v.pool, v.borrowAllow, v.requireNewcomers, v.coverageN = pool, borrowAllow, requireNewcomers, coverageN
+		v.players, v.rest = aiPlayers, rest
 		var accepted []pending
 		var genErr error
 		// Two AI tries only: each one spends provider tokens, and when the
@@ -1282,7 +1422,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			var ep aiEndpoint
 			var skips []string
 			strictSoft := attempt == 0 && len(softSeen) > 0
-			aiRounds, ep, skips, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, softHistory, 1, attempt)
+			aiRounds, ep, skips, genErr = generateMatchups(c.Context(), s.cfg, aiPlayers, history, softHistory, 1, attempt, restNames)
 			// Skipped primaries are worth reporting even when a fallback AI
 			// succeeds, so the UI can show why AI 1 was not used.
 			if len(skips) > 0 && aiErrMsg == "" {
@@ -1302,7 +1442,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				genErr = httpx.Unprocessable("AI returned no usable matchups. Try generating again.")
 				continue
 			}
-			accepted, genErr = s.validateGenRound(v, aiRounds[0].Matches, roundNo, waveBase, strictSoft)
+			// Tired players run last so they get a break before their game.
+			accepted, genErr = s.validateGenRound(v, orderMatchesByRest(aiRounds[0].Matches, rest), roundNo, waveBase, strictSoft)
 			if genErr == nil {
 				if !usedAISet {
 					usedAI, usedAISet = ep, true
@@ -1429,8 +1570,23 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
 	}
-	prompt := aiSystemPrompt + "\n\n" + buildUserPrompt(gb.aiPlayers, gb.history, gb.softHistory, 1, 0)
+	rest := restSetFor(gb.matches, nil, roundNo)
+	for id := range liveSetFor(gb.matches, gb.maxRound) {
+		rest[id] = true
+	}
+	prompt := aiSystemPrompt + "\n\n" + buildUserPrompt(gb.aiPlayers, gb.history, gb.softHistory, 1, 0, restNamesFor(gb.pool, rest))
 	return httpx.OK(c, http.StatusOK, map[string]any{"round": roundNo, "prompt": prompt})
+}
+
+// restNamesFor maps a rest set of player IDs to pool names for the prompt.
+func restNamesFor(pool []poolPlayer, rest map[string]bool) []string {
+	names := []string{}
+	for _, p := range pool {
+		if rest[p.ID] {
+			names = append(names, p.Name)
+		}
+	}
+	return names
 }
 
 // ManualGenerate validates a pasted web-AI answer through the same pipeline
@@ -1505,11 +1661,16 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		out.Rounds[0].Matches[mi].Team1 = t1
 		out.Rounds[0].Matches[mi].Team2 = t2
 	}
-	// 3) Full rules: 2v2, mixed doubles, one appearance, no repeat, coverage.
-	v := &genValidator{pool: gb.pool, borrowAllow: map[string]bool{}, requireNewcomers: []string{},
-		seen: gb.seen, softSeen: gb.softSeen, coverageN: len(gb.pool),
+	// 3) Full rules: 2v2, mixed doubles, one appearance, no repeat, coverage,
+	// leveling, and rest for last-wave + live players.
+	rest := restSetFor(gb.matches, nil, roundNo)
+	for id := range liveSetFor(gb.matches, gb.maxRound) {
+		rest[id] = true
+	}
+	v := &genValidator{pool: gb.pool, players: gb.aiPlayers, borrowAllow: map[string]bool{}, requireNewcomers: []string{},
+		seen: gb.seen, softSeen: gb.softSeen, rest: rest, coverageN: len(gb.pool),
 		wavesPerRound: gb.wavesPerRound, playedCounts: gb.playedCounts}
-	accepted, verr := s.validateGenRound(v, out.Rounds[0].Matches, roundNo, 0, len(gb.softSeen) > 0)
+	accepted, verr := s.validateGenRound(v, orderMatchesByRest(out.Rounds[0].Matches, rest), roundNo, 0, len(gb.softSeen) > 0)
 	if verr != nil {
 		return httpx.WriteAppError(c, verr)
 	}

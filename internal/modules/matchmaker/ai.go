@@ -31,6 +31,9 @@ type aiPlayer struct {
 	Gender  *string `json:"gender"`
 	Rank    int     `json:"rank"`
 	Arrival int     `json:"arrival"`
+	// Played counts matches already played or scheduled (ENDED, PLAYING,
+	// UPCOMING): the load-balancing signal, lowest plays first.
+	Played int `json:"played"`
 }
 
 type aiHistoryMatch struct {
@@ -93,6 +96,10 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 	`prioritize early arrivals (low arrival number) for earlier rounds and fuller schedules, ` +
 	`but keep it fair: across all generated rounds no player may sit out more than one round extra ` +
 	`compared to anyone else; ` +
+	`LOAD FIRST: each player has a played count (matches already played or scheduled). ` +
+	`Fill every round from the LOWEST played count upward: players who played less must play more. ` +
+	`When N mod 4 players must sit out, sit out the HIGHEST played count first ` +
+	`(ties: latest arrival sits out); early arrival only breaks remaining ties; ` +
 	`NEVER repeat an exact matchup from history (same four players with the same sides). ` +
 	`Players are numbered by "i": always reference players by their index number as a string ` +
 	`(e.g. team1 ["0","3"]), never by name or id. ` +
@@ -238,9 +245,9 @@ func isProviderError(err error) bool {
 
 // buildUserPrompt renders the exact user message sent to the model: player
 // lines keyed by index (no UUIDs on the wire), history as one line per past
-// matchup, plus the soft cross-week guard on attempt 0. generateMatchups and
-// the manual "AI web" prompt preview share it so both show identical text.
-func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int) string {
+// matchup, plus the soft cross-week guard on attempt 0. rest names players
+// coming straight off the previous round's last wave: bench them first.
+func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int, rest []string) string {
 	var pb strings.Builder
 	for _, p := range players {
 		grade := "-"
@@ -251,7 +258,7 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 		if p.Gender != nil && *p.Gender != "" {
 			gender = *p.Gender
 		}
-		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival)
+		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d|played%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival, p.Played)
 	}
 	var hb strings.Builder
 	for _, h := range history {
@@ -260,7 +267,7 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 				h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
 		}
 	}
-	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
+	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival|played, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
 		rounds, pb.String(), hb.String())
 	if attempt == 0 && len(softHistory) > 0 {
 		var sb strings.Builder
@@ -276,6 +283,10 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 	}
 	if attempt > 0 {
 		user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
+	}
+	if len(rest) > 0 {
+		user += "\nRest these players first (they played the last wave of the previous round, or are still playing live right now): " + strings.Join(rest, ", ") +
+			". Bench them before anyone else with equal play counts, and never schedule them in the first wave."
 	}
 	return user
 }
@@ -314,7 +325,7 @@ func resolveIdxRefs(players []aiPlayer) func([]string) ([]string, error) {
 // softHistory holds last-round matchups from other events in the same period:
 // the model should avoid repeating them if possible, but may repeat when
 // forced (attempt > 0 drops the soft section entirely).
-func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int) ([]aiRound, aiEndpoint, []string, error) {
+func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int, rest []string) ([]aiRound, aiEndpoint, []string, error) {
 	endpoints := aiEndpoints(cfg)
 	if len(endpoints) == 0 {
 		return nil, aiEndpoint{}, nil, httpx.Unprocessable("AI generation is not configured. Set AI_API_KEY (plus AI_PROVIDER, AI_MODEL, AI_BASE_URL) to enable it.")
@@ -327,7 +338,7 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 
 	// Compact prompt: players as short lines keyed by index (no UUIDs on the
 	// wire), history as one line per past matchup. Keeps token usage low.
-	user := buildUserPrompt(players, history, softHistory, rounds, attempt)
+	user := buildUserPrompt(players, history, softHistory, rounds, attempt, rest)
 
 	// Resolve index references back to real player ids.
 	resolve := resolveIdxRefs(players)
