@@ -133,7 +133,8 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		       COALESCE(sh_u.units, 0),
 		       ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
 		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float)),
-		       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0) - s.court_cost
+		       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0)
+		           - CASE WHEN s.type = 'PERIOD' THEN 0 ELSE s.court_cost END
 		           - ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
 		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float)),
 		       '',
@@ -159,7 +160,13 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		if err := rows.Scan(&row.ID, &row.Type, &row.Date, &row.PeriodName, &row.VenueName,
 			&row.CourtCost, &row.Revenue, &row.ShuttleUsed, &row.ShuttleCost, &row.Profit, &row.Status,
 			&row.BillsTotal, &row.BillsPaid); err == nil {
-			row.Status = finance.FinancialStatus(row.Revenue, row.CourtCost+row.ShuttleCost)
+			// PERIOD courts are pre-funded by commitment fees: only
+			// shuttlecocks count at session level. DAILY splits courts.
+			cost := row.ShuttleCost
+			if row.Type != "PERIOD" {
+				cost += row.CourtCost
+			}
+			row.Status = finance.FinancialStatus(row.Revenue, cost)
 			row.PaymentStatus = paymentState(row.Type, row.BillsTotal, row.BillsPaid)
 			recent = append(recent, row)
 		}
