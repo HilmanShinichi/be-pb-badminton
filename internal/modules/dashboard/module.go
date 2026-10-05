@@ -27,6 +27,7 @@ type sessionRow struct {
 	Revenue       int64   `json:"revenue"`
 	ShuttleUsed   int64   `json:"shuttlecock_used"`
 	ShuttleCost   int64   `json:"shuttlecock_cost"`
+	OtherExpense  int64   `json:"other_expense"`
 	Profit            int64   `json:"profit"`
 	OperationalProfit int64   `json:"operational_profit"`
 	Status            string  `json:"status"`
@@ -48,7 +49,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 
 	upcoming := []sessionRow{}
 	rows, err := s.db.Query(c.Context(), `
-		SELECT s.id::text, s.type, s.date::text, p.name, v.name, s.court_cost, 0, 0, 0, 0, ''
+		SELECT s.id::text, s.type, s.date::text, p.name, v.name, s.court_cost, 0, 0, 0, 0, 0, ''
 		FROM mabar_sessions s
 		LEFT JOIN membership_periods p ON p.id = s.period_id
 		LEFT JOIN venues v ON v.id = s.venue_id
@@ -63,7 +64,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		for rows.Next() {
 			var row sessionRow
 			if err := rows.Scan(&row.ID, &row.Type, &row.Date, &row.PeriodName, &row.VenueName,
-				&row.CourtCost, &row.Revenue, &row.ShuttleUsed, &row.ShuttleCost, &row.Profit, &row.Status); err == nil {
+				&row.CourtCost, &row.Revenue, &row.ShuttleUsed, &row.ShuttleCost, &row.OtherExpense, &row.Profit, &row.Status); err == nil {
 				upcoming = append(upcoming, row)
 			}
 		}
@@ -134,10 +135,12 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		       COALESCE(sh_u.units, 0),
 		       ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
 		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float)),
+		       COALESCE(ex.total, 0),
 		       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0)
 		           - CASE WHEN s.type = 'PERIOD' THEN 0 ELSE s.court_cost END
 		           - ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
-		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float)),
+		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float))
+		           - COALESCE(ex.total, 0),
 		       '',
 		       COALESCE(bl.total, 0), COALESCE(bl.paid, 0)
 		FROM mabar_sessions s
@@ -149,6 +152,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		LEFT JOIN (SELECT session_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE payment_status = 'PAID') AS paid,
 		                  SUM(total) FILTER (WHERE payment_status = 'PAID') AS paid_total
 		           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
+		LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM expenses WHERE category <> 'SHUTTLECOCK_PURCHASE' GROUP BY session_id) ex ON ex.session_id = s.id
 		WHERE (s.date < CURRENT_DATE
 		   OR (s.date = CURRENT_DATE AND s.type = 'DAILY_EVENT'
 		       AND COALESCE(bl.total, 0) > 0 AND COALESCE(bl.paid, 0) >= bl.total))`+recentFilter+`
@@ -159,11 +163,11 @@ func (s *Service) Get(c *fiber.Ctx) error {
 	for rows.Next() {
 		var row sessionRow
 		if err := rows.Scan(&row.ID, &row.Type, &row.Date, &row.PeriodName, &row.VenueName,
-			&row.CourtCost, &row.Revenue, &row.ShuttleUsed, &row.ShuttleCost, &row.Profit, &row.Status,
+			&row.CourtCost, &row.Revenue, &row.ShuttleUsed, &row.ShuttleCost, &row.OtherExpense, &row.Profit, &row.Status,
 			&row.BillsTotal, &row.BillsPaid); err == nil {
 			// PERIOD courts are pre-funded by commitment fees: only
-			// shuttlecocks count at session level. DAILY splits courts.
-			cost := row.ShuttleCost
+			// shuttlecocks and other session expenses count at session level. DAILY splits courts.
+			cost := row.ShuttleCost + row.OtherExpense
 			if row.Type != "PERIOD" {
 				cost += row.CourtCost
 			}
@@ -289,6 +293,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 			       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0)
 			           - ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
 			           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float))
+			           - COALESCE(ex.total, 0)
 			FROM mabar_sessions s
 			LEFT JOIN avg_unit a ON TRUE
 			LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM revenues GROUP BY session_id) rv ON rv.session_id = s.id
@@ -296,6 +301,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 			                  SUM(total) FILTER (WHERE payment_status = 'PAID') AS paid_total
 			           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
 			LEFT JOIN (SELECT session_id, SUM(units) AS units FROM shuttlecock_transactions WHERE type = 'USAGE' GROUP BY session_id) sh_u ON sh_u.session_id = s.id
+			LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM expenses WHERE category <> 'SHUTTLECOCK_PURCHASE' GROUP BY session_id) ex ON ex.session_id = s.id
 			WHERE s.period_id = $1 AND s.type = 'PERIOD' AND s.date < CURRENT_DATE
 			ORDER BY s.date`, *fundPeriodID)
 		if err == nil {
