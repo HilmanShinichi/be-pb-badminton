@@ -87,6 +87,9 @@ func Load() Config {
 }
 
 func (c Config) DatabaseConnectionString() string {
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		return dbURL
+	}
 	databaseURL := url.URL{
 		Scheme: "postgres",
 		Host:   net.JoinHostPort(c.DBHost, c.DBPort),
