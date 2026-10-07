@@ -85,10 +85,18 @@ func (s *Service) Attendance(c *fiber.Ctx) error {
 		       COUNT(*) FILTER (WHERE a.status <> 'NOT_LISTED'),
 		       COUNT(*) FILTER (WHERE a.status = 'PRESENT'),
 		       COUNT(*) FILTER (WHERE a.status = 'CANCELLED'),
-		       COUNT(*) FILTER (WHERE a.status = 'NO_SHOW')
+		       COUNT(*) FILTER (WHERE a.status = 'NO_SHOW'),
+		       COALESCE(COUNT(*) FILTER (WHERE ra.arrival_order = 1), 0),
+		       COALESCE(COUNT(*) FILTER (WHERE ra.arrival_order <= 3), 0)
 		FROM attendances a
 		JOIN players pl ON pl.id = a.player_id
 		JOIN mabar_sessions ms ON ms.id = a.session_id
+		LEFT JOIN (
+			SELECT a2.id,
+			       ROW_NUMBER() OVER (PARTITION BY a2.session_id ORDER BY a2.listed_at ASC, a2.id ASC) as arrival_order
+			FROM attendances a2
+			WHERE a2.status = 'PRESENT'
+		) ra ON ra.id = a.id
 		WHERE %s
 		GROUP BY pl.name
 		HAVING COUNT(*) FILTER (WHERE a.status <> 'NOT_LISTED') > 0
@@ -101,26 +109,36 @@ func (s *Service) Attendance(c *fiber.Ctx) error {
 	defer rows.Close()
 
 	type row struct {
-		Name      string `json:"player"`
-		Listed    int    `json:"listed"`
-		Present   int    `json:"present"`
-		Cancelled int    `json:"cancelled"`
-		NoShow    int    `json:"no_show"`
-		RateBP    int64  `json:"no_show_rate_bp"`
+		Name        string `json:"player"`
+		Listed      int    `json:"listed"`
+		Present     int    `json:"present"`
+		Cancelled   int    `json:"cancelled"`
+		NoShow      int    `json:"no_show"`
+		RateBP      int64  `json:"no_show_rate_bp"`
+		Fastest     int    `json:"fastest"`
+		Top3Arrival int    `json:"top3_arrival"`
 	}
 	list := []row{}
 	csvRows := [][]string{}
 	for rows.Next() {
 		var t row
-		if err := rows.Scan(&t.Name, &t.Listed, &t.Present, &t.Cancelled, &t.NoShow); err == nil {
+		if err := rows.Scan(&t.Name, &t.Listed, &t.Present, &t.Cancelled, &t.NoShow, &t.Fastest, &t.Top3Arrival); err == nil {
 			t.RateBP = finance.NoShowRate(int64(t.NoShow), int64(t.Listed))
 			list = append(list, t)
-			csvRows = append(csvRows, []string{t.Name, it(t.Listed), it(t.Present), it(t.Cancelled), it(t.NoShow), fmt.Sprintf("%.1f%%", float64(t.RateBP)/100)})
+			csvRows = append(csvRows, []string{
+				t.Name,
+				it(t.Listed),
+				it(t.Present),
+				it(t.Fastest),
+				it(t.Cancelled),
+				it(t.NoShow),
+				fmt.Sprintf("%.1f%%", float64(t.RateBP)/100),
+			})
 		}
 	}
 	if wantCSV(c) {
 		return sendCSV(c, "attendance-report.csv",
-			[]string{"Player", "Listed", "Present", "Cancelled", "No-show", "No-show rate"}, csvRows)
+			[]string{"Player", "Listed", "Present", "Absen Tercepat (#1)", "Cancelled", "No-show", "No-show rate"}, csvRows)
 	}
 	return httpx.OK(c, http.StatusOK, list)
 }

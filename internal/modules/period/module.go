@@ -1014,6 +1014,7 @@ type MatrixMemberRow struct {
 	CommitmentAmountPaid int64             `json:"commitment_amount_paid"`
 	Attendances          map[string]string `json:"attendances"`
 	PresentCount         int               `json:"present_count"`
+	FastestCount         int               `json:"fastest_count"`
 }
 
 type MatrixNonMemberRow struct {
@@ -1112,20 +1113,31 @@ func (s *Service) AttendanceMatrix(c *fiber.Ctx) error {
 		}
 	}
 
-	// 4. Fetch attendance records for sessions in this period
+	// 4. Fetch attendance records for sessions in this period with arrival rank
 	arows, err := s.db.Query(c.Context(), `
-		SELECT a.session_id::text, a.player_id::text, a.status
+		SELECT a.session_id::text, a.player_id::text, a.status,
+		       COALESCE(ra.arrival_order, 0)
 		FROM attendances a
 		JOIN mabar_sessions ms ON ms.id = a.session_id
+		LEFT JOIN (
+			SELECT a2.id,
+			       ROW_NUMBER() OVER (PARTITION BY a2.session_id ORDER BY a2.listed_at ASC, a2.id ASC) as arrival_order
+			FROM attendances a2
+			WHERE a2.status = 'PRESENT'
+		) ra ON ra.id = a.id
 		WHERE ms.period_id = $1`, id)
 	if err == nil {
 		for arows.Next() {
 			var sid, pid, status string
-			if err := arows.Scan(&sid, &pid, &status); err == nil {
+			var arrivalOrder int
+			if err := arows.Scan(&sid, &pid, &status, &arrivalOrder); err == nil {
 				if midx, ok := memberIndexMap[pid]; ok {
 					rows[midx].Attendances[sid] = status
 					if status == "PRESENT" {
 						rows[midx].PresentCount++
+						if arrivalOrder == 1 {
+							rows[midx].FastestCount++
+						}
 						if sidx, ok := sessionMap[sid]; ok {
 							sessions[sidx].PresentCount++
 						}
