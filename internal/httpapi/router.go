@@ -68,16 +68,26 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	authed.Get("/auth/me", deps.Auth.Me)
 	authed.Patch("/auth/password", deps.Auth.ChangePassword)
 	authed.Post("/auth/logout", deps.Auth.Logout)
-	authed.Get("/dashboard", deps.Dashboard.Get)
 
-	players := authed.Group("/players")
-	players.Get("/", deps.Player.List)
-	players.Post("/", deps.Player.Create)
-	players.Get("/:id", deps.Player.Get)
-	players.Patch("/:id", deps.Player.Update)
-	players.Delete("/:id", deps.Player.Delete)
+	// User management is superadmin-only.
+	usersAdmin := authed.Group("/users", httpx.RequireSuperadmin())
+	usersAdmin.Get("/", deps.Auth.ListUsers)
+	usersAdmin.Post("/", deps.Auth.CreateUser)
+	usersAdmin.Patch("/:id", deps.Auth.UpdateUser)
+	usersAdmin.Delete("/:id", deps.Auth.DeleteUser)
 
-	periods := authed.Group("/periods")
+	authed.Get("/dashboard", httpx.RequirePerm(httpx.PermDashboard), deps.Dashboard.Get)
+
+	// Player directory reads double as match-maker roster tooling.
+	playersRead := authed.Group("/players", httpx.RequireAnyPerm(httpx.PermPlayers, httpx.PermMatchmaker))
+	playersRead.Get("/", deps.Player.List)
+	playersRead.Get("/:id", deps.Player.Get)
+	playersWrite := authed.Group("/players", httpx.RequirePerm(httpx.PermPlayers))
+	playersWrite.Post("/", deps.Player.Create)
+	playersWrite.Patch("/:id", deps.Player.Update)
+	playersWrite.Delete("/:id", deps.Player.Delete)
+
+	periods := authed.Group("/periods", httpx.RequirePerm(httpx.PermPeriods))
 	periods.Get("/", deps.Period.List)
 	periods.Post("/", deps.Period.Create)
 	periods.Get("/:id", deps.Period.Get)
@@ -93,13 +103,16 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	periods.Get("/:id/shuttlecock-matrix", deps.Period.ShuttlecockMatrix)
 	periods.Get("/:id/attendance-matrix", deps.Period.AttendanceMatrix)
 
-	mabar := authed.Group("/mabar")
-	mabar.Get("/", deps.Mabar.List)
-	mabar.Post("/", deps.Mabar.Create)
+	// Session list + attendance reads double as match-maker pool tooling.
+	mabarRead := authed.Group("/mabar", httpx.RequireAnyPerm(httpx.PermMabar, httpx.PermMatchmaker))
+	mabarRead.Get("/", deps.Mabar.List)
+	mabarRead.Get("/:id/attendance", deps.Mabar.ListAttendance)
+
+	mabar := authed.Group("/mabar", httpx.RequirePerm(httpx.PermMabar))
 	mabar.Get("/:id", deps.Mabar.Get)
+	mabar.Post("/", deps.Mabar.Create)
 	mabar.Patch("/:id", deps.Mabar.Update)
 	mabar.Delete("/:id", deps.Mabar.Delete)
-	mabar.Get("/:id/attendance", deps.Mabar.ListAttendance)
 	mabar.Post("/:id/attendance", deps.Mabar.SetAttendance)
 	mabar.Delete("/:id/attendance/:playerId", deps.Mabar.RemoveAttendance)
 	mabar.Get("/:id/attendance/stats", deps.Mabar.AttendanceStats)
@@ -116,13 +129,13 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	mabar.Post("/:id/expenses", deps.Mabar.AddExpense)
 	mabar.Delete("/:id/expenses/:expenseId", deps.Mabar.DeleteExpense)
 
-	matches := authed.Group("/matches")
+	matches := authed.Group("/matches", httpx.RequirePerm(httpx.PermMabar))
 	matches.Patch("/:id", deps.Mabar.UpdateMatch)
 	matches.Delete("/:id", deps.Mabar.DeleteMatch)
 	matches.Post("/:id/players", deps.Mabar.AddMatchPlayer)
 	matches.Delete("/:id/players/:playerId", deps.Mabar.RemoveMatchPlayer)
 
-	events := authed.Group("/match-events")
+	events := authed.Group("/match-events", httpx.RequirePerm(httpx.PermMatchmaker))
 	events.Get("/", deps.MatchMaker.ListEvents)
 	events.Post("/", deps.MatchMaker.CreateEvent)
 	events.Get("/:id", deps.MatchMaker.GetEvent)
@@ -135,12 +148,12 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	events.Post("/:id/players", deps.MatchMaker.AddEventPlayers)
 	events.Delete("/:id/rounds/:round", deps.MatchMaker.DeleteRound)
 
-	genMatches := authed.Group("/generated-matches")
+	genMatches := authed.Group("/generated-matches", httpx.RequirePerm(httpx.PermMatchmaker))
 	genMatches.Post("/", deps.MatchMaker.CreateMatch)
 	genMatches.Patch("/:id", deps.MatchMaker.UpdateMatch)
 	genMatches.Delete("/:id", deps.MatchMaker.DeleteMatch)
 
-	inv := authed.Group("/inventory/shuttlecock")
+	inv := authed.Group("/inventory/shuttlecock", httpx.RequirePerm(httpx.PermInventory))
 	inv.Get("/", deps.Inventory.ListProducts)
 	inv.Post("/", deps.Inventory.CreateProduct)
 	inv.Patch("/:id", deps.Inventory.UpdateProduct)
@@ -149,19 +162,19 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	inv.Post("/purchase", deps.Inventory.Purchase)
 	inv.Post("/adjustment", deps.Inventory.Adjust)
 
-	finance := authed.Group("/finance")
+	finance := authed.Group("/finance", httpx.RequirePerm(httpx.PermFinance))
 	finance.Get("/summary", deps.Finance.Summary)
 	finance.Get("/transactions", deps.Finance.Transactions)
 	finance.Post("/revenue", deps.Finance.CreateRevenue)
 	finance.Post("/expense", deps.Finance.CreateExpense)
 
-	venues := authed.Group("/venues")
+	venues := authed.Group("/venues", httpx.RequirePerm(httpx.PermMabar))
 	venues.Get("/", deps.Venue.ListVenues)
 	venues.Post("/", deps.Venue.CreateVenue)
-	authed.Get("/courts", deps.Venue.ListCourts)
-	authed.Post("/courts", deps.Venue.CreateCourt)
+	authed.Get("/courts", httpx.RequirePerm(httpx.PermMabar), deps.Venue.ListCourts)
+	authed.Post("/courts", httpx.RequirePerm(httpx.PermMabar), deps.Venue.CreateCourt)
 
-	reports := authed.Group("/reports")
+	reports := authed.Group("/reports", httpx.RequirePerm(httpx.PermReports))
 	reports.Get("/financial", deps.Report.Financial)
 	reports.Get("/attendance", deps.Report.Attendance)
 	reports.Get("/no-show", deps.Report.NoShow)
@@ -171,8 +184,8 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	reports.Get("/player-usage", deps.Report.PlayerUsage)
 	reports.Get("/inactive-members", deps.Report.InactiveMembers)
 
-	authed.Post("/simulator/period", simulator.RunPeriod)
-	authed.Post("/simulator/daily-event", simulator.RunDailyEvent)
+	authed.Post("/simulator/period", httpx.RequirePerm(httpx.PermSimulator), simulator.RunPeriod)
+	authed.Post("/simulator/daily-event", httpx.RequirePerm(httpx.PermSimulator), simulator.RunDailyEvent)
 
 	return app
 }

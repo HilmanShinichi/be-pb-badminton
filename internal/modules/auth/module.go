@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
@@ -140,29 +141,38 @@ func (s *Service) Login(c *fiber.Ctx) error {
 	}
 
 	var id, hash string
+	var isSuper bool
+	var perms []string
 	err := s.db.QueryRow(c.Context(),
-		`SELECT id::text, password_hash FROM users WHERE username = $1`, req.Username,
-	).Scan(&id, &hash)
+		`SELECT id::text, password_hash, COALESCE(is_superadmin, FALSE), COALESCE(permissions, '{}') FROM users WHERE username = $1`, req.Username,
+	).Scan(&id, &hash, &isSuper, &perms)
 	if err != nil || bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
 		s.noteLoginFailure(c.IP(), user)
 		return httpx.Err(c, http.StatusUnauthorized, "INVALID_CREDENTIALS", "Incorrect username or password.")
 	}
 	s.resetLoginFailures(user)
 
+	role := "ADMIN"
+	if isSuper {
+		role = "SUPERADMIN"
+	}
 	claims := &httpx.Claims{
-		UserID: id, Username: req.Username, Role: "ADMIN",
+		UserID: id, Username: req.Username, Role: role,
+		Permissions: httpx.NormalizePerms(perms), IsSuperadmin: isSuper,
 		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour))},
 	}
 	token, err := httpx.SignToken(s.jwtSecret, claims)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create session.")
 	}
-	return httpx.OK(c, http.StatusOK, map[string]any{"token": token, "username": req.Username, "role": "ADMIN"})
+	return httpx.OK(c, http.StatusOK, map[string]any{"token": token, "username": req.Username, "role": role,
+		"permissions": claims.Permissions, "is_superadmin": isSuper})
 }
 
 func (s *Service) Me(c *fiber.Ctx) error {
 	cl := httpx.ClaimsFrom(c)
-	return httpx.OK(c, http.StatusOK, map[string]any{"username": cl.Username, "role": cl.Role})
+	return httpx.OK(c, http.StatusOK, map[string]any{"username": cl.Username, "role": cl.Role,
+		"permissions": cl.Permissions, "is_superadmin": cl.IsSuperadmin})
 }
 
 func (s *Service) Logout(c *fiber.Ctx) error {
@@ -198,10 +208,185 @@ func (s *Service) EnsureAdminUser(ctx context.Context) error {
 	return err
 }
 
+type userRow struct {
+	ID           string   `json:"id"`
+	Username     string   `json:"username"`
+	IsSuperadmin bool     `json:"is_superadmin"`
+	Permissions  []string `json:"permissions"`
+	CreatedAt    string   `json:"created_at"`
+}
+
+func scanUserRow(row interface {
+	Scan(...any) error
+}) (userRow, error) {
+	var u userRow
+	var perms []string
+	if err := row.Scan(&u.ID, &u.Username, &u.IsSuperadmin, &perms, &u.CreatedAt); err != nil {
+		return u, err
+	}
+	u.Permissions = httpx.NormalizePerms(perms)
+	if u.Permissions == nil {
+		u.Permissions = []string{}
+	}
+	return u, nil
+}
+
+// ListUsers returns every admin account. Superadmins only.
+func (s *Service) ListUsers(c *fiber.Ctx) error {
+	rows, err := s.db.Query(c.Context(),
+		`SELECT id::text, username, COALESCE(is_superadmin, FALSE), COALESCE(permissions, '{}'), created_at::text
+		 FROM users ORDER BY username`)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load users.")
+	}
+	defer rows.Close()
+	users := []userRow{}
+	for rows.Next() {
+		if u, err := scanUserRow(rows); err == nil {
+			users = append(users, u)
+		}
+	}
+	return httpx.OK(c, http.StatusOK, users)
+}
+
+// CreateUser opens a new admin account with an explicit permission
+// allowlist (or all-access via is_superadmin). Superadmins only.
+func (s *Service) CreateUser(c *fiber.Ctx) error {
+	var in struct {
+		Username     string   `json:"username"`
+		Password     string   `json:"password"`
+		Permissions  []string `json:"permissions"`
+		IsSuperadmin bool     `json:"is_superadmin"`
+	}
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+	}
+	username := strings.ToLower(strings.TrimSpace(in.Username))
+	if len(username) < 3 || len(username) > 32 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Username must be 3-32 characters."))
+	}
+	if len(in.Password) < minPasswordLen {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Password must be at least 8 characters."))
+	}
+	perms := httpx.NormalizePerms(in.Permissions)
+	if !in.IsSuperadmin && len(perms) == 0 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pick at least one accessible feature, or grant all access."))
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create user.")
+	}
+	var u userRow
+	err = s.db.QueryRow(c.Context(), `
+		INSERT INTO users (id, username, password_hash, is_superadmin, permissions)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4)
+		RETURNING id::text, username, is_superadmin, permissions, created_at::text`,
+		username, string(hash), in.IsSuperadmin, perms).Scan(&u.ID, &u.Username, &u.IsSuperadmin, &u.Permissions, &u.CreatedAt)
+	if err != nil {
+		return httpx.WriteAppError(c, httpx.Conflict("USERNAME_TAKEN", "That username is already taken."))
+	}
+	u.Permissions = httpx.NormalizePerms(u.Permissions)
+	return httpx.OK(c, http.StatusCreated, u)
+}
+
+// UpdateUser changes permissions, superadmin flag, and/or password.
+// Self-modification of access is forbidden (use change-password for self);
+// the last superadmin can neither be demoted nor deleted.
+func (s *Service) UpdateUser(c *fiber.Ctx) error {
+	cl := httpx.ClaimsFrom(c)
+	id := c.Params("id")
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid user ID."))
+	}
+	var target userRow
+	if err := s.db.QueryRow(c.Context(),
+		`SELECT id::text, username, COALESCE(is_superadmin, FALSE), COALESCE(permissions, '{}'), created_at::text
+		 FROM users WHERE id = $1`, id).Scan(&target.ID, &target.Username, &target.IsSuperadmin, &target.Permissions, &target.CreatedAt); err != nil {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "User not found.")
+	}
+	var in struct {
+		Permissions  *[]string `json:"permissions"`
+		IsSuperadmin *bool     `json:"is_superadmin"`
+		Password     *string   `json:"password"`
+	}
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+	}
+	if target.ID == cl.UserID && (in.Permissions != nil || in.IsSuperadmin != nil) {
+		return httpx.WriteAppError(c, httpx.Unprocessable("You cannot change your own access. Ask another superadmin."))
+	}
+	newSuper := target.IsSuperadmin
+	if in.IsSuperadmin != nil {
+		newSuper = *in.IsSuperadmin
+	}
+	newPerms := httpx.NormalizePerms(target.Permissions)
+	if in.Permissions != nil {
+		newPerms = httpx.NormalizePerms(*in.Permissions)
+	}
+	if !newSuper && len(newPerms) == 0 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pick at least one accessible feature, or grant all access."))
+	}
+	if target.IsSuperadmin && !newSuper {
+		var others int
+		if err := s.db.QueryRow(c.Context(),
+			`SELECT COUNT(*) FROM users WHERE is_superadmin AND id <> $1`, id).Scan(&others); err != nil || others == 0 {
+			return httpx.WriteAppError(c, httpx.Conflict("LAST_SUPERADMIN", "The last superadmin cannot be demoted."))
+		}
+	}
+	setHash := ""
+	if in.Password != nil && *in.Password != "" {
+		if len(*in.Password) < minPasswordLen {
+			return httpx.WriteAppError(c, httpx.Unprocessable("Password must be at least 8 characters."))
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(*in.Password), bcrypt.DefaultCost)
+		if err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update user.")
+		}
+		setHash = string(hash)
+	}
+	if _, err := s.db.Exec(c.Context(), `
+		UPDATE users SET is_superadmin = $2, permissions = $3,
+		    password_hash = CASE WHEN $4 = '' THEN password_hash ELSE $4 END,
+		    updated_at = now()
+		WHERE id = $1`, id, newSuper, newPerms, setHash); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update user.")
+	}
+	target.IsSuperadmin, target.Permissions = newSuper, newPerms
+	return httpx.OK(c, http.StatusOK, target)
+}
+
+// DeleteUser removes an account. Self-deletion and deleting the last
+// superadmin are refused.
+func (s *Service) DeleteUser(c *fiber.Ctx) error {
+	cl := httpx.ClaimsFrom(c)
+	id := c.Params("id")
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid user ID."))
+	}
+	if id == cl.UserID {
+		return httpx.WriteAppError(c, httpx.Unprocessable("You cannot delete your own account."))
+	}
+	var isSuper bool
+	if err := s.db.QueryRow(c.Context(),
+		`SELECT COALESCE(is_superadmin, FALSE) FROM users WHERE id = $1`, id).Scan(&isSuper); err != nil {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "User not found.")
+	}
+	if isSuper {
+		var others int
+		if err := s.db.QueryRow(c.Context(),
+			`SELECT COUNT(*) FROM users WHERE is_superadmin AND id <> $1`, id).Scan(&others); err != nil || others == 0 {
+			return httpx.WriteAppError(c, httpx.Conflict("LAST_SUPERADMIN", "The last superadmin cannot be deleted."))
+		}
+	}
+	if _, err := s.db.Exec(c.Context(), `DELETE FROM users WHERE id = $1`, id); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete user.")
+	}
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true})
+}
+
 // ChangePassword rotates the caller's own password. It exists so the seeded
 // default credential can be retired without database access.
-func (s *Service) ChangePassword(c *fiber.Ctx) error {
-	cl := httpx.ClaimsFrom(c)
+func (s *Service) ChangePassword(c *fiber.Ctx) error {	cl := httpx.ClaimsFrom(c)
 	var in struct {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
