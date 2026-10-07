@@ -74,6 +74,12 @@ func (s *Service) Attendance(c *fiber.Ctx) error {
 	f := parseScopeFilter(c)
 	cond, args := sessionWhere(f, "ms")
 
+	months := c.QueryInt("months", 0)
+	if months > 0 {
+		args = append(args, months)
+		cond += fmt.Sprintf(" AND ms.date >= (CURRENT_DATE - make_interval(months => $%d))::date", len(args))
+	}
+
 	query := fmt.Sprintf(`
 		SELECT pl.name,
 		       COUNT(*) FILTER (WHERE a.status <> 'NOT_LISTED'),
