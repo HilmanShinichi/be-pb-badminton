@@ -3,6 +3,7 @@ package matchmaker
 import (
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -876,6 +877,7 @@ type genBase struct {
 	wavesPerRound int
 	maxRounds     int
 	maxRound      int
+	basePlayed    int
 }
 
 func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) {
@@ -890,7 +892,7 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 	// Matches per wave = courts running simultaneously (event cap, else 3).
 	gb.wavesPerRound = 3
 	_ = s.db.QueryRow(ctx,
-		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds FROM match_events WHERE id = $1`, id).Scan(&gb.wavesPerRound, &gb.maxRounds)
+		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds, COALESCE(base_played, 0) FROM match_events WHERE id = $1`, id).Scan(&gb.wavesPerRound, &gb.maxRounds, &gb.basePlayed)
 	if gb.wavesPerRound <= 0 {
 		gb.wavesPerRound = 3
 	}
@@ -1295,11 +1297,13 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 							merged = append(merged, p.ID)
 						}
 						added := false
+						addedIDs := []string{}
 						for rows.Next() {
 							var pid string
 							if err := rows.Scan(&pid); err == nil && !have[pid] {
 								have[pid] = true
 								merged = append(merged, pid)
+								addedIDs = append(addedIDs, pid)
 								added = true
 							}
 						}
@@ -1311,6 +1315,19 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 								id, string(idsJSON)); err == nil {
 								if np, err := s.pool(c.Context(), id); err == nil {
 									pool = np
+								}
+								// Auto-pulled newcomers start from 0, not base.
+								if gb.basePlayed > 0 && len(addedIDs) > 0 {
+									if _, err := s.db.Exec(c.Context(), `
+										INSERT INTO match_count_adjustments (event_id, player_id, played_delta, refereed_delta)
+										SELECT $1, u.id::uuid, -($3::integer), 0
+										FROM unnest($2::text[]) WITH ORDINALITY AS u(id, ordinality)
+										JOIN players p ON p.id::text = u.id AND p.status = 'ACTIVE'
+										ON CONFLICT (event_id, player_id) DO UPDATE SET
+										    played_delta = match_count_adjustments.played_delta + EXCLUDED.played_delta,
+										    updated_at = now()`, id, addedIDs, gb.basePlayed); err != nil {
+										log.Printf("matchmaker: newcomer base offset failed for event %s: %v", id, err)
+									}
 								}
 							}
 							// Newcomers join the AI subset with pool-order arrival.
@@ -1909,6 +1926,9 @@ func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 	}
 	var ev MatchEvent
 	var poolRaw string
+	var beforeRaw string
+	_ = s.db.QueryRow(c.Context(),
+		`SELECT player_ids::text FROM match_events WHERE id = $1`, id).Scan(&beforeRaw)
 	err := s.db.QueryRow(c.Context(), `
 		UPDATE match_events
 		SET player_ids = (
@@ -1933,6 +1953,37 @@ func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
 	_ = json.Unmarshal([]byte(poolRaw), &ev.PlayerIDs)
+	// Newcomers missed the pre-event games the base stands for, so they
+	// start from 0: book a correction of -base on top of the shared base.
+	// Only genuinely new pool members (not re-added ones), and later base
+	// changes never touch their personal offset.
+	if ev.BasePlayed > 0 {
+		before := map[string]bool{}
+		var beforeIDs []string
+		_ = json.Unmarshal([]byte(beforeRaw), &beforeIDs)
+		for _, pid := range beforeIDs {
+			before[pid] = true
+		}
+		newIDs := []string{}
+		for _, pid := range in.PlayerIDs {
+			if !before[pid] {
+				newIDs = append(newIDs, pid)
+			}
+		}
+		if len(newIDs) > 0 {
+			if _, err := s.db.Exec(c.Context(), `
+				INSERT INTO match_count_adjustments (event_id, player_id, played_delta, refereed_delta)
+				SELECT $1, u.id::uuid, -($3::integer), 0
+				FROM unnest($2::text[]) WITH ORDINALITY AS u(id, ordinality)
+				JOIN players p ON p.id::text = u.id AND p.status = 'ACTIVE'
+				ON CONFLICT (event_id, player_id) DO UPDATE SET
+				    played_delta = match_count_adjustments.played_delta + EXCLUDED.played_delta,
+				    updated_at = now()`, id, newIDs, ev.BasePlayed); err != nil {
+				log.Printf("matchmaker: newcomer base offset failed: %v", err)
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Pool updated, but starting counts could not be synced.")
+			}
+		}
+	}
 	// Late arrivals show up in person: mark them PRESENT on the source
 	// session so attendance (and billing) follows the pool. LISTED and
 	// CONFIRMED flip to PRESENT; ABSENT/CANCELLED rows are left alone,
