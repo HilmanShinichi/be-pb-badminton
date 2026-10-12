@@ -1178,13 +1178,9 @@ func playedSubset(pool []poolPlayer, counts []PlayerCount, cap int) (sub []aiPla
 	return sub, required, nil
 }
 
-// playedCapSubset loads display play counts and builds the filtered AI
-// subset for the "generate by play count" mode. Shared by API generate,
-// prompt preview, and manual paste so all three filter identically.
-func (s *Service) playedCapSubset(ctx context.Context, id string, pool []poolPlayer, matches []GenMatch, cap int) ([]aiPlayer, error) {
-	if cap < 0 {
-		return nil, httpx.Unprocessable("Jumlah main tidak valid.")
-	}
+// loadCounts reads display play counts (base + ended/playing + manual
+// corrections) shared by the play-count filter modes.
+func (s *Service) loadCounts(ctx context.Context, id string, pool []poolPlayer, matches []GenMatch) ([]PlayerCount, error) {
 	var base int
 	var idsRaw string
 	var evIDs []string
@@ -1197,8 +1193,67 @@ func (s *Service) playedCapSubset(ctx context.Context, id string, pool []poolPla
 	if err != nil {
 		return nil, &httpx.AppError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "Could not load play counts."}
 	}
+	return counts, nil
+}
+
+// playedCapSubset loads display play counts and builds the filtered AI
+// subset for the "generate by play count" mode. Shared by API generate,
+// prompt preview, and manual paste so all three filter identically.
+func (s *Service) playedCapSubset(ctx context.Context, id string, pool []poolPlayer, matches []GenMatch, cap int) ([]aiPlayer, error) {
+	if cap < 0 {
+		return nil, httpx.Unprocessable("Jumlah main tidak valid.")
+	}
+	counts, err := s.loadCounts(ctx, id, pool, matches)
+	if err != nil {
+		return nil, err
+	}
 	sub, _, err := playedSubset(pool, counts, cap)
 	return sub, err
+}
+
+// catchupSubset builds the "even out first" subset: every pool member below
+// the target plays, nobody at or above it does. No borrowing — leftovers
+// sit by arrival rotation and catch up next time.
+func catchupSubset(pool []poolPlayer, counts []PlayerCount, target int) ([]aiPlayer, error) {
+	playedOf := map[string]int{}
+	posOf := map[string]int{}
+	for i, p := range pool {
+		posOf[p.ID] = i
+	}
+	for _, c := range counts {
+		playedOf[c.PlayerID] = c.Played
+	}
+	sub := []aiPlayer{}
+	for _, p := range pool {
+		if playedOf[p.ID] < target {
+			sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: posOf[p.ID] + 1, Played: playedOf[p.ID]})
+		}
+	}
+	if len(sub) == 0 {
+		return nil, httpx.Unprocessable("Semua pemain sudah rata di " + strconv.Itoa(target) + ". Naikkan batas match untuk lanjut.")
+	}
+	if len(sub) < 4 {
+		return nil, httpx.Unprocessable("Hanya "+strconv.Itoa(len(sub))+" pemain di bawah target — butuh minimal 4 untuk 2v2.")
+	}
+	return sub, nil
+}
+
+// catchupPlayers builds the even-out subset for all three flows: everyone
+// below target (maxRounds, else the pool max) plays, nobody at/above it.
+func (s *Service) catchupPlayers(ctx context.Context, id string, gb *genBase) ([]aiPlayer, error) {
+	counts, err := s.loadCounts(ctx, id, gb.pool, gb.matches)
+	if err != nil {
+		return nil, err
+	}
+	target := gb.maxRounds
+	if target <= 0 {
+		for _, cc := range counts {
+			if cc.Played > target {
+				target = cc.Played
+			}
+		}
+	}
+	return catchupSubset(gb.pool, counts, target)
 }
 
 // genValidator carries per-round validation state. seen is shared by
@@ -1356,6 +1411,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		Round     int  `json:"round"`
 		TopUp     bool `json:"topup"`
 		PlayedCap *int `json:"played_cap"`
+		CatchUp   bool `json:"catchup"`
 	}
 	_ = httpx.Decode(c, &in)
 	if in.Rounds <= 0 {
@@ -1364,14 +1420,25 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	if in.Rounds > 5 {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Generate at most 5 rounds at a time."))
 	}
-	// Play-count filter mode: one round only, never combined with top-up.
+	// Filter modes are exclusive and single-round: top-up fills an existing
+	// round, played_cap targets one level, catch-up evens out below target.
+	modes := 0
+	if in.TopUp {
+		modes++
+	}
 	if in.PlayedCap != nil {
-		if in.TopUp {
-			return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan atau filter jumlah main."))
-		}
-		if in.Rounds > 1 {
-			return httpx.WriteAppError(c, httpx.Unprocessable("Filter jumlah main hanya satu ronde per generate."))
-		}
+		modes++
+	}
+	if in.CatchUp {
+		modes++
+	}
+	if modes > 1 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan, filter jumlah main, atau perataan."))
+	}
+	if (in.PlayedCap != nil || in.CatchUp) && in.Rounds > 1 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Filter dan perataan hanya satu ronde per generate."))
+	}
+	if in.PlayedCap != nil || in.CatchUp {
 		in.Rounds = 1
 	}
 	if _, err := uuid.Parse(id); err != nil {
@@ -1394,13 +1461,22 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		}
 		aiPlayers = sub
 	}
+	// Catch-up mode: only players below target play, nobody at/above it.
+	if in.CatchUp {
+		sub, err := s.catchupPlayers(c.Context(), id, gb)
+		if err != nil {
+			return httpx.WriteAppError(c, err)
+		}
+		aiPlayers = sub
+	}
 	// The event's match limit caps how many rounds this night may reach; one
 	// round is one match per player, so it also drives the count bars.
-	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds {
+	// Catch-up rounds are extra by design and bypass the plan cap.
+	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds && !in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
 	}
-	if in.Round == 0 && maxRounds > 0 {
+	if in.Round == 0 && maxRounds > 0 && !in.CatchUp {
 		remaining := maxRounds - maxRound
 		if remaining <= 0 {
 			return httpx.WriteAppError(c, httpx.Unprocessable(
@@ -1623,10 +1699,10 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		for i := range aiPlayers {
 			aiPlayers[i].Played = playedCounts[aiPlayers[i].ID]
 		}
-		if in.PlayedCap != nil {
-			// Filtered mode: standard coverage over the subset (all but at
-			// most 3 play); leveling plus load-first ordering protect the
-			// required level, leftovers sit by arrival rotation.
+		if in.PlayedCap != nil || in.CatchUp {
+			// Filtered/catch-up mode: standard coverage over the subset (all
+			// but at most 3 play); leveling plus load-first ordering protect
+			// the required level, leftovers sit by arrival rotation.
 			coverageN = len(aiPlayers)
 		}
 		// Sync per-round validation state (top-up may have rebuilt the pool).
@@ -1774,8 +1850,12 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 	var in struct {
 		Round     int  `json:"round"`
 		PlayedCap *int `json:"played_cap"`
+		CatchUp   bool `json:"catchup"`
 	}
 	_ = httpx.Decode(c, &in)
+	if in.PlayedCap != nil && in.CatchUp {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan, filter jumlah main, atau perataan."))
+	}
 	if _, err := uuid.Parse(id); err != nil {
 		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
 	}
@@ -1798,7 +1878,7 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 			return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
 		}
 		roundNo = in.Round
-	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds {
+	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
 	}
@@ -1809,6 +1889,13 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 	promptPlayers := gb.aiPlayers
 	if in.PlayedCap != nil {
 		sub, err := s.playedCapSubset(c.Context(), id, gb.pool, gb.matches, *in.PlayedCap)
+		if err != nil {
+			return httpx.WriteAppError(c, err)
+		}
+		promptPlayers = sub
+	}
+	if in.CatchUp {
+		sub, err := s.catchupPlayers(c.Context(), id, gb)
 		if err != nil {
 			return httpx.WriteAppError(c, err)
 		}
@@ -1842,6 +1929,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		Round     int    `json:"round"`
 		Raw       string `json:"raw"`
 		PlayedCap *int   `json:"played_cap"`
+		CatchUp   bool   `json:"catchup"`
 	}
 	if err := httpx.Decode(c, &in); err != nil {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Paste the AI answer as text.")
@@ -1872,7 +1960,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 			return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
 		}
 		roundNo = in.Round
-	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds {
+	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
 	}
@@ -1880,8 +1968,18 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	// later step (markdown names, index resolve, validation) uses them.
 	mPlayers := gb.aiPlayers
 	mCoverage := len(gb.pool)
+	if in.PlayedCap != nil && in.CatchUp {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan, filter jumlah main, atau perataan."))
+	}
 	if in.PlayedCap != nil {
 		sub, err := s.playedCapSubset(c.Context(), id, gb.pool, gb.matches, *in.PlayedCap)
+		if err != nil {
+			return httpx.WriteAppError(c, err)
+		}
+		mPlayers, mCoverage = sub, len(sub)
+	}
+	if in.CatchUp {
+		sub, err := s.catchupPlayers(c.Context(), id, gb)
 		if err != nil {
 			return httpx.WriteAppError(c, err)
 		}
