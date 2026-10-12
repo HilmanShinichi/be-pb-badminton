@@ -38,6 +38,8 @@ type sessionRow struct {
 
 // Get is the landing overview: what is happening, what is next, is the club
 // in the black. Kept to a handful of aggregate queries.
+// NOTE: all calendar-day comparisons use Asia/Jakarta (the DB runs on UTC);
+// never use bare CURRENT_DATE here or sessions flip status at 07:00 WIB.
 func (s *Service) Get(c *fiber.Ctx) error {
 	var activePeriodID, activePeriodName *string
 	var members int
@@ -56,7 +58,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		LEFT JOIN (SELECT session_id, COUNT(*) AS total,
 		                  COUNT(*) FILTER (WHERE payment_status = 'PAID') AS paid
 		           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
-		WHERE s.date >= CURRENT_DATE
+		WHERE s.date >= (now() AT TIME ZONE 'Asia/Jakarta')::date
 		  AND NOT (s.type = 'DAILY_EVENT' AND COALESCE(bl.total, 0) > 0
 		           AND COALESCE(bl.paid, 0) >= bl.total)
 		ORDER BY s.date ASC LIMIT 5`)
@@ -116,8 +118,8 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		LEFT JOIN (SELECT session_id, COUNT(*) AS total,
 		                  COUNT(*) FILTER (WHERE payment_status = 'PAID') AS paid
 		           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
-		WHERE (s.date < CURRENT_DATE
-		   OR (s.date = CURRENT_DATE AND s.type = 'DAILY_EVENT'
+		WHERE (s.date < (now() AT TIME ZONE 'Asia/Jakarta')::date
+		   OR (s.date = (now() AT TIME ZONE 'Asia/Jakarta')::date AND s.type = 'DAILY_EVENT'
 		       AND COALESCE(bl.total, 0) > 0 AND COALESCE(bl.paid, 0) >= bl.total))`+recentFilter,
 		recentArgs...).Scan(&recentTotal)
 	recentArgs = append(recentArgs, recentLimit, recentOffset)
@@ -153,8 +155,8 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		                  SUM(total) FILTER (WHERE payment_status = 'PAID') AS paid_total
 		           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
 		LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM expenses WHERE category <> 'SHUTTLECOCK_PURCHASE' GROUP BY session_id) ex ON ex.session_id = s.id
-		WHERE (s.date < CURRENT_DATE
-		   OR (s.date = CURRENT_DATE AND s.type = 'DAILY_EVENT'
+		WHERE (s.date < (now() AT TIME ZONE 'Asia/Jakarta')::date
+		   OR (s.date = (now() AT TIME ZONE 'Asia/Jakarta')::date AND s.type = 'DAILY_EVENT'
 		       AND COALESCE(bl.total, 0) > 0 AND COALESCE(bl.paid, 0) >= bl.total))`+recentFilter+`
 		ORDER BY s.date DESC LIMIT `+limitPH+` OFFSET `+offsetPH, recentArgs...)
 	if err != nil {
@@ -207,8 +209,8 @@ func (s *Service) Get(c *fiber.Ctx) error {
 
 	var monthRevenue, monthExpense int64
 	_ = s.db.QueryRow(c.Context(), `
-		SELECT COALESCE((SELECT SUM(amount) FROM revenues WHERE occurred_at >= date_trunc('month', CURRENT_DATE)), 0),
-		       COALESCE((SELECT SUM(amount) FROM expenses WHERE occurred_at >= date_trunc('month', CURRENT_DATE)), 0)`).
+		SELECT COALESCE((SELECT SUM(amount) FROM revenues WHERE occurred_at >= date_trunc('month', (now() AT TIME ZONE 'Asia/Jakarta')::date)), 0),
+		       COALESCE((SELECT SUM(amount) FROM expenses WHERE occurred_at >= date_trunc('month', (now() AT TIME ZONE 'Asia/Jakarta')::date)), 0)`).
 		Scan(&monthRevenue, &monthExpense)
 
 	// Monthly cash flow split by scope so Daily and Period money never mix.
@@ -226,7 +228,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 			COALESCE(SUM(r.amount) FILTER (WHERE s.type = 'PERIOD' OR (s.id IS NULL AND r.period_id IS NOT NULL)), 0),
 			COALESCE(SUM(r.amount) FILTER (WHERE s.id IS NULL AND r.period_id IS NULL), 0)
 		FROM revenues r LEFT JOIN mabar_sessions s ON s.id = r.session_id
-		WHERE r.occurred_at >= date_trunc('month', CURRENT_DATE)`).
+		WHERE r.occurred_at >= date_trunc('month', (now() AT TIME ZONE 'Asia/Jakarta')::date)`).
 		Scan(&dRev, &pRev, &gRev)
 	_ = s.db.QueryRow(c.Context(), `
 		SELECT
@@ -236,7 +238,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		FROM expenses e
 		LEFT JOIN mabar_sessions s ON s.id = e.session_id
 		LEFT JOIN shuttlecock_products p ON p.id = e.product_id
-		WHERE e.occurred_at >= date_trunc('month', CURRENT_DATE)`).
+		WHERE e.occurred_at >= date_trunc('month', (now() AT TIME ZONE 'Asia/Jakarta')::date)`).
 		Scan(&dExp, &pExp, &gExp)
 	monthScope["daily"]["revenue"], monthScope["period"]["revenue"], monthScope["general"]["revenue"] = dRev, pRev, gRev
 	monthScope["daily"]["expense"], monthScope["period"]["expense"], monthScope["general"]["expense"] = dExp, pExp, gExp
@@ -253,7 +255,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		FROM player_bills b
 		JOIN mabar_sessions s ON s.id = b.session_id
 		WHERE b.payment_status = 'PAID'
-		  AND s.date >= date_trunc('month', CURRENT_DATE)::date`).
+		  AND s.date >= date_trunc('month', (now() AT TIME ZONE 'Asia/Jakarta')::date)::date`).
 		Scan(&dBilled, &pBilled)
 	monthScope["daily"]["revenue"] += dBilled
 	monthScope["period"]["revenue"] += pBilled
@@ -302,7 +304,7 @@ func (s *Service) Get(c *fiber.Ctx) error {
 			           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
 			LEFT JOIN (SELECT session_id, SUM(units) AS units FROM shuttlecock_transactions WHERE type = 'USAGE' GROUP BY session_id) sh_u ON sh_u.session_id = s.id
 			LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM expenses WHERE category <> 'SHUTTLECOCK_PURCHASE' GROUP BY session_id) ex ON ex.session_id = s.id
-			WHERE s.period_id = $1 AND s.type = 'PERIOD' AND s.date < CURRENT_DATE
+			WHERE s.period_id = $1 AND s.type = 'PERIOD' AND s.date < (now() AT TIME ZONE 'Asia/Jakarta')::date
 			ORDER BY s.date`, *fundPeriodID)
 		if err == nil {
 			defer srows.Close()

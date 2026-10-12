@@ -77,7 +77,7 @@ func (s *Service) Attendance(c *fiber.Ctx) error {
 	months := c.QueryInt("months", 0)
 	if months > 0 {
 		args = append(args, months)
-		cond += fmt.Sprintf(" AND ms.date >= (CURRENT_DATE - make_interval(months => $%d))::date", len(args))
+		cond += fmt.Sprintf(" AND ms.date >= ((now() AT TIME ZONE 'Asia/Jakarta')::date - make_interval(months => $%d))::date", len(args))
 	}
 
 	query := fmt.Sprintf(`
@@ -213,7 +213,7 @@ func (s *Service) NoShowTracker(c *fiber.Ctx) error {
 
 	monthCond := "TRUE"
 	if months > 0 {
-		monthCond = fmt.Sprintf("ms.date >= CURRENT_DATE - make_interval(months => %d)", months)
+		monthCond = fmt.Sprintf("ms.date >= ((now() AT TIME ZONE 'Asia/Jakarta')::date - make_interval(months => %d))", months)
 	}
 
 	statusFilter := c.Query("status")
