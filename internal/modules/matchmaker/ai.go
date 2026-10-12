@@ -88,10 +88,9 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 	`Rules: every match is exactly 2v2; keep the sum of ranks on both sides as close as possible; ` +
 	`cover EVERY player every round: with N players make exactly floor(N/4) matches ` +
 	`(20 players = 5 matches, 13 players = 3 matches); leave out at most N mod 4 players, ` +
-	`preferring the latest arrivals to sit out this round, ` +
+	`preferring — among those with the highest play counts — the latest arrivals to sit out this round, ` +
+	`(players with the lowest play counts must always play, whatever their arrival order); ` +
 	`and rotate who sits out across rounds so no one sits out twice before everyone sat out once); ` +
-	`MIXED DOUBLES is mandatory for female players: any side containing a gender-P player must pair ` +
-	`her with exactly one gender-L player (P+P or P+unknown is forbidden; L may pair with L or P); ` +
 	`vary partnerships across rounds; within one round a player appears at most once; ` +
 	`prioritize early arrivals (low arrival number) for earlier rounds and fuller schedules, ` +
 	`but keep it fair: across all generated rounds no player may sit out more than one round extra ` +
@@ -113,7 +112,10 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 const (
 	aiMinCallGap = 8 * time.Second
 	aiCacheTTL   = 10 * time.Minute
-	aiMaxTokens  = 1500
+	// 2500: a full 7-match draw is ~700 tokens, but chatty combo models
+	// spend tokens on prose/reasoning first — a tight budget truncates
+	// them into partial coverage ("only X of Y players").
+	aiMaxTokens = 2500
 )
 
 var (
@@ -247,7 +249,9 @@ func isProviderError(err error) bool {
 // lines keyed by index (no UUIDs on the wire), history as one line per past
 // matchup, plus the soft cross-week guard on attempt 0. rest names players
 // coming straight off the previous round's last wave: bench them first.
-func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int, rest []string) string {
+// retryNote carries the previous attempt's rejection reason so the model
+// fixes exactly what failed (e.g. partial coverage) instead of guessing.
+func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int, rest []string, retryNote string, pool []poolPlayer) string {
 	var pb strings.Builder
 	for _, p := range players {
 		grade := "-"
@@ -261,10 +265,41 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d|played%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival, p.Played)
 	}
 	var hb strings.Builder
+	idToIdx := map[string]int{}
+	for _, p := range players {
+		idToIdx[p.ID] = p.Index
+	}
+	nameOf := map[string]string{}
+	for _, p := range pool {
+		nameOf[p.ID] = p.Name
+	}
+	// History players are referenced by index number when every side member
+	// maps to this prompt's pool (unambiguous, no name confusion like Agus
+	// vs "Agus temen Dika"). Filtered subsets renumber players 0..k, so a
+	// side touching outsiders falls back to names instead of wrong indices.
+	renderSide := func(refs []string) string {
+		idx := make([]string, 0, len(refs))
+		for _, ref := range refs {
+			n, ok := idToIdx[ref]
+			if !ok {
+				names := make([]string, 0, len(refs))
+				for _, r := range refs {
+					if nm, ok := nameOf[r]; ok {
+						names = append(names, nm)
+					} else {
+						names = append(names, r)
+					}
+				}
+				return strings.Join(names, "+")
+			}
+			idx = append(idx, strconv.Itoa(n))
+		}
+		return strings.Join(idx, "+")
+	}
 	for _, h := range history {
 		if len(h.Team1) == 2 && len(h.Team2) == 2 {
-			fmt.Fprintf(&hb, "R%d: %s+%s vs %s+%s\n", h.Round,
-				h.Team1[0], h.Team1[1], h.Team2[0], h.Team2[1])
+			fmt.Fprintf(&hb, "R%d: %s vs %s\n", h.Round,
+				renderSide(h.Team1), renderSide(h.Team2))
 		}
 	}
 	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival|played, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
@@ -282,11 +317,15 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 		}
 	}
 	if attempt > 0 {
-		user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
+		if retryNote != "" {
+			user += fmt.Sprintf("\nPrevious attempt was rejected: %s Fix exactly that and nothing else.", retryNote)
+		} else {
+			user += fmt.Sprintf("\nThis is retry %d: use different partnerships and pairings than the obvious balanced split.", attempt)
+		}
 	}
 	if len(rest) > 0 {
 		user += "\nRest these players first (they played the last wave of the previous round, or are still playing live right now): " + strings.Join(rest, ", ") +
-			". Bench them before anyone else with equal play counts, and never schedule them in the first wave."
+			". Bench them before anyone else with equal play counts. Matches with the lowest play counts open the first wave, even beside tired teammates."
 	}
 	return user
 }
@@ -325,7 +364,7 @@ func resolveIdxRefs(players []aiPlayer) func([]string) ([]string, error) {
 // softHistory holds last-round matchups from other events in the same period:
 // the model should avoid repeating them if possible, but may repeat when
 // forced (attempt > 0 drops the soft section entirely).
-func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int, rest []string) ([]aiRound, aiEndpoint, []string, error) {
+func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer, history []aiHistoryMatch, softHistory []aiHistoryMatch, rounds, attempt int, rest []string, retryNote string, pool []poolPlayer) ([]aiRound, aiEndpoint, []string, error) {
 	endpoints := aiEndpoints(cfg)
 	if len(endpoints) == 0 {
 		return nil, aiEndpoint{}, nil, httpx.Unprocessable("AI generation is not configured. Set AI_API_KEY (plus AI_PROVIDER, AI_MODEL, AI_BASE_URL) to enable it.")
@@ -338,7 +377,7 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 
 	// Compact prompt: players as short lines keyed by index (no UUIDs on the
 	// wire), history as one line per past matchup. Keeps token usage low.
-	user := buildUserPrompt(players, history, softHistory, rounds, attempt, rest)
+	user := buildUserPrompt(players, history, softHistory, rounds, attempt, rest, retryNote, pool)
 
 	// Resolve index references back to real player ids.
 	resolve := resolveIdxRefs(players)
@@ -452,6 +491,24 @@ func generateMatchups(ctx context.Context, cfg config.Config, players []aiPlayer
 		if badRef != "" {
 			skip(ep, "referensi pemain salah ("+badRef+")")
 			lastErr = httpx.Unprocessable("AI returned unusable matchups (" + badRef + "). Try generating again.")
+			continue
+		}
+		// Coverage pre-check: a parseable answer that covers only part of
+		// the pool must NOT win the endpoint chain — otherwise a chatty
+		// model that always answers short would starve the next AI (which
+		// might answer fully). Same bar as the validator: all but at most
+		// 3 players, in complete groups of 4.
+		covered := map[string]bool{}
+		for _, mu := range out.Rounds {
+			for _, m := range mu.Matches {
+				for _, id := range append(append([]string{}, m.Team1...), m.Team2...) {
+					covered[id] = true
+				}
+			}
+		}
+		if usedCount := len(covered); usedCount == 0 || usedCount%4 != 0 || usedCount < len(players)-3 {
+			skip(ep, fmt.Sprintf("hanya mencakup %d dari %d pemain", usedCount, len(players)))
+			lastErr = httpx.Unprocessable("AI covered only part of the pool. Try generating again.")
 			continue
 		}
 		aiStore(cacheKey, raw)
