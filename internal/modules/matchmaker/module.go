@@ -463,13 +463,13 @@ func (s *Service) periodLastRoundSoft(ctx context.Context, periodID, currentEven
 // (0 = unlimited), max_rounds is the planned number of rounds (0 = no limit).
 func (s *Service) CreateEvent(c *fiber.Ctx) error {
 	var in struct {
-		Name            string   `json:"name"`
-		PlayerIDs       []string `json:"player_ids"`
-		CourtCount      *int     `json:"court_count"`
-		BasePlayed      *int     `json:"base_played"`
-		MaxRounds       *int     `json:"max_rounds"`
-		UseReferee      *bool    `json:"use_referee"`
-		SourceSessionID *string  `json:"source_session_id"`
+		Name            string    `json:"name"`
+		PlayerIDs       *[]string `json:"player_ids"`
+		CourtCount      *int      `json:"court_count"`
+		BasePlayed      *int      `json:"base_played"`
+		MaxRounds       *int      `json:"max_rounds"`
+		UseReferee      *bool     `json:"use_referee"`
+		SourceSessionID *string   `json:"source_session_id"`
 	}
 	if err := httpx.Decode(c, &in); err != nil || strings.TrimSpace(in.Name) == "" {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Event name is required.")
@@ -505,8 +505,11 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 		}
 		base = *in.BasePlayed
 	}
-	ids := in.PlayerIDs
-	if len(ids) == 0 {
+	ids := []string{}
+	if in.PlayerIDs == nil {
+		// Omitted: default to every active player. An explicitly empty
+		// list is allowed too — the pool starts empty and players join
+		// later via late arrivals or top-up auto-pull.
 		rows, err := s.db.Query(c.Context(), `SELECT id::text FROM players WHERE status = 'ACTIVE' ORDER BY name`)
 		if err != nil {
 			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create event.")
@@ -518,9 +521,8 @@ func (s *Service) CreateEvent(c *fiber.Ctx) error {
 			}
 		}
 		rows.Close()
-	}
-	if len(ids) < 4 {
-		return httpx.WriteAppError(c, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles."))
+	} else {
+		ids = *in.PlayerIDs
 	}
 	idsJSON, _ := json.Marshal(ids)
 	useReferee := true
