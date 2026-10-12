@@ -994,7 +994,7 @@ func restSetFor(matches []GenMatch, pendings []pending, roundNo int) map[string]
 // locally drawn rounds (the AI-answer path is ordered before validating).
 // Waves are renumbered after sorting and referees re-picked for the new
 // waves, so the least-played run first everywhere.
-func orderPendingsByLoad(pend []pending, rest map[string]bool, played map[string]int, waveBase, wavesPerRound int, pool []poolPlayer, useReferee bool) []pending {
+func orderPendingsByLoad(pend []pending, rest map[string]bool, played map[string]int, live map[string]bool, waveBase, wavesPerRound int, pool []poolPlayer, useReferee bool) []pending {
 	if len(pend) < 2 {
 		return pend
 	}
@@ -1019,8 +1019,19 @@ func orderPendingsByLoad(pend []pending, rest map[string]bool, played map[string
 		}
 		return best
 	}
+	hasLive := func(p pending) bool {
+		for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
+			if live[id] {
+				return true
+			}
+		}
+		return false
+	}
 	out := append([]pending{}, pend...)
 	sort.SliceStable(out, func(i, j int) bool {
+		if li, lj := hasLive(out[i]), hasLive(out[j]); li != lj {
+			return !li
+		}
 		if a, b := minPlayed(out[i]), minPlayed(out[j]); a != b {
 			return a < b
 		}
@@ -1038,11 +1049,10 @@ func orderPendingsByLoad(pend []pending, rest map[string]bool, played map[string
 	return out
 }
 
-// orderMatchesByRest stable-sorts AI-answer matchups so the lowest play
-// counts run first (a 0-play player opens wave 1 even beside tired
-// teammates), and among equally loaded sides the well-rested ones run
-// first (tired players gain a break).
-func orderMatchesByRest(ms []aiMatchup, rest map[string]bool, played map[string]int) []aiMatchup {
+// orderMatchesByRest stable-sorts AI-answer matchups: sides holding a
+// live player always run last (they need rest after their current game),
+// then the lowest play counts run first, then the well-rested ones.
+func orderMatchesByRest(ms []aiMatchup, rest map[string]bool, played map[string]int, live map[string]bool) []aiMatchup {
 	if len(ms) < 2 {
 		return ms
 	}
@@ -1067,8 +1077,19 @@ func orderMatchesByRest(ms []aiMatchup, rest map[string]bool, played map[string]
 		}
 		return best
 	}
+	hasLive := func(mu aiMatchup) bool {
+		for _, id := range append(append([]string{}, mu.Team1...), mu.Team2...) {
+			if live[id] {
+				return true
+			}
+		}
+		return false
+	}
 	out := append([]aiMatchup{}, ms...)
 	sort.SliceStable(out, func(i, j int) bool {
+		if li, lj := hasLive(out[i]), hasLive(out[j]); li != lj {
+			return !li
+		}
 		if mi, mj := minPlayed(out[i]), minPlayed(out[j]); mi != mj {
 			return mi < mj
 		}
@@ -1650,7 +1671,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				continue
 			}
 			// Tired players run last so they get a break before their game.
-			accepted, genErr = s.validateGenRound(v, orderMatchesByRest(aiRounds[0].Matches, rest, playedCounts), roundNo, waveBase, strictSoft)
+			accepted, genErr = s.validateGenRound(v, orderMatchesByRest(aiRounds[0].Matches, rest, playedCounts, liveSet), roundNo, waveBase, strictSoft)
 			if genErr == nil {
 				if !usedAISet {
 					usedAI, usedAISet = ep, true
@@ -1682,14 +1703,14 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 					for _, p := range local {
 						seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
 					}
-					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, waveBase, wavesPerRound, pool, gb.useReferee), nil
+					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, liveSet, waveBase, wavesPerRound, pool, gb.useReferee), nil
 					usedLocal = true
 				}
 			}
 			if genErr != nil {
 				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee)
 				if localErr == nil {
-					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, waveBase, wavesPerRound, pool, gb.useReferee), nil
+					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, liveSet, waveBase, wavesPerRound, pool, gb.useReferee), nil
 					usedLocal = true
 				}
 			}
@@ -1893,13 +1914,14 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	// 3) Full rules: 2v2, mixed doubles, one appearance, no repeat, coverage,
 	// leveling, and rest for last-wave + live players.
 	rest := restSetFor(gb.matches, nil, roundNo)
-	for id := range liveSetFor(gb.matches, gb.maxRound) {
+	live := liveSetFor(gb.matches, gb.maxRound)
+	for id := range live {
 		rest[id] = true
 	}
 	v := &genValidator{pool: gb.pool, players: mPlayers, borrowAllow: map[string]bool{}, requireNewcomers: []string{},
 		seen: gb.seen, softSeen: gb.softSeen, rest: rest, coverageN: mCoverage,
 		wavesPerRound: gb.wavesPerRound, playedCounts: gb.playedCounts, useReferee: gb.useReferee}
-	accepted, verr := s.validateGenRound(v, orderMatchesByRest(out.Rounds[0].Matches, rest, gb.playedCounts), roundNo, 0, len(gb.softSeen) > 0)
+	accepted, verr := s.validateGenRound(v, orderMatchesByRest(out.Rounds[0].Matches, rest, gb.playedCounts, live), roundNo, 0, len(gb.softSeen) > 0)
 	if verr != nil {
 		return httpx.WriteAppError(c, verr)
 	}
