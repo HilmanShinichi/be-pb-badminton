@@ -73,13 +73,14 @@ type MatchEvent struct {
 }
 
 type PlayerCount struct {
-	PlayerID string  `json:"player_id"`
-	Name     string  `json:"name"`
-	Grade    *string `json:"grade"`
-	Gender   *string `json:"gender"`
-	Arrival  int     `json:"arrival"`
-	Played   int     `json:"played"`
-	Refereed int     `json:"refereed"`
+	PlayerID  string  `json:"player_id"`
+	Name      string  `json:"name"`
+	Grade     *string `json:"grade"`
+	Gender    *string `json:"gender"`
+	Arrival   int     `json:"arrival"`
+	Played    int     `json:"played"`
+	Refereed  int     `json:"refereed"`
+	MaxPlayed *int    `json:"max_played"`
 }
 
 func parseTeam(raw string) []TeamPlayer {
@@ -238,7 +239,7 @@ func assignReferees(pool []poolPlayer, out []pending, waves map[int]int, played 
 // just because the model could not be reached.
 func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[string]bool,
 	roundNo, waveBase, wavesPerRound int, played map[string]int,
-	newcomers []string, borrow map[string]bool, useReferee bool) ([]pending, error) {
+	newcomers []string, borrow map[string]bool, useReferee bool, caps map[string]int, eventMax int) ([]pending, error) {
 
 	rank := map[string]int{}
 	arrival := map[string]int{}
@@ -254,15 +255,26 @@ func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[
 	for id := range borrow {
 		must[id] = true
 	}
-	// Sit-outs go to whoever has played most (ties: latest arrival); late
-	// arrivals and borrowed top-up players always play.
+	// Sit-outs go to whoever hit their personal cap first, then whoever has
+	// played most (ties: latest arrival); late arrivals and borrowed top-up
+	// players always play.
 	optional := []string{}
 	for _, p := range players {
 		if !must[p.ID] {
 			optional = append(optional, p.ID)
 		}
 	}
+	atCap := func(id string) bool {
+		cap := eventMax
+		if c, ok := caps[id]; ok {
+			cap = c
+		}
+		return cap > 0 && played[id] >= cap
+	}
 	sort.Slice(optional, func(i, j int) bool {
+		if ai, aj := atCap(optional[i]), atCap(optional[j]); ai != aj {
+			return ai
+		}
 		if played[optional[i]] != played[optional[j]] {
 			return played[optional[i]] > played[optional[j]]
 		}
@@ -624,6 +636,18 @@ func (s *Service) playerCounts(ctx context.Context, ev MatchEvent, pool []poolPl
 	if err != nil {
 		return nil, err
 	}
+	caps := map[string]int{}
+	if crows, err := s.db.Query(ctx,
+		`SELECT player_id::text, max_played FROM match_player_caps WHERE event_id = $1`, ev.ID); err == nil {
+		defer crows.Close()
+		for crows.Next() {
+			var pid string
+			var cap int
+			if err := crows.Scan(&pid, &cap); err == nil {
+				caps[pid] = cap
+			}
+		}
+	}
 	arrival := map[string]int{}
 	for i, pid := range ev.PlayerIDs {
 		arrival[pid] = i + 1
@@ -639,6 +663,11 @@ func (s *Service) playerCounts(ctx context.Context, ev MatchEvent, pool []poolPl
 		if rCount < 0 {
 			rCount = 0
 		}
+		var maxPlayed *int
+		if c, ok := caps[p.ID]; ok {
+			v := c
+			maxPlayed = &v
+		}
 		counts = append(counts, PlayerCount{
 			PlayerID: p.ID,
 			Name:     p.Name,
@@ -647,6 +676,7 @@ func (s *Service) playerCounts(ctx context.Context, ev MatchEvent, pool []poolPl
 			Arrival:  arrival[p.ID],
 			Played:   pCount,
 			Refereed: rCount,
+			MaxPlayed: maxPlayed,
 		})
 	}
 	return counts, nil
@@ -677,22 +707,31 @@ func (s *Service) countAdjustments(ctx context.Context, eventID string) (map[str
 
 // AdjustCount moves one player's played or refereed count by a delta on top of
 // the counted matches, so notes can be corrected without editing match cards.
-// The resulting count may never drop below zero.
+// The resulting count may never drop below zero. It also sets a personal
+// play cap (max_played >= 0); omitted leaves the cap untouched.
 func (s *Service) AdjustCount(c *fiber.Ctx) error {
 	id := c.Params("id")
 	playerID := c.Params("player_id")
 	var in struct {
-		PlayedDelta   int `json:"played_delta"`
-		RefereedDelta int `json:"refereed_delta"`
+		PlayedDelta   int  `json:"played_delta"`
+		RefereedDelta int  `json:"refereed_delta"`
+		MaxPlayed     *int `json:"max_played"`
 	}
 	if err := httpx.Decode(c, &in); err != nil {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
-	if in.PlayedDelta == 0 && in.RefereedDelta == 0 {
+	// max_played:null (clear back to event default) arrives as a nil pointer
+	// just like an omitted key, so detect key presence from the raw body.
+	var rawBody map[string]json.RawMessage
+	hasMax := json.Unmarshal(c.Body(), &rawBody) == nil && rawBody["max_played"] != nil
+	if in.PlayedDelta == 0 && in.RefereedDelta == 0 && !hasMax {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Pick a change of at least 1."))
 	}
 	if in.PlayedDelta < -50 || in.PlayedDelta > 50 || in.RefereedDelta < -50 || in.RefereedDelta > 50 {
 		return httpx.WriteAppError(c, httpx.Unprocessable("A single change may not pass 50."))
+	}
+	if in.MaxPlayed != nil && (*in.MaxPlayed < 0 || *in.MaxPlayed > 999) {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Personal max must be between 0 and 999."))
 	}
 	if _, err := uuid.Parse(id); err != nil {
 		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
@@ -758,6 +797,22 @@ func (s *Service) AdjustCount(c *fiber.Ctx) error {
 		    updated_at = now()`,
 		id, playerID, in.PlayedDelta, in.RefereedDelta); err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save the change.")
+	}
+	if in.MaxPlayed != nil {
+		if _, err := s.db.Exec(c.Context(), `
+			INSERT INTO match_player_caps (event_id, player_id, max_played)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (event_id, player_id) DO UPDATE SET max_played = EXCLUDED.max_played, updated_at = now()`,
+			id, playerID, *in.MaxPlayed); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save the personal max.")
+		}
+	} else if hasMax {
+		// Explicit null: back to following the event limit.
+		if _, err := s.db.Exec(c.Context(),
+			`DELETE FROM match_player_caps WHERE event_id = $1 AND player_id = $2`,
+			id, playerID); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not clear the personal max.")
+		}
 	}
 	after, err := s.playerCounts(c.Context(), ev, pool, matches)
 	if err != nil {
@@ -871,6 +926,19 @@ type genBase struct {
 	maxRound      int
 	basePlayed    int
 	useReferee    bool
+	caps          map[string]int
+}
+
+// capOf resolves a player's personal cap: explicit cap wins, else the event
+// limit (0 = unlimited).
+func (gb *genBase) capOf(pid string) int {
+	if gb == nil {
+		return 0
+	}
+	if c, ok := gb.caps[pid]; ok {
+		return c
+	}
+	return gb.maxRounds
 }
 
 func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) {
@@ -881,13 +949,24 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 	if len(pool) < 4 {
 		return nil, httpx.Unprocessable("An event needs at least 4 players for 2v2 doubles.")
 	}
-	gb := &genBase{pool: pool, seen: map[string]bool{}, playedCounts: map[string]int{}}
+	gb := &genBase{pool: pool, seen: map[string]bool{}, playedCounts: map[string]int{}, caps: map[string]int{}}
 	// Matches per wave = courts running simultaneously (event cap, else 3).
 	gb.wavesPerRound = 3
 	_ = s.db.QueryRow(ctx,
 		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds, COALESCE(base_played, 0), COALESCE(use_referee, TRUE) FROM match_events WHERE id = $1`, id).Scan(&gb.wavesPerRound, &gb.maxRounds, &gb.basePlayed, &gb.useReferee)
 	if gb.wavesPerRound <= 0 {
 		gb.wavesPerRound = 3
+	}
+	if crows, err := s.db.Query(ctx,
+		`SELECT player_id::text, max_played FROM match_player_caps WHERE event_id = $1`, id); err == nil {
+		defer crows.Close()
+		for crows.Next() {
+			var pid string
+			var cap int
+			if err := crows.Scan(&pid, &cap); err == nil {
+				gb.caps[pid] = cap
+			}
+		}
 	}
 	matches, err := s.listMatches(ctx, id)
 	if err != nil {
@@ -920,6 +999,7 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 	for i := range gb.aiPlayers {
 		gb.aiPlayers[i].Played = gb.playedCounts[gb.aiPlayers[i].ID]
 	}
+	applyCaps(gb.aiPlayers, gb.caps, gb.maxRounds)
 	// Soft cross-week guard: final round(s) of other events in the same
 	// period (via source_session -> mabar_sessions.period_id).
 	gb.softSeen = map[string]bool{}
@@ -1212,9 +1292,10 @@ func (s *Service) playedCapSubset(ctx context.Context, id string, pool []poolPla
 }
 
 // catchupSubset builds the "even out first" subset: every pool member below
-// the target plays, nobody at or above it does. No borrowing — leftovers
-// sit by arrival rotation and catch up next time.
-func catchupSubset(pool []poolPlayer, counts []PlayerCount, target int) ([]aiPlayer, error) {
+// their personal cap (explicit wins, else the target) plays, nobody at or
+// above it does. No borrowing — leftovers sit by arrival rotation and catch
+// up next time.
+func catchupSubset(pool []poolPlayer, counts []PlayerCount, target int, caps map[string]int) ([]aiPlayer, error) {
 	playedOf := map[string]int{}
 	posOf := map[string]int{}
 	for i, p := range pool {
@@ -1223,11 +1304,19 @@ func catchupSubset(pool []poolPlayer, counts []PlayerCount, target int) ([]aiPla
 	for _, c := range counts {
 		playedOf[c.PlayerID] = c.Played
 	}
+	effOf := func(pid string) int {
+		if c, ok := caps[pid]; ok {
+			return c
+		}
+		return target
+	}
 	sub := []aiPlayer{}
 	for _, p := range pool {
-		if playedOf[p.ID] < target {
-			sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: posOf[p.ID] + 1, Played: playedOf[p.ID]})
+		cap := effOf(p.ID)
+		if cap > 0 && playedOf[p.ID] >= cap {
+			continue
 		}
+		sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: posOf[p.ID] + 1, Played: playedOf[p.ID]})
 	}
 	if len(sub) == 0 {
 		return nil, httpx.Unprocessable("Semua pemain sudah rata di " + strconv.Itoa(target) + ". Naikkan batas match untuk lanjut.")
@@ -1253,7 +1342,19 @@ func (s *Service) catchupPlayers(ctx context.Context, id string, gb *genBase) ([
 			}
 		}
 	}
-	return catchupSubset(gb.pool, counts, target)
+	return catchupSubset(gb.pool, counts, target, gb.caps)
+}
+
+// applyCaps stamps the effective personal cap (explicit wins, else event
+// limit, 0 = unlimited) onto AI players for the prompt.
+func applyCaps(players []aiPlayer, caps map[string]int, eventMax int) {
+	for i := range players {
+		if c, ok := caps[players[i].ID]; ok {
+			players[i].Cap = c
+		} else {
+			players[i].Cap = eventMax
+		}
+	}
 }
 
 // genValidator carries per-round validation state. seen is shared by
@@ -1270,6 +1371,29 @@ type genValidator struct {
 	wavesPerRound    int
 	playedCounts     map[string]int
 	useReferee       bool
+	caps             map[string]int
+	eventMax         int
+}
+
+// effCap resolves a personal cap: explicit wins, else the event limit
+// (0 = unlimited, represented as a huge allowance).
+func effCap(caps map[string]int, eventMax int, pid string) int {
+	if c, ok := caps[pid]; ok {
+		return c
+	}
+	return eventMax
+}
+
+func remAfter(caps map[string]int, eventMax int, played map[string]int, pid string, playingNow bool) int {
+	cap := effCap(caps, eventMax, pid)
+	if cap <= 0 {
+		return 1 << 30
+	}
+	n := played[pid]
+	if playingNow {
+		n++
+	}
+	return cap - n
 }
 
 // validateGenRound checks one AI round: 2v2, pool members, mixed-doubles
@@ -1349,6 +1473,19 @@ func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, wav
 				for _, bp := range v.players {
 					if used[bp.ID] > 0 && v.playedCounts[bp.ID] == maxPlaying && v.rest[bp.ID] {
 						return nil, httpx.Unprocessable(bp.Name + " just played the last wave with no break — rest them before " + ap.Name + ".")
+					}
+				}
+			}
+			// Personal caps: a player with allowance left never sits out for
+			// one already at their cap. (Coverage may still force capped
+			// players in when bodies run short.)
+			for _, ap := range v.players {
+				if used[ap.ID] != 0 || remAfter(v.caps, v.eventMax, v.playedCounts, ap.ID, false) <= 0 {
+					continue
+				}
+				for _, bp := range v.players {
+					if used[bp.ID] > 0 && remAfter(v.caps, v.eventMax, v.playedCounts, bp.ID, true) <= 0 {
+						return nil, httpx.Unprocessable(bp.Name + " sudah mencapai batas main — beri ke " + ap.Name + " yang masih punya jatah.")
 					}
 				}
 			}
@@ -1515,7 +1652,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// Shared validation state; per-round fields (pool, borrowAllow,
 	// requireNewcomers, coverageN) are synced at the top of each iteration
 	// because top-up can grow the pool mid-loop.
-	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts, useReferee: gb.useReferee}
+	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts, useReferee: gb.useReferee, caps: gb.caps, eventMax: gb.maxRounds}
 	// Live players (still PLAYING in the latest round) rest in every round
 	// prepared while their games run. Static per request: statuses here
 	// never change mid-loop (new rounds are stored UPCOMING).
@@ -1699,6 +1836,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		for i := range aiPlayers {
 			aiPlayers[i].Played = playedCounts[aiPlayers[i].ID]
 		}
+		applyCaps(aiPlayers, gb.caps, gb.maxRounds)
 		if in.PlayedCap != nil || in.CatchUp {
 			// Filtered/catch-up mode: standard coverage over the subset (all
 			// but at most 3 play); leveling plus load-first ordering protect
@@ -1777,7 +1915,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				for k := range softSeen {
 					strictSeen[k] = true
 				}
-				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee); localErr == nil {
+				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds); localErr == nil {
 					for _, p := range local {
 						seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
 					}
@@ -1786,7 +1924,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				}
 			}
 			if genErr != nil {
-				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee)
+				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds)
 				if localErr == nil {
 					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, liveSet, waveBase, wavesPerRound, pool, gb.useReferee), nil
 					usedLocal = true
@@ -1901,6 +2039,7 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 		}
 		promptPlayers = sub
 	}
+	applyCaps(promptPlayers, gb.caps, gb.maxRounds)
 	prompt := aiSystemPrompt + "\n\n" + buildUserPrompt(promptPlayers, gb.history, gb.softHistory, 1, 0, restNamesFor(gb.pool, rest), "", gb.pool)
 	return httpx.OK(c, http.StatusOK, map[string]any{"round": roundNo, "prompt": prompt})
 }
@@ -1985,6 +2124,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		}
 		mPlayers, mCoverage = sub, len(sub)
 	}
+	applyCaps(mPlayers, gb.caps, gb.maxRounds)
 	// 1) Valid JSON (or a readable team table)?
 	out, perr := parseAIOutput(raw)
 	if perr != nil {
@@ -2020,7 +2160,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	}
 	v := &genValidator{pool: gb.pool, players: mPlayers, borrowAllow: map[string]bool{}, requireNewcomers: []string{},
 		seen: gb.seen, softSeen: gb.softSeen, rest: rest, coverageN: mCoverage,
-		wavesPerRound: gb.wavesPerRound, playedCounts: gb.playedCounts, useReferee: gb.useReferee}
+		wavesPerRound: gb.wavesPerRound, playedCounts: gb.playedCounts, useReferee: gb.useReferee, caps: gb.caps, eventMax: gb.maxRounds}
 	accepted, verr := s.validateGenRound(v, orderMatchesByRest(out.Rounds[0].Matches, rest, gb.playedCounts, live), roundNo, 0, len(gb.softSeen) > 0)
 	if verr != nil {
 		return httpx.WriteAppError(c, verr)

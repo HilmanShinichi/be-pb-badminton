@@ -34,6 +34,8 @@ type aiPlayer struct {
 	// Played counts matches already played or scheduled (ENDED, PLAYING,
 	// UPCOMING): the load-balancing signal, lowest plays first.
 	Played int `json:"played"`
+	// Cap is the personal play limit (0 = unlimited / follow event).
+	Cap int `json:"cap"`
 }
 
 type aiHistoryMatch struct {
@@ -99,6 +101,8 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 	`Fill every round from the LOWEST played count upward: players who played less must play more. ` +
 	`When N mod 4 players must sit out, sit out the HIGHEST played count first ` +
 	`(ties: latest arrival sits out); early arrival only breaks remaining ties; ` +
+	`CAPS: cap is the personal play limit (0 = unlimited). A player at their cap sits before anyone below their cap; ` +
+	`a player below cap never sits out for one already at cap; ` +
 	`NEVER repeat an exact matchup from history (same four players with the same sides). ` +
 	`Players are numbered by "i": always reference players by their index number as a string ` +
 	`(e.g. team1 ["0","3"]), never by name or id. ` +
@@ -262,7 +266,7 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 		if p.Gender != nil && *p.Gender != "" {
 			gender = *p.Gender
 		}
-		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d|played%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival, p.Played)
+		fmt.Fprintf(&pb, "%d|%s|%s|%s|rank%d|arr%d|played%d|cap%d\n", p.Index, p.Name, grade, gender, p.Rank, p.Arrival, p.Played, p.Cap)
 	}
 	var hb strings.Builder
 	idToIdx := map[string]int{}
@@ -302,7 +306,7 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 				renderSide(h.Team1), renderSide(h.Team2))
 		}
 	}
-	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival|played, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
+	user := fmt.Sprintf("Generate %d round(s) of 2v2 doubles from these players (index|name|grade|gender|rank|arrival|played|cap with cap 0 = unlimited, use every index at most once per round):\n%sHistory to never repeat (R=round):\n%s",
 		rounds, pb.String(), hb.String())
 	if attempt == 0 && len(softHistory) > 0 {
 		var sb strings.Builder
