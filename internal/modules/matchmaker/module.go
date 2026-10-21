@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -239,7 +240,8 @@ func assignReferees(pool []poolPlayer, out []pending, waves map[int]int, played 
 // just because the model could not be reached.
 func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[string]bool,
 	roundNo, waveBase, wavesPerRound int, played map[string]int,
-	newcomers []string, borrow map[string]bool, useReferee bool, caps map[string]int, eventMax int) ([]pending, error) {
+	newcomers []string, borrow map[string]bool, useReferee bool, caps map[string]int, eventMax int,
+	rest map[string]bool) ([]pending, error) {
 
 	rank := map[string]int{}
 	arrival := map[string]int{}
@@ -256,8 +258,9 @@ func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[
 		must[id] = true
 	}
 	// Sit-outs go to whoever hit their personal cap first, then whoever has
-	// played most (ties: latest arrival); late arrivals and borrowed top-up
-	// players always play.
+	// played most, then whoever just came off the court (rest set); ties
+	// after that fall back to latest arrival. Late arrivals and borrowed
+	// top-up players always play.
 	optional := []string{}
 	for _, p := range players {
 		if !must[p.ID] {
@@ -277,6 +280,9 @@ func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[
 		}
 		if played[optional[i]] != played[optional[j]] {
 			return played[optional[i]] > played[optional[j]]
+		}
+		if ri, rj := rest[optional[i]], rest[optional[j]]; ri != rj {
+			return ri
 		}
 		return arrival[optional[i]] > arrival[optional[j]]
 	})
@@ -669,13 +675,13 @@ func (s *Service) playerCounts(ctx context.Context, ev MatchEvent, pool []poolPl
 			maxPlayed = &v
 		}
 		counts = append(counts, PlayerCount{
-			PlayerID: p.ID,
-			Name:     p.Name,
-			Grade:    p.Grade,
-			Gender:   p.Gender,
-			Arrival:  arrival[p.ID],
-			Played:   pCount,
-			Refereed: rCount,
+			PlayerID:  p.ID,
+			Name:      p.Name,
+			Grade:     p.Grade,
+			Gender:    p.Gender,
+			Arrival:   arrival[p.ID],
+			Played:    pCount,
+			Refereed:  rCount,
 			MaxPlayed: maxPlayed,
 		})
 	}
@@ -1013,60 +1019,184 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 	return gb, nil
 }
 
-// liveSetFor collects players whose matches are still PLAYING in the latest
-// round: their games haven't finished, so the prepared next round must let
-// them rest afterwards. Only the latest round counts, so a forgotten status
-// on an old round never pollutes future draws.
-func liveSetFor(matches []GenMatch, maxRound int) map[string]bool {
+// liveSetFor collects players whose matches are still PLAYING. It scans
+// every round, not just the latest one: a forgotten PLAYING status on an
+// older round (e.g. a manual card added late) must still bench that player
+// in the next draw, otherwise they get scheduled again immediately.
+//
+// A match only counts as live while it can still plausibly be running. The
+// status column is not reset on its own, so a card left on PLAYING by a
+// forgotten tap would otherwise bench its four players forever. A match
+// older than liveMatchWindow is treated as abandoned and ignored.
+func liveSetFor(matches []GenMatch) map[string]bool {
+	return liveSetForAt(matches, time.Now())
+}
+
+// liveMatchWindow is how long a match may stay on PLAYING before the status
+// is considered abandoned. One session evening is a few hours, so anything
+// older than a day is a stale flag, not a running game.
+const liveMatchWindow = 24 * time.Hour
+
+// liveSetForAt is liveSetFor with an explicit clock, so the window can be
+// tested without waiting for real time to pass.
+func liveSetForAt(matches []GenMatch, now time.Time) map[string]bool {
 	live := map[string]bool{}
-	if maxRound <= 0 {
-		return live
-	}
+	cutoff := now.Add(-liveMatchWindow)
 	for _, m := range matches {
-		if m.Round == maxRound && m.Status == "PLAYING" {
-			for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
-				live[id] = true
-			}
+		if m.Status != "PLAYING" {
+			continue
+		}
+		if at := playedAt(m); at.IsZero() || at.Before(cutoff) {
+			continue
+		}
+		for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
+			live[id] = true
 		}
 	}
 	return live
 }
 
-// restSetFor collects players from the last wave of the previous round:
-// they just played with no break, so the next round must rest them first
-// (bench when slots allow, else schedule them in the last waves).
-func restSetFor(matches []GenMatch, pendings []pending, roundNo int) map[string]bool {
+// parseMatchTime reads a Postgres timestamp text. The database returns
+// "2026-10-18 07:30:39.315735+00", so the usual RFC3339 layout does not
+// parse; several fallbacks are tried in order.
+func parseMatchTime(v *string) *time.Time {
+	if v == nil || strings.TrimSpace(*v) == "" {
+		return nil
+	}
+	s := strings.TrimSpace(*v)
+	layouts := []string{
+		time.RFC3339Nano,
+		time.RFC3339,
+		"2006-01-02 15:04:05.999999999Z07:00",
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04:05.999999",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return &t
+		}
+	}
+	return nil
+}
+
+// playedAt returns when a match took the court. started_at is the real play
+// moment, so it wins; a card that was never started falls back to draw time.
+// The stale flags are handled by the window below, not by hiding started_at:
+// a leftover card closed minutes before the draw really did just finish.
+func playedAt(m GenMatch) time.Time {
+	if t := parseMatchTime(m.StartedAt); t != nil {
+		return *t
+	}
+	if t := parseMatchTime(&m.CreatedAt); t != nil {
+		return *t
+	}
+	return time.Time{}
+}
+
+// wasPlayed reports whether the card already took a court.
+func wasPlayed(m GenMatch) bool {
+	return m.Status == "ENDED" || m.Status == "PLAYING"
+}
+
+// lastWave rest returns the cards of the most recent wave: one wave is
+// courtCount matches, because the courts of a session run side by side.
+// Ordering runs on draw time, so a wave is picked by what was drawn last
+// instead of by round numbers, which are only display labels and may be
+// sparse, out of order, or full of leftover single cards.
+func lastWave(matches []GenMatch, roundNo, courtCount int) []GenMatch {
+	if courtCount <= 0 {
+		courtCount = 3
+	}
+	played := make([]GenMatch, 0, len(matches))
+	for _, m := range matches {
+		if !wasPlayed(m) || m.Round >= roundNo {
+			continue
+		}
+		if playedAt(m).IsZero() {
+			continue
+		}
+		played = append(played, m)
+	}
+	sort.SliceStable(played, func(i, j int) bool {
+		ti, tj := playedAt(played[i]), playedAt(played[j])
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		if played[i].Round != played[j].Round {
+			return played[i].Round > played[j].Round
+		}
+		return played[i].Wave > played[j].Wave
+	})
+	if len(played) > courtCount {
+		played = played[:courtCount]
+	}
+	return played
+}
+
+// lastPendingWave returns the newest wave drawn earlier in this same call:
+// the highest round, then the highest wave inside it.
+func lastPendingWave(pendings []pending, roundNo int) (round, wave int, found bool) {
+	for _, p := range pendings {
+		if p.round >= roundNo {
+			continue
+		}
+		if !found || p.round > round || (p.round == round && p.wave > wave) {
+			round, wave, found = p.round, p.wave, true
+		}
+	}
+	return round, wave, found
+}
+
+// restSetFor collects the players from the last wave so the next round lets
+// them rest first.
+//
+// It reads chronology instead of round-relative numbers: round is a display
+// label and may be sparse (a deleted round leaves a hole) or hold leftover
+// single cards, so keying off roundNo-1 hides exactly the players who need
+// the break — someone who played the last wave of round 1 while round 3
+// exists was invisible to a round-relative window.
+//
+// A wave is at most courtCount matches, matching how many courts run at once.
+// Rounds drawn earlier in this same call count as the newest wave, since a
+// generated round must not be followed immediately by its own players.
+// Live players (still PLAYING) are merged in by the caller.
+func restSetFor(matches []GenMatch, pendings []pending, roundNo, courtCount int) map[string]bool {
+	return restSetForAt(matches, pendings, roundNo, courtCount, time.Now())
+}
+
+// restSetForAt is restSetFor with an explicit clock. When the newest card is
+// older than liveMatchWindow the whole evening is over and nobody is owed a
+// break, so the set stays empty instead of benching a stale wave.
+func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount int, now time.Time) map[string]bool {
 	rest := map[string]bool{}
 	if roundNo <= 1 {
 		return rest
 	}
-	prev := roundNo - 1
-	maxWave := 0
-	for _, m := range matches {
-		if m.Round == prev && m.Wave > maxWave {
-			maxWave = m.Wave
-		}
-	}
-	for _, p := range pendings {
-		if p.round == prev && p.wave > maxWave {
-			maxWave = p.wave
-		}
-	}
-	if maxWave == 0 {
-		return rest
-	}
-	for _, m := range matches {
-		if m.Round == prev && m.Wave == maxWave {
-			for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
-				rest[id] = true
+	if pRound, pWave, ok := lastPendingWave(pendings, roundNo); ok {
+		for _, p := range pendings {
+			if p.round != pRound || p.wave != pWave {
+				continue
 			}
-		}
-	}
-	for _, p := range pendings {
-		if p.round == prev && p.wave == maxWave {
 			for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
 				rest[id] = true
 			}
+		}
+		return rest
+	}
+	wave := lastWave(matches, roundNo, courtCount)
+	if len(wave) == 0 {
+		return rest
+	}
+	cutoff := now.Add(-liveMatchWindow)
+	for _, m := range wave {
+		at := playedAt(m)
+		if at.IsZero() || at.Before(cutoff) {
+			continue
+		}
+		for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
+			rest[id] = true
 		}
 	}
 	return rest
@@ -1322,7 +1452,7 @@ func catchupSubset(pool []poolPlayer, counts []PlayerCount, target int, caps map
 		return nil, httpx.Unprocessable("Semua pemain sudah rata di " + strconv.Itoa(target) + ". Naikkan batas match untuk lanjut.")
 	}
 	if len(sub) < 4 {
-		return nil, httpx.Unprocessable("Hanya "+strconv.Itoa(len(sub))+" pemain di bawah target — butuh minimal 4 untuk 2v2.")
+		return nil, httpx.Unprocessable("Hanya " + strconv.Itoa(len(sub)) + " pemain di bawah target — butuh minimal 4 untuk 2v2.")
 	}
 	return sub, nil
 }
@@ -1653,10 +1783,10 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// requireNewcomers, coverageN) are synced at the top of each iteration
 	// because top-up can grow the pool mid-loop.
 	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts, useReferee: gb.useReferee, caps: gb.caps, eventMax: gb.maxRounds}
-	// Live players (still PLAYING in the latest round) rest in every round
+	// Live players (still PLAYING, in any round) rest in every round
 	// prepared while their games run. Static per request: statuses here
 	// never change mid-loop (new rounds are stored UPCOMING).
-	liveSet := liveSetFor(matches, maxRound)
+	liveSet := liveSetFor(matches)
 
 	for i := 0; i < in.Rounds; i++ {
 		// Explicit round number fills one empty round (e.g. after deleting
@@ -1821,7 +1951,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		// Skipped for top-up: borrowed players are mid-round by design.
 		rest := map[string]bool{}
 		if !in.TopUp {
-			rest = restSetFor(matches, pendings, roundNo)
+			rest = restSetFor(matches, pendings, roundNo, gb.wavesPerRound)
 			for id := range liveSet {
 				rest[id] = true
 			}
@@ -1915,7 +2045,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				for k := range softSeen {
 					strictSeen[k] = true
 				}
-				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds); localErr == nil {
+				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds, rest); localErr == nil {
 					for _, p := range local {
 						seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
 					}
@@ -1924,7 +2054,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				}
 			}
 			if genErr != nil {
-				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds)
+				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds, rest)
 				if localErr == nil {
 					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, liveSet, waveBase, wavesPerRound, pool, gb.useReferee), nil
 					usedLocal = true
@@ -2020,8 +2150,8 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
 	}
-	rest := restSetFor(gb.matches, nil, roundNo)
-	for id := range liveSetFor(gb.matches, gb.maxRound) {
+	rest := restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound)
+	for id := range liveSetFor(gb.matches) {
 		rest[id] = true
 	}
 	promptPlayers := gb.aiPlayers
@@ -2060,6 +2190,7 @@ func restNamesFor(pool []poolPlayer, rest map[string]bool) []string {
 //  1. valid JSON (or a readable team table) — else 422,
 //  2. index refs resolve to pool players — else 422,
 //  3. full rules incl. no-repeat and coverage — else 422 with the reason.
+//
 // There is deliberately no local fallback: a bad paste is reported so the
 // user can re-ask the web AI, never silently replaced.
 func (s *Service) ManualGenerate(c *fiber.Ctx) error {
@@ -2153,8 +2284,8 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	}
 	// 3) Full rules: 2v2, mixed doubles, one appearance, no repeat, coverage,
 	// leveling, and rest for last-wave + live players.
-	rest := restSetFor(gb.matches, nil, roundNo)
-	live := liveSetFor(gb.matches, gb.maxRound)
+	rest := restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound)
+	live := liveSetFor(gb.matches)
 	for id := range live {
 		rest[id] = true
 	}
