@@ -1046,7 +1046,7 @@ func liveSetForAt(matches []GenMatch, now time.Time) map[string]bool {
 		if m.Status != "PLAYING" {
 			continue
 		}
-		if at := playedAt(m); at.IsZero() || at.Before(cutoff) {
+		if at := liveAt(m); at.IsZero() || at.Before(cutoff) {
 			continue
 		}
 		for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
@@ -1069,9 +1069,14 @@ func parseMatchTime(v *string) *time.Time {
 		time.RFC3339,
 		"2006-01-02 15:04:05.999999999Z07:00",
 		"2006-01-02 15:04:05.999999999-07:00",
-		"2006-01-02 15:04:05.999999999",
-		"2006-01-02 15:04:05",
+		// Postgres renders a timestamptz as "2026-10-18 06:26:43.473381+00",
+		// and a UTC one as "…+00:00": two-digit offset without the minutes.
+		// Without these the format above never matches and every timestamp
+		// reads as zero, which silently emptied the rest set.
+		"2006-01-02 15:04:05.999999999-07",
+		"2006-01-02 15:04:05.999999999Z07",
 		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
 	}
 	for _, layout := range layouts {
 		if t, err := time.Parse(layout, s); err == nil {
@@ -1081,15 +1086,29 @@ func parseMatchTime(v *string) *time.Time {
 	return nil
 }
 
-// playedAt returns when a match took the court. started_at is the real play
-// moment, so it wins; a card that was never started falls back to draw time.
-// The stale flags are handled by the window below, not by hiding started_at:
-// a leftover card closed minutes before the draw really did just finish.
-func playedAt(m GenMatch) time.Time {
+// liveAt returns when a match actually went on court, for the live window.
+// started_at is the right clock here: a card drawn on Monday and started on
+// Tuesday was live on Tuesday, whatever the draw time says. It falls back to
+// the draw time for a card that was never started.
+func liveAt(m GenMatch) time.Time {
 	if t := parseMatchTime(m.StartedAt); t != nil {
 		return *t
 	}
 	if t := parseMatchTime(&m.CreatedAt); t != nil {
+		return *t
+	}
+	return time.Time{}
+}
+
+// playedAt returns when a match took the court. Draw time (created_at) is the
+// clock used here, not started_at: started_at is rewritten whenever a leftover
+// card is started again days later, which would drag stale cards into the
+// newest wave and bench players who never played that evening.
+func playedAt(m GenMatch) time.Time {
+	if t := parseMatchTime(&m.CreatedAt); t != nil {
+		return *t
+	}
+	if t := parseMatchTime(m.StartedAt); t != nil {
 		return *t
 	}
 	return time.Time{}
@@ -1166,10 +1185,14 @@ func restSetFor(matches []GenMatch, pendings []pending, roundNo, courtCount int)
 	return restSetForAt(matches, pendings, roundNo, courtCount, time.Now())
 }
 
-// restSetForAt is restSetFor with an explicit clock. When the newest card is
-// older than liveMatchWindow the whole evening is over and nobody is owed a
-// break, so the set stays empty instead of benching a stale wave.
-func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount int, now time.Time) map[string]bool {
+// restSetForAt is restSetFor with an explicit clock. The clock is carried for
+// symmetry with liveSetFor, but it is not used to expire the set: a rest set
+// answers "who came off the court last", and that stays true however long the
+// event has been open. The 24-hour window belongs to liveSetFor only, where it
+// means "a PLAYING flag nobody ever cleared". Mixing the two would empty the
+// set on a resumed event, letting the last wave out again the moment the
+// session is picked back up.
+func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount int, _ time.Time) map[string]bool {
 	rest := map[string]bool{}
 	if roundNo <= 1 {
 		return rest
@@ -1185,16 +1208,7 @@ func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount in
 		}
 		return rest
 	}
-	wave := lastWave(matches, roundNo, courtCount)
-	if len(wave) == 0 {
-		return rest
-	}
-	cutoff := now.Add(-liveMatchWindow)
-	for _, m := range wave {
-		at := playedAt(m)
-		if at.IsZero() || at.Before(cutoff) {
-			continue
-		}
+	for _, m := range lastWave(matches, roundNo, courtCount) {
 		for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
 			rest[id] = true
 		}

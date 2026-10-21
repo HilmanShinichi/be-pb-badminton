@@ -95,19 +95,66 @@ func TestRestSetIsLastWave(t *testing.T) {
 		"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p")
 }
 
-// TestRestSetStaleWaveIsIdle: when every card is older than the window the
-// evening ended long ago, so nobody is owed a break.
+// TestParseMatchTimePostgresFormat pins the exact shape Postgres returns.
+// Unit tests elsewhere use RFC3339, which parses fine, so a broken Postgres
+// layout stayed invisible until the integration test ran against real rows.
+func TestParseMatchTimePostgresFormat(t *testing.T) {
+	cases := []string{
+		"2026-10-18 06:26:43.473381+00",
+		"2026-10-18 05:44:15.4887+00",
+		"2026-10-18 07:31:13.235598+00",
+		"2026-10-18 06:26:43.473381+07",
+		"2026-10-18 06:26:43+00",
+	}
+	for _, c := range cases {
+		got := parseMatchTime(&c)
+		if got == nil {
+			t.Fatalf("parseMatchTime(%q) = nil, want a time", c)
+		}
+		if got.Year() != 2026 || got.Month() != time.October || got.Day() != 18 {
+			t.Fatalf("parseMatchTime(%q) = %v, wrong date", c, got)
+		}
+	}
+
+	// A UTC offset must not shift the wall clock: 06:26+00 is 06:26 UTC.
+	c := "2026-10-18 06:26:43.473381+00"
+	got := parseMatchTime(&c)
+	if got.UTC().Hour() != 6 || got.UTC().Minute() != 26 {
+		t.Fatalf("parseMatchTime(%q) = %v UTC, want 06:26", c, got.UTC())
+	}
+
+	// Empty and nil stay nil.
+	if parseMatchTime(nil) != nil {
+		t.Fatal("nil should parse to nil")
+	}
+	empty := "  "
+	if parseMatchTime(&empty) != nil {
+		t.Fatal("blank should parse to nil")
+	}
+}
+
+// TestRestSetStaleWaveIsIdle: a rest set answers who came off the court last,
+// so it is never expired by the clock. The 24-hour window belongs to liveSetFor
+// only, where it means a PLAYING flag nobody ever cleared. This test now
+// checks that window on liveSetFor, not on restSetFor.
 func TestRestSetStaleWaveIsIdle(t *testing.T) {
 	matches := []GenMatch{
 		{Round: 1, Wave: 4, Status: "ENDED", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
 	}
 	now := mustParse(t, "2026-10-21T09:33:00Z")
-	if got := restSetForAt(matches, nil, 4, 4, now); len(got) != 0 {
-		t.Fatalf("rest = %v, want empty (wave is 3 days old)", got)
-	}
-	// Within the window the same wave still rests.
-	now = mustParse(t, "2026-10-18T08:00:00Z")
+	// rest still holds the last wave, even three days later.
 	wantSet(t, restSetForAt(matches, nil, 4, 4, now), "a", "b", "c", "d")
+	// live flags do expire, though.
+	live := []GenMatch{
+		gmS(1, 4, "PLAYING", "2026-10-18T07:30:00Z", "2026-10-18T07:30:00Z", tp("a", "b"), tp("c", "d")),
+	}
+	if got := liveSetForAt(live, now); len(got) != 0 {
+		t.Fatalf("live = %v, want empty (match is 3 days old)", got)
+	}
+	now = mustParse(t, "2026-10-18T08:00:00Z")
+	if got := liveSetForAt(live, now); len(got) != 4 {
+		t.Fatalf("live = %v, want 4 players", got)
+	}
 }
 
 // TestRestSetFromPendings: rounds drawn earlier in the same call are the
