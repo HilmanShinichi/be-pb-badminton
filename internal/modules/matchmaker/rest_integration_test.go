@@ -110,15 +110,92 @@ func TestIntegrationRestSetRealEvent(t *testing.T) {
 	t.Logf("live: %s", names(live))
 	t.Logf("rest: %s", names(rest))
 
-	// The four cards left on PLAYING from the 18 Oct evening are closed now,
-	// so nothing may be held live. If a stale flag creeps back in, this
-	// catches it against the real rows.
-	if len(live) != 0 {
-		t.Errorf("expected no live players once the stale cards are closed, got %s",
-			names(live))
+	// Live is time-relative, not empty-by-definition: a card started moments ago
+	// must bench its players, while a forgotten PLAYING flag from days ago must
+	// not. Assert the semantics rather than a fixed count, so the test survives
+	// a night where somebody is actually on court.
+	stale := 0
+	fresh := 0
+	cutoff := time.Now().Add(-liveMatchWindow)
+	for _, m := range gb.matches {
+		if m.Status != "PLAYING" {
+			continue
+		}
+		if at := liveAt(m); at.IsZero() || at.Before(cutoff) {
+			stale++
+			continue
+		}
+		fresh++
+	}
+	t.Logf("playing cards: fresh=%d stale=%d", fresh, stale)
+	if len(live) > 0 && fresh == 0 {
+		t.Errorf("live set is non-empty but no PLAYING card started within the window")
+	}
+	if fresh > 0 && len(live) == 0 {
+		t.Errorf("a PLAYING card started within the window but the live set is empty")
 	}
 	if len(rest) == 0 {
 		t.Errorf("expected a rest set from the last wave")
+	}
+}
+
+// TestIntegrationAllowanceModeRealEvent checks the per-player allowance draw on
+// the real event: with max_rounds spent, the pool must be everyone still under
+// their cap plus the fewest capped players needed to reach a 2v2. Read-only.
+func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
+	if os.Getenv("INTEGRATION_DB") != "1" {
+		t.Skip("set INTEGRATION_DB=1 to run against the real database")
+	}
+
+	pool := testDBPool(t)
+	s := &Service{db: pool, cfg: config.Config{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const eventID = "d5e11c16-9d05-4651-8a8a-7bf8b4f2418c"
+	gb, err := s.loadGenBase(ctx, eventID)
+	if err != nil {
+		t.Fatalf("loadGenBase: %v", err)
+	}
+
+	// Precondition: this is the case the user hit — planned rounds spent.
+	if gb.maxRounds <= 0 || gb.maxRound < gb.maxRounds {
+		t.Skipf("event is not past its round budget (maxRound=%d maxRounds=%d)", gb.maxRound, gb.maxRounds)
+	}
+
+	sub, cards, err := s.allowancePlayers(ctx, eventID, gb)
+	if err != nil {
+		t.Fatalf("allowancePlayers: %v", err)
+	}
+
+	under, capped := 0, 0
+	for _, p := range sub {
+		lim := effCap(gb.caps, gb.maxRounds, p.ID)
+		if lim > 0 && gb.playedCounts[p.ID] >= lim {
+			capped++
+			continue
+		}
+		under++
+	}
+
+	t.Logf("maxRound=%d maxRounds=%d pool=%d allowancePool=%d under=%d borrowed=%d cards=%d",
+		gb.maxRound, gb.maxRounds, len(gb.pool), len(sub), under, capped, cards)
+
+	if len(sub) == 0 {
+		t.Fatalf("allowance pool is empty")
+	}
+	if len(sub)%4 != 0 {
+		t.Errorf("allowance pool is not a full 2v2 set: %d", len(sub))
+	}
+	if cards != len(sub)/4 {
+		t.Errorf("card count %d does not match pool size %d", cards, len(sub))
+	}
+	// Borrowing must be minimal: only to round the remainder up to a 2v2.
+	if capped >= 4 {
+		t.Errorf("borrowed %d capped players, expected fewer than 4", capped)
+	}
+	if capped > 0 && under%4 == 0 {
+		t.Errorf("borrowed %d capped players although the group was already complete", capped)
 	}
 }
 

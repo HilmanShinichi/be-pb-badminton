@@ -1520,6 +1520,77 @@ func (s *Service) catchupPlayers(ctx context.Context, id string, gb *genBase) ([
 	return catchupSubset(gb.pool, counts, target, gb.caps)
 }
 
+// allowancePlayers builds the draw pool once an event's planned rounds are
+// used up. max_rounds is an allowance per player, not a wave count: a
+// 29-player night spends five waves inside its first round, so the round label
+// runs out long before the players do. Everyone still under their personal cap
+// plays; capped players fill the last card only when the leftovers cannot make
+// a 2v2 by themselves ("kalau memang sudah habis yang 3-nya").
+//
+// It returns the pool and how many cards that pool can support.
+func (s *Service) allowancePlayers(ctx context.Context, id string, gb *genBase) ([]aiPlayer, int, error) {
+	counts, err := s.loadCounts(ctx, id, gb.pool, gb.matches)
+	if err != nil {
+		return nil, 0, err
+	}
+	playedOf := map[string]int{}
+	for _, c := range counts {
+		playedOf[c.PlayerID] = c.Played
+	}
+	posOf := map[string]int{}
+	for i, p := range gb.pool {
+		posOf[p.ID] = i
+	}
+
+	under := []poolPlayer{}
+	capped := []poolPlayer{}
+	for _, p := range gb.pool {
+		lim := effCap(gb.caps, gb.maxRounds, p.ID)
+		if lim > 0 && playedOf[p.ID] >= lim {
+			capped = append(capped, p)
+			continue
+		}
+		under = append(under, p)
+	}
+	if len(under) == 0 {
+		return nil, 0, httpx.Unprocessable(
+			"Semua pemain sudah mencapai batas main (" + strconv.Itoa(gb.maxRounds) + "x). Naikkan batas match di pengaturan event untuk lanjut.")
+	}
+
+	// Borrow the fewest capped players needed to round the group up to a 2v2.
+	// Prefer the ones closest to the cap so the leveling gap stays small.
+	need := (4 - len(under)%4) % 4
+	if need > len(capped) {
+		need = len(capped)
+	}
+	sort.SliceStable(capped, func(i, j int) bool {
+		if playedOf[capped[i].ID] != playedOf[capped[j].ID] {
+			return playedOf[capped[i].ID] < playedOf[capped[j].ID]
+		}
+		return posOf[capped[i].ID] < posOf[capped[j].ID]
+	})
+
+	picked := append(append([]poolPlayer{}, under...), capped[:need]...)
+	// Keep the pool in arrival order: the prompt lists players by position and
+	// the late-arrival rule reads the same index.
+	sort.SliceStable(picked, func(i, j int) bool {
+		return posOf[picked[i].ID] < posOf[picked[j].ID]
+	})
+
+	sub := make([]aiPlayer, 0, len(picked))
+	for i, p := range picked {
+		sub = append(sub, aiPlayer{
+			Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender,
+			Rank: gradeRank(p.Grade), Arrival: i + 1, Played: playedOf[p.ID],
+		})
+	}
+	if len(sub) < 4 {
+		return nil, 0, httpx.Unprocessable(
+			"Hanya " + strconv.Itoa(len(sub)) + " pemain tersisa di bawah batas main — butuh minimal 4 untuk 2v2.")
+	}
+	return sub, len(sub) / 4, nil
+}
+
 // applyCaps stamps the effective personal cap (explicit wins, else event
 // limit, 0 = unlimited) onto AI players for the prompt.
 func applyCaps(players []aiPlayer, caps map[string]int, eventMax int) {
@@ -1781,21 +1852,30 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		}
 		aiPlayers = sub
 	}
-	// The event's match limit caps how many rounds this night may reach; one
-	// round is one match per player, so it also drives the count bars.
-	// Catch-up rounds are extra by design and bypass the plan cap.
+	// max_rounds is a per-player allowance, not a wave budget. A 29-player
+	// night burns five waves inside round 1, so the round counter runs out
+	// while players still owe matches. Once the planned rounds are spent, keep
+	// drawing for whoever is under their cap and top the last card up from
+	// capped players when the leftovers cannot make a 2v2 alone.
+	coverageN := len(pool)
+	allowance := false
 	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds && !in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
 			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
 	}
-	if in.Round == 0 && maxRounds > 0 && !in.CatchUp {
-		remaining := maxRounds - maxRound
-		if remaining <= 0 {
-			return httpx.WriteAppError(c, httpx.Unprocessable(
-				"This event already has all its planned matches ("+strconv.Itoa(maxRounds)+"). Raise the match limit in event settings to add more."))
+	if in.Round == 0 && maxRounds > 0 && maxRound >= maxRounds && !in.CatchUp && !in.TopUp {
+		allowance = true
+		in.Rounds = 1
+	}
+	if allowance {
+		sub, cards, err := s.allowancePlayers(c.Context(), id, gb)
+		if err != nil {
+			return httpx.WriteAppError(c, err)
 		}
-		if in.Rounds > remaining {
-			in.Rounds = remaining
+		aiPlayers = sub
+		coverageN = len(sub)
+		if in.Rounds > cards {
+			in.Rounds = cards
 		}
 	}
 
@@ -1804,7 +1884,6 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// next call, so nothing repeats. Nothing is stored until all rounds
 	// validate — existing rounds are never touched.
 	pendings := []pending{}
-	coverageN := len(pool)
 	// borrowAllow marks round players borrowed to complete a top-up group
 	// (they may appear twice); requireNewcomers must all play.
 	borrowAllow := map[string]bool{}
@@ -2192,8 +2271,13 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 		}
 		roundNo = in.Round
 	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
-		return httpx.WriteAppError(c, httpx.Unprocessable(
-			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
+		// Planned rounds are spent, but max_rounds is a per-player allowance:
+		// draw for whoever still owes matches instead of refusing outright.
+		sub, _, aerr := s.allowancePlayers(c.Context(), id, gb)
+		if aerr != nil {
+			return httpx.WriteAppError(c, aerr)
+		}
+		gb.aiPlayers = sub
 	}
 	rest := restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound)
 	for id := range liveSetFor(gb.matches) {
@@ -2276,13 +2360,22 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		}
 		roundNo = in.Round
 	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
-		return httpx.WriteAppError(c, httpx.Unprocessable(
-			"Round "+strconv.Itoa(roundNo)+" is past this event's match limit ("+strconv.Itoa(gb.maxRounds)+"). Raise the limit in event settings first."))
+		// Planned rounds are spent, but max_rounds is a per-player allowance:
+		// draw for whoever still owes matches instead of refusing outright.
+		sub, _, aerr := s.allowancePlayers(c.Context(), id, gb)
+		if aerr != nil {
+			return httpx.WriteAppError(c, aerr)
+		}
+		gb.aiPlayers = sub
 	}
 	// Filtered mode answers reference the subset positions (0..k), so every
 	// later step (markdown names, index resolve, validation) uses them.
 	mPlayers := gb.aiPlayers
 	mCoverage := len(gb.pool)
+	if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
+		// Allowance mode shrank the pool above; coverage follows it.
+		mCoverage = len(gb.aiPlayers)
+	}
 	if in.PlayedCap != nil && in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan, filter jumlah main, atau perataan."))
 	}
