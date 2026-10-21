@@ -433,20 +433,42 @@ func (s *Service) eventPeriodID(ctx context.Context, eventID string) (string, bo
 	return *periodID, true
 }
 
-// periodLastRoundSoft loads the final round of every OTHER event in the same
-// period as soft-avoid history: generate should not repeat these matchups
+// periodRecentSoftEvents is how many earlier events in the same period feed the
+// cross-week no-repeat guard. The guard used to look only at the final round of
+// each event, which left most repeat matchups unguarded: an event with five
+// waves only contributed its last one.
+const periodRecentSoftEvents = 3
+
+// softHistoryPromptLimit caps how many soft rows reach the AI prompt. The
+// validator may reject hundreds of keys, but the prompt only needs a taste of
+// recent history: a long list dilutes the rest/cap rules and pushes the model
+// into retries that end up on the local fallback.
+const softHistoryPromptLimit = 20
+
+// periodRecentSoft loads every matchup from the last few OTHER events in the
+// same period as soft-avoid history: generate should not repeat these matchups
 // unless no other valid 2v2 exists ("kecuali terpaksa").
-func (s *Service) periodLastRoundSoft(ctx context.Context, periodID, currentEventID string) (map[string]bool, []aiHistoryMatch) {
+//
+// Events are ranked by match_events.created_at, not by their latest card: a
+// leftover card tapped days later would otherwise make an old night look like
+// the most recent one.
+func (s *Service) periodRecentSoft(ctx context.Context, periodID, currentEventID string) (map[string]bool, []aiHistoryMatch) {
 	softSeen := map[string]bool{}
 	softHistory := []aiHistoryMatch{}
 	rows, err := s.db.Query(ctx, `
-		SELECT m.round, m.team1::text, m.team2::text
+		WITH recent AS (
+			SELECT e.id
+			FROM match_events e
+			JOIN mabar_sessions ms ON ms.id = e.source_session_id
+			WHERE ms.period_id = $1
+			  AND e.id <> $2
+			ORDER BY e.created_at DESC
+			LIMIT $3
+		)
+		SELECT m.round, m.team1::text, m.team2::text, m.created_at
 		FROM generated_matches m
-		JOIN match_events e ON e.id = m.event_id
-		JOIN mabar_sessions ms ON ms.id = e.source_session_id
-		WHERE ms.period_id = $1
-		  AND m.event_id <> $2
-		  AND m.round = (SELECT MAX(m2.round) FROM generated_matches m2 WHERE m2.event_id = m.event_id)`, periodID, currentEventID)
+		JOIN recent r ON r.id = m.event_id
+		ORDER BY m.created_at DESC`, periodID, currentEventID, periodRecentSoftEvents)
 	if err != nil {
 		return softSeen, softHistory
 	}
@@ -454,7 +476,8 @@ func (s *Service) periodLastRoundSoft(ctx context.Context, periodID, currentEven
 	for rows.Next() {
 		var round int
 		var t1raw, t2raw string
-		if err := rows.Scan(&round, &t1raw, &t2raw); err != nil {
+		var at time.Time
+		if err := rows.Scan(&round, &t1raw, &t2raw, &at); err != nil {
 			continue
 		}
 		t1 := parseTeam(t1raw)
@@ -464,6 +487,10 @@ func (s *Service) periodLastRoundSoft(ctx context.Context, periodID, currentEven
 		}
 		ids1, ids2 := idsOf(t1), idsOf(t2)
 		softSeen[matchupKey(ids1, ids2)] = true
+		// Rows arrive newest first, so the cap keeps the most recent ones.
+		if len(softHistory) >= softHistoryPromptLimit {
+			continue
+		}
 		names := func(team []TeamPlayer) []string {
 			out := []string{}
 			for _, t := range team {
@@ -472,6 +499,10 @@ func (s *Service) periodLastRoundSoft(ctx context.Context, periodID, currentEven
 			return out
 		}
 		softHistory = append(softHistory, aiHistoryMatch{Round: round, Team1: names(t1), Team2: names(t2)})
+	}
+	// Hand the prompt a chronological list; it reads as a timeline.
+	for i, j := 0, len(softHistory)-1; i < j; i, j = i+1, j-1 {
+		softHistory[i], softHistory[j] = softHistory[j], softHistory[i]
 	}
 	return softSeen, softHistory
 }
@@ -1006,11 +1037,11 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 		gb.aiPlayers[i].Played = gb.playedCounts[gb.aiPlayers[i].ID]
 	}
 	applyCaps(gb.aiPlayers, gb.caps, gb.maxRounds)
-	// Soft cross-week guard: final round(s) of other events in the same
-	// period (via source_session -> mabar_sessions.period_id).
+	// Soft cross-week guard: recent events of the same period (via
+	// source_session -> mabar_sessions.period_id).
 	gb.softSeen = map[string]bool{}
 	if periodID, ok := s.eventPeriodID(ctx, id); ok {
-		gb.softSeen, gb.softHistory = s.periodLastRoundSoft(ctx, periodID, id)
+		gb.softSeen, gb.softHistory = s.periodRecentSoft(ctx, periodID, id)
 		// Keys already covered by this event need no soft treatment.
 		for k := range gb.seen {
 			delete(gb.softSeen, k)

@@ -121,3 +121,72 @@ func TestIntegrationRestSetRealEvent(t *testing.T) {
 		t.Errorf("expected a rest set from the last wave")
 	}
 }
+
+// TestIntegrationSoftScopeRealPeriod checks the cross-week no-repeat guard on
+// the real period: every matchup of the three most recent earlier events enters
+// softSeen, while the prompt list stays capped. Read-only.
+func TestIntegrationSoftScopeRealPeriod(t *testing.T) {
+	if os.Getenv("INTEGRATION_DB") != "1" {
+		t.Skip("set INTEGRATION_DB=1 to run against the real database")
+	}
+
+	pool := testDBPool(t)
+	s := &Service{db: pool, cfg: config.Config{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const eventID = "d5e11c16-9d05-4651-8a8a-7bf8b4f2418c"
+	periodID, ok := s.eventPeriodID(ctx, eventID)
+	if !ok {
+		t.Fatalf("event %s has no period link", eventID)
+	}
+
+	softSeen, softHistory := s.periodRecentSoft(ctx, periodID, eventID)
+
+	// Count what the old query would have produced: last round of each event.
+	var oldStyle int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM generated_matches m
+		JOIN match_events e ON e.id = m.event_id
+		JOIN mabar_sessions ms ON ms.id = e.source_session_id
+		WHERE ms.period_id = $1
+		  AND m.event_id <> $2
+		  AND m.round = (SELECT MAX(m2.round) FROM generated_matches m2 WHERE m2.event_id = m.event_id)`,
+		periodID, eventID).Scan(&oldStyle); err != nil {
+		t.Fatalf("count old scope: %v", err)
+	}
+
+	var total int
+	if err := pool.QueryRow(ctx, `
+		WITH recent AS (
+			SELECT e.id
+			FROM match_events e
+			JOIN mabar_sessions ms ON ms.id = e.source_session_id
+			WHERE ms.period_id = $1 AND e.id <> $2
+			ORDER BY e.created_at DESC
+			LIMIT $3
+		)
+		SELECT count(*) FROM generated_matches m JOIN recent r ON r.id = m.event_id`,
+		periodID, eventID, periodRecentSoftEvents).Scan(&total); err != nil {
+		t.Fatalf("count new scope: %v", err)
+	}
+
+	t.Logf("period=%s softKeys=%d promptRows=%d oldScope=%d newScopeRows=%d",
+		periodID, len(softSeen), len(softHistory), oldStyle, total)
+
+	if len(softSeen) == 0 {
+		t.Errorf("expected a non-empty soft set")
+	}
+	// The new scope must cover strictly more cards than the old last-round view.
+	if len(softSeen) <= oldStyle {
+		t.Errorf("soft scope did not widen: %d keys vs old %d", len(softSeen), oldStyle)
+	}
+	if len(softHistory) > softHistoryPromptLimit {
+		t.Errorf("prompt history exceeds cap: %d > %d", len(softHistory), softHistoryPromptLimit)
+	}
+	// The cap trims the prompt list only; the validator keeps every key.
+	if total > softHistoryPromptLimit && len(softHistory) != softHistoryPromptLimit {
+		t.Errorf("expected the prompt list capped at %d, got %d", softHistoryPromptLimit, len(softHistory))
+	}
+}
