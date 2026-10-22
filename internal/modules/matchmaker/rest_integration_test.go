@@ -2,6 +2,8 @@ package matchmaker
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -168,10 +170,22 @@ func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
 		t.Fatalf("allowancePlayers: %v", err)
 	}
 
+	// The draw counts games including base_played and manual adjustments;
+	// gb.playedCounts only holds the raw match rows, so auditing fairness with
+	// it would disagree with the code under test.
+	cnts, err := s.loadCounts(ctx, eventID, gb.pool, gb.matches)
+	if err != nil {
+		t.Fatalf("loadCounts: %v", err)
+	}
+	played := make(map[string]int, len(cnts))
+	for _, c := range cnts {
+		played[c.PlayerID] = c.Played
+	}
+
 	under, capped := 0, 0
 	for _, p := range sub {
 		lim := effCap(gb.caps, gb.maxRounds, p.ID)
-		if lim > 0 && gb.playedCounts[p.ID] >= lim {
+		if lim > 0 && played[p.ID] >= lim {
 			capped++
 			continue
 		}
@@ -196,6 +210,69 @@ func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
 	}
 	if capped > 0 && under%4 == 0 {
 		t.Errorf("borrowed %d capped players although the group was already complete", capped)
+	}
+
+	// Fairness: the card must be built from the lowest play counts first. If a
+	// capped player was borrowed, everyone picked below the cap must come from
+	// the bottom of the count table — no player may be left behind on fewer
+	// games than somebody who was drawn.
+	pickedMin, pickedMax := math.MaxInt32, -1
+	for _, p := range sub {
+		n := played[p.ID]
+		if n < pickedMin {
+			pickedMin = n
+		}
+		if n > pickedMax {
+			pickedMax = n
+		}
+	}
+	lowest := math.MaxInt32
+	for _, p := range gb.pool {
+		if n := played[p.ID]; n < lowest {
+			lowest = n
+		}
+	}
+	t.Logf("picked counts: min=%d max=%d; lowest in pool=%d", pickedMin, pickedMax, lowest)
+
+	// Name the picks so a human can eyeball the fairness on the real event.
+	pickedSet := make(map[string]bool, len(sub))
+	picks := make([]string, 0, len(sub))
+	for _, p := range sub {
+		pickedSet[p.ID] = true
+		picks = append(picks, fmt.Sprintf("%s(%dx)", p.Name, played[p.ID]))
+	}
+	sort.Strings(picks)
+	t.Logf("picked: %s", strings.Join(picks, " "))
+
+	// Everyone left out must have played at least as often as the players who
+	// went on court; otherwise the draw skipped somebody who was behind.
+	leftOut := make([]string, 0, 4)
+	for _, p := range gb.pool {
+		if pickedSet[p.ID] {
+			continue
+		}
+		if n := played[p.ID]; n < pickedMax {
+			leftOut = append(leftOut, fmt.Sprintf("%s(%dx)", p.Name, n))
+		}
+	}
+	if len(leftOut) > 0 {
+		t.Errorf("left out while fewer games than a picked player: %s", strings.Join(leftOut, " "))
+	}
+
+	if pickedMin != lowest {
+		t.Errorf("draw skipped players on %dx: lowest picked is %d", lowest, pickedMin)
+	}
+	// Levels are taken whole, so at most one count value may appear below the
+	// cap plus the borrowed tail: anything wider means a level was skipped.
+	underCounts := map[int]bool{}
+	for _, p := range sub {
+		n := played[p.ID]
+		if lim := effCap(gb.caps, gb.maxRounds, p.ID); lim <= 0 || n < lim {
+			underCounts[n] = true
+		}
+	}
+	if len(underCounts) > 2 {
+		t.Errorf("under-cap picks span %d count levels (%v); should be one level plus at most a trailing one", len(underCounts), underCounts)
 	}
 }
 
