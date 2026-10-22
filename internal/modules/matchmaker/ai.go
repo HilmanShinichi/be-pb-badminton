@@ -127,7 +127,43 @@ var (
 	aiLastCall time.Time
 	aiCacheMu  sync.Mutex
 	aiCache    = map[string]aiCacheEntry{}
+
+	// aiSchemaRejected remembers providers that refused json_schema, keyed by
+	// base URL + model. Without it every draw burned one request on a mode the
+	// gateway always rejects — on agentrouter that is a 400 per generate, and
+	// the retry budget is not free on free tiers. Providers do learn new
+	// features, so the memo expires.
+	aiSchemaMu       sync.Mutex
+	aiSchemaRejected = map[string]time.Time{}
 )
+
+// aiSchemaRejectTTL is how long a refusal is remembered. Long enough to stop
+// paying for it on every draw of a session, short enough to notice an upgrade.
+const aiSchemaRejectTTL = 6 * time.Hour
+
+func aiSchemaKey(base, model string) string {
+	return strings.TrimSuffix(base, "/") + "|" + model
+}
+
+func aiSchemaBlocked(base, model string) bool {
+	aiSchemaMu.Lock()
+	defer aiSchemaMu.Unlock()
+	at, ok := aiSchemaRejected[aiSchemaKey(base, model)]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > aiSchemaRejectTTL {
+		delete(aiSchemaRejected, aiSchemaKey(base, model))
+		return false
+	}
+	return true
+}
+
+func aiMarkSchemaBlocked(base, model string) {
+	aiSchemaMu.Lock()
+	defer aiSchemaMu.Unlock()
+	aiSchemaRejected[aiSchemaKey(base, model)] = time.Now()
+}
 
 type aiCacheEntry struct {
 	raw string
@@ -857,6 +893,8 @@ func callOpenAIWithMessages(ctx context.Context, base, key, model string, messag
 	// Strict schema first (guaranteed-valid JSON on providers that support
 	// Structured Outputs); gateways that reject it fall back to lenient
 	// json_object, then to plain instructions — parseAIOutput tolerates fences.
+	// A gateway known to refuse json_schema skips straight to json_object, so
+	// a mode that always fails does not cost a request on every draw.
 	modes := []map[string]any{
 		{
 			"type": "json_schema",
@@ -899,6 +937,9 @@ func callOpenAIWithMessages(ctx context.Context, base, key, model string, messag
 	}
 	var lastErr error
 	for _, mode := range modes {
+		if mode["type"] == "json_schema" && aiSchemaBlocked(base, model) {
+			continue
+		}
 		// Only schema/format rejections fall through to the next mode.
 		body, _ := json.Marshal(map[string]any{
 			"model":           model,
@@ -914,6 +955,9 @@ func callOpenAIWithMessages(ctx context.Context, base, key, model string, messag
 		}
 		if !isSchemaRejection(err) {
 			return "", err
+		}
+		if mode["type"] == "json_schema" {
+			aiMarkSchemaBlocked(base, model)
 		}
 		lastErr = err
 	}
@@ -931,9 +975,29 @@ func callOpenAIWithMessages(ctx context.Context, base, key, model string, messag
 
 func isSchemaRejection(err error) bool {
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "json_validate_failed") ||
+	if strings.Contains(msg, "json_validate_failed") ||
 		strings.Contains(msg, "response_format") ||
-		strings.Contains(msg, "json_schema")
+		strings.Contains(msg, "json_schema") {
+		return true
+	}
+	// Some gateways reject structured output with a generic 400 that names
+	// nothing but the model, e.g. {"message":"[400]: {\"model\":\"x\"}"} from
+	// agentrouter. Nothing in that body says response_format, so the checks
+	// above miss it and the draw dies instead of falling back to json_object.
+	// A 400/422 on the schema attempt is treated as a rejection: the schema is
+	// the most exotic parameter of the three modes, so it is the likeliest
+	// culprit, and the plain mode still runs if json_object fails too.
+	if strings.Contains(msg, "http 400") || strings.Contains(msg, "http 422") {
+		// Only when the body echoes the request instead of explaining a real
+		// problem: agentrouter answers a rejected schema with
+		// {"message":"[400]: {\"model\":\"x\"}"} — the payload sent back minus
+		// everything that was wrong. A genuine 400 (unknown model, bad key,
+		// context too long) names the problem, and retrying those would just
+		// burn a second call before failing anyway.
+		return strings.Contains(msg, `{\"model\"`) || strings.Contains(msg, `{"model"`) ||
+			strings.Contains(msg, "invalid_request_error")
+	}
+	return false
 }
 
 // sseToJSON normalizes a text/event-stream body into the single JSON

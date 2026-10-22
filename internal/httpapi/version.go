@@ -13,7 +13,7 @@ import (
 // the new code is live, an unchanged one proves the deploy did not land.
 //
 // Keep it short, no spaces — it travels in logs and chat messages.
-var BuildTag = "313cf0e-cap-fix"
+var BuildTag = "json-schema-fallback"
 
 // startedAt marks process start. A fresh value proves the process restarted,
 // which separates "new code deployed" from "same process still answering".
