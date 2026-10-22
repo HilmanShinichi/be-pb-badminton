@@ -1247,6 +1247,60 @@ func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount in
 	return rest
 }
 
+// Generate strategies decide how a draw treats players who are still on court.
+//
+// strategyLeveling keeps them in the pool (bench-first), so an odd pool can
+// still fill its cards and play counts keep levelling up.
+// strategyRest drops them entirely: nobody is scheduled while their match is
+// still PLAYING. Fewer cards is acceptable, an incomplete card is not.
+const (
+	strategyLeveling = "leveling"
+	strategyRest     = "rest"
+)
+
+// normalizeStrategy returns the canonical strategy name, or "" when the value
+// is not one of the supported names. An empty request means leveling, the
+// behaviour every existing caller expects.
+func normalizeStrategy(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", strategyLeveling, "level":
+		return strategyLeveling
+	case strategyRest, "istirahat":
+		return strategyRest
+	}
+	return ""
+}
+
+// dropBench removes players the resting strategy must not schedule: anyone
+// whose match is still PLAYING, and anyone who played the last wave. Both
+// would otherwise start a second game in a row. Leveling keeps them instead
+// and merely benches them first, which is why an odd pool there can still
+// fill every court.
+func dropBench(players []aiPlayer, bench map[string]bool, strategy string) []aiPlayer {
+	if strategy != strategyRest || len(bench) == 0 {
+		return players
+	}
+	out := make([]aiPlayer, 0, len(players))
+	for _, p := range players {
+		if !bench[p.ID] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// requireDrawable rejects a draw that cannot fill a single 2v2.
+func requireDrawable(n int, strategy string) error {
+	if n >= 4 {
+		return nil
+	}
+	if strategy == strategyRest {
+		return httpx.Unprocessable("Mode istirahat: cuma " + strconv.Itoa(n) +
+			" pemain yang sudah turun dari lapangan. Selesaikan kartu yang berjalan dulu, atau pakai mode leveling.")
+	}
+	return httpx.Unprocessable("Not enough players to build a 2v2 matchup.")
+}
+
 // orderPendingsByLoad applies the tired-first/load-first wave order to
 // locally drawn rounds (the AI-answer path is ordered before validating).
 // Waves are renumbered after sorting and referees re-picked for the new
@@ -1790,13 +1844,19 @@ func (s *Service) savePendings(ctx context.Context, id string, pendings []pendin
 func (s *Service) Generate(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Rounds    int  `json:"rounds"`
-		Round     int  `json:"round"`
-		TopUp     bool `json:"topup"`
-		PlayedCap *int `json:"played_cap"`
-		CatchUp   bool `json:"catchup"`
+		Rounds    int    `json:"rounds"`
+		Round     int    `json:"round"`
+		TopUp     bool   `json:"topup"`
+		PlayedCap *int   `json:"played_cap"`
+		CatchUp   bool   `json:"catchup"`
+		Strategy  string `json:"strategy"`
 	}
 	_ = httpx.Decode(c, &in)
+	strategy := normalizeStrategy(in.Strategy)
+	if strategy == "" {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Strategy tidak dikenal. Pakai \"leveling\" atau \"rest\"."))
+	}
+	restStrategy := strategy == strategyRest
 	if in.Rounds <= 0 {
 		in.Rounds = 1
 	}
@@ -1858,6 +1918,12 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// drawing for whoever is under their cap and top the last card up from
 	// capped players when the leftovers cannot make a 2v2 alone.
 	coverageN := len(pool)
+	// coverageDefault is what every iteration resets coverage to: the whole
+	// pool normally, the filtered subset in cap/catch-up mode, and the
+	// allowance pool once the planned rounds are spent. Without this the loop
+	// reset it to len(pool) and the allowance validator demanded full coverage
+	// from a deliberately partial pool.
+	coverageDefault := len(pool)
 	allowance := false
 	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds && !in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable(
@@ -1874,8 +1940,25 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		}
 		aiPlayers = sub
 		coverageN = len(sub)
+		coverageDefault = len(sub)
 		if in.Rounds > cards {
 			in.Rounds = cards
+		}
+	}
+	// Resting strategy: players still on court, and players from the last
+	// wave, are not scheduled at all — that is the whole point of the mode.
+	// Leveling keeps them in the pool and only benches them first.
+	if restStrategy {
+		bench := liveSetFor(matches)
+		for id := range restSetFor(matches, nil, maxRound+1, gb.wavesPerRound) {
+			bench[id] = true
+		}
+		aiPlayers = dropBench(aiPlayers, bench, strategy)
+		if !allowance {
+			coverageN, coverageDefault = len(aiPlayers), len(aiPlayers)
+		}
+		if err := requireDrawable(len(aiPlayers), strategy); err != nil {
+			return httpx.WriteAppError(c, err)
 		}
 	}
 
@@ -1907,6 +1990,10 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// requireNewcomers, coverageN) are synced at the top of each iteration
 	// because top-up can grow the pool mid-loop.
 	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts, useReferee: gb.useReferee, caps: gb.caps, eventMax: gb.maxRounds}
+	// playerBase is the pool before any per-round benching: each iteration in
+	// resting mode re-filters from here, so round 2 of a multi-round request
+	// also skips the wave drawn in round 1.
+	playerBase := aiPlayers
 	// Live players (still PLAYING, in any round) rest in every round
 	// prepared while their games run. Static per request: statuses here
 	// never change mid-loop (new rounds are stored UPCOMING).
@@ -1918,7 +2005,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		// TopUp adds matches for pool members missing from a NON-empty round
 		// (late arrivals) without touching its existing matches.
 		roundNo := maxRound + i + 1
-		coverageN = len(pool)
+		coverageN = coverageDefault
 		waveBase := 0
 		borrowAllow = map[string]bool{}
 		requireNewcomers = []string{}
@@ -2065,6 +2152,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				}
 				aiPlayers = sub
 				coverageN = len(sub)
+				coverageDefault = len(sub)
 			} else if exists {
 				return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
 			}
@@ -2086,6 +2174,34 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				restNames = append(restNames, p.Name)
 			}
 		}
+		// Resting mode re-filters the pool each round: the wave just drawn in
+		// this same request must sit out the next one too, otherwise a 5-round
+		// request would schedule the same people back to back.
+		if restStrategy && !in.TopUp {
+			aiPlayers = append([]aiPlayer{}, playerBase...)
+			drop := map[string]bool{}
+			for id := range rest {
+				drop[id] = true
+			}
+			// Pendings just accepted also count as the newest wave.
+			if pRound, pWave, ok := lastPendingWave(pendings, roundNo); ok {
+				for _, p := range pendings {
+					if p.round != pRound || p.wave != pWave {
+						continue
+					}
+					for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
+						drop[id] = true
+					}
+				}
+			}
+			aiPlayers = dropBench(aiPlayers, drop, strategy)
+			if !allowance {
+				coverageN, coverageDefault = len(aiPlayers), len(aiPlayers)
+			}
+			if err := requireDrawable(len(aiPlayers), strategy); err != nil {
+				return httpx.WriteAppError(c, err)
+			}
+		}
 		// Refresh load counts (earlier rounds generated just now count too).
 		for i := range aiPlayers {
 			aiPlayers[i].Played = playedCounts[aiPlayers[i].ID]
@@ -2096,6 +2212,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			// but at most 3 play); leveling plus load-first ordering protect
 			// the required level, leftovers sit by arrival rotation.
 			coverageN = len(aiPlayers)
+			coverageDefault = len(aiPlayers)
 		}
 		// Sync per-round validation state (top-up may have rebuilt the pool).
 		v.pool, v.borrowAllow, v.requireNewcomers, v.coverageN = pool, borrowAllow, requireNewcomers, coverageN
@@ -2240,11 +2357,16 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Round     int  `json:"round"`
-		PlayedCap *int `json:"played_cap"`
-		CatchUp   bool `json:"catchup"`
+		Round     int    `json:"round"`
+		PlayedCap *int   `json:"played_cap"`
+		CatchUp   bool   `json:"catchup"`
+		Strategy  string `json:"strategy"`
 	}
 	_ = httpx.Decode(c, &in)
+	strategy := normalizeStrategy(in.Strategy)
+	if strategy == "" {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Strategy tidak dikenal. Pakai \"leveling\" atau \"rest\"."))
+	}
 	if in.PlayedCap != nil && in.CatchUp {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan, filter jumlah main, atau perataan."))
 	}
@@ -2299,19 +2421,37 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 		promptPlayers = sub
 	}
 	applyCaps(promptPlayers, gb.caps, gb.maxRounds)
-	prompt := aiSystemPrompt + "\n\n" + buildUserPrompt(promptPlayers, gb.history, gb.softHistory, 1, 0, restNamesFor(gb.pool, rest), "", gb.pool)
-	return httpx.OK(c, http.StatusOK, map[string]any{"round": roundNo, "prompt": prompt})
-}
-
-// restNamesFor maps a rest set of player IDs to pool names for the prompt.
-func restNamesFor(pool []poolPlayer, rest map[string]bool) []string {
-	names := []string{}
-	for _, p := range pool {
-		if rest[p.ID] {
-			names = append(names, p.Name)
+	if strategy == strategyRest {
+		// Resting mode: the bench is not offered to the model at all, so it
+		// cannot put a just-played player back on court.
+		bench := map[string]bool{}
+		for id := range rest {
+			bench[id] = true
+		}
+		promptPlayers = dropBench(promptPlayers, bench, strategy)
+		if err := requireDrawable(len(promptPlayers), strategy); err != nil {
+			return httpx.WriteAppError(c, err)
+		}
+		for i := range promptPlayers {
+			promptPlayers[i].Index = i
 		}
 	}
-	return names
+	// Resting mode already removed the bench from the player list, so naming
+	// them again as "rest these first" would reference players the model
+	// cannot see. Only leveling needs the hint.
+	restNames := []string{}
+	if strategy == strategyLeveling {
+		for _, p := range gb.pool {
+			if rest[p.ID] {
+				restNames = append(restNames, p.Name)
+			}
+		}
+	}
+	prompt := aiSystemPrompt + "\n\n" + buildUserPrompt(promptPlayers, gb.history, gb.softHistory, 1, 0, restNames, "", gb.pool)
+	if strategy == strategyRest {
+		prompt += "\nMode istirahat: jangan memakai pemain yang masih bermain atau baru selesai di wave terakhir. Pakai hanya daftar di atas."
+	}
+	return httpx.OK(c, http.StatusOK, map[string]any{"round": roundNo, "strategy": strategy, "prompt": prompt})
 }
 
 // ManualGenerate validates a pasted web-AI answer through the same pipeline
@@ -2329,9 +2469,14 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		Raw       string `json:"raw"`
 		PlayedCap *int   `json:"played_cap"`
 		CatchUp   bool   `json:"catchup"`
+		Strategy  string `json:"strategy"`
 	}
 	if err := httpx.Decode(c, &in); err != nil {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Paste the AI answer as text.")
+	}
+	strategy := normalizeStrategy(in.Strategy)
+	if strategy == "" {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Strategy tidak dikenal. Pakai \"leveling\" atau \"rest\"."))
 	}
 	if _, err := uuid.Parse(id); err != nil {
 		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
@@ -2394,6 +2539,23 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		mPlayers, mCoverage = sub, len(sub)
 	}
 	applyCaps(mPlayers, gb.caps, gb.maxRounds)
+	if strategy == strategyRest {
+		// Resting mode: a pasted answer may not use anyone who is still on
+		// court or just came off. Shrinking the accepted pool makes the
+		// validator reject those references instead of scheduling them.
+		bench := liveSetFor(gb.matches)
+		for id := range restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound) {
+			bench[id] = true
+		}
+		mPlayers = dropBench(mPlayers, bench, strategy)
+		mCoverage = len(mPlayers)
+		if err := requireDrawable(len(mPlayers), strategy); err != nil {
+			return httpx.WriteAppError(c, err)
+		}
+		for i := range mPlayers {
+			mPlayers[i].Index = i
+		}
+	}
 	// 1) Valid JSON (or a readable team table)?
 	out, perr := parseAIOutput(raw)
 	if perr != nil {

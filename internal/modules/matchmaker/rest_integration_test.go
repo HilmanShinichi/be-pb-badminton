@@ -199,6 +199,60 @@ func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
 	}
 }
 
+// TestIntegrationStrategyRestRealEvent checks resting mode on the real event:
+// the draw pool must contain nobody who is still on court or played the last
+// wave, and it must be strictly smaller than the leveling pool (which keeps
+// them and only benches them first). Read-only.
+func TestIntegrationStrategyRestRealEvent(t *testing.T) {
+	if os.Getenv("INTEGRATION_DB") != "1" {
+		t.Skip("set INTEGRATION_DB=1 to run against the real database")
+	}
+
+	pool := testDBPool(t)
+	s := &Service{db: pool, cfg: config.Config{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const eventID = "d5e11c16-9d05-4651-8a8a-7bf8b4f2418c"
+	gb, err := s.loadGenBase(ctx, eventID)
+	if err != nil {
+		t.Fatalf("loadGenBase: %v", err)
+	}
+
+	rest := restSetFor(gb.matches, nil, gb.maxRound+1, gb.wavesPerRound)
+	live := liveSetFor(gb.matches)
+	bench := map[string]bool{}
+	for id := range rest {
+		bench[id] = true
+	}
+	for id := range live {
+		bench[id] = true
+	}
+
+	leveling := gb.aiPlayers
+	resting := dropBench(gb.aiPlayers, bench, strategyRest)
+
+	t.Logf("pool=%d bench=%d (rest=%d live=%d) leveling=%d resting=%d",
+		len(gb.aiPlayers), len(bench), len(rest), len(live), len(leveling), len(resting))
+
+	if len(bench) == 0 {
+		t.Skip("no live or last-wave players right now — nothing to bench")
+	}
+	for _, p := range resting {
+		if bench[p.ID] {
+			t.Errorf("%s is on the bench (live or last wave) but entered the resting draw", p.Name)
+		}
+	}
+	// Leveling must keep them, otherwise the two modes would be identical and
+	// the toggle would be pointless.
+	if len(leveling) != len(gb.aiPlayers) {
+		t.Errorf("leveling dropped players: %d of %d", len(leveling), len(gb.aiPlayers))
+	}
+	if len(resting) >= len(leveling) {
+		t.Errorf("resting pool (%d) should be smaller than leveling (%d)", len(resting), len(leveling))
+	}
+}
+
 // TestIntegrationSoftScopeRealPeriod checks the cross-week no-repeat guard on
 // the real period: every matchup of the three most recent earlier events enters
 // softSeen, while the prompt list stays capped. Read-only.
