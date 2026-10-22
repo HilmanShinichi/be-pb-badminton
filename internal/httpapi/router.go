@@ -55,6 +55,8 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		return c.SendString("ok")
 	})
+	// Deploy check: no auth, no DB. Bump BuildTag in the same commit as a fix.
+	app.Get("/version", Version)
 
 	v1 := app.Group("/api/v1")
 	v1.Post("/auth/login", deps.Auth.Login)
