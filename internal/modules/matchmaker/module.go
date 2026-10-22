@@ -1574,12 +1574,88 @@ func (s *Service) catchupPlayers(ctx context.Context, id string, gb *genBase) ([
 	return catchupSubset(gb.pool, counts, target, gb.caps)
 }
 
+// allowancePick chooses who plays once the planned rounds are spent. It walks
+// the play counts upward from the lowest and stops as soon as a full card can
+// be filled, so the short-changed players catch up before anyone above them
+// plays again: with four players on 3x and the rest already on 5x, exactly
+// those four play — nobody's allowance is raised just because other people
+// have more games. A level that spills past a card leaves its extras on the
+// bench, which self-corrects because their count is then the lowest and they
+// lead the next draw. Only when fewer than four players sit below their cap at
+// all does the card borrow from the capped ones, nearest to their limit first.
+//
+// The result keeps arrival order: the prompt lists players by position and the
+// late-arrival rule reads the same index.
+func allowancePick(pool []poolPlayer, playedOf map[string]int, caps map[string]int, eventMax int) ([]poolPlayer, error) {
+	posOf := map[string]int{}
+	for i, p := range pool {
+		posOf[p.ID] = i
+	}
+
+	under := []poolPlayer{}
+	capped := []poolPlayer{}
+	for _, p := range pool {
+		lim := effCap(caps, eventMax, p.ID)
+		if lim > 0 && playedOf[p.ID] >= lim {
+			capped = append(capped, p)
+			continue
+		}
+		under = append(under, p)
+	}
+	if len(under) == 0 {
+		return nil, httpx.Unprocessable(
+			"Semua pemain sudah mencapai batas main (" + strconv.Itoa(eventMax) + "x). Naikkan batas match di pengaturan event untuk lanjut.")
+	}
+
+	// Fewest games first, so the draw opens with whoever is behind.
+	sort.SliceStable(under, func(i, j int) bool {
+		if playedOf[under[i].ID] != playedOf[under[j].ID] {
+			return playedOf[under[i].ID] < playedOf[under[j].ID]
+		}
+		return posOf[under[i].ID] < posOf[under[j].ID]
+	})
+
+	// Walk up the count levels until a card can be filled, then trim to whole
+	// cards. The lowest level always goes in first; only when it cannot fill a
+	// card alone is the next level pulled in, and only as far as the card
+	// needs. Extras left over from a level sit out and lead the next draw,
+	// because their count is then the lowest.
+	take := 0
+	for take < len(under) && take < 4 {
+		lvl := playedOf[under[take].ID]
+		for take < len(under) && playedOf[under[take].ID] == lvl {
+			take++
+		}
+	}
+	picked := under[:take]
+	if cards := take / 4; cards > 0 {
+		picked = under[:cards*4]
+	} else {
+		// Too few players below the cap to fill a card: borrow the minimum
+		// from capped players so the low ones still get on court.
+		sort.SliceStable(capped, func(i, j int) bool {
+			if playedOf[capped[i].ID] != playedOf[capped[j].ID] {
+				return playedOf[capped[i].ID] < playedOf[capped[j].ID]
+			}
+			return posOf[capped[i].ID] < posOf[capped[j].ID]
+		})
+		need := 4 - len(picked)
+		if need > len(capped) {
+			need = len(capped)
+		}
+		picked = append(append([]poolPlayer{}, picked...), capped[:need]...)
+	}
+	picked = append([]poolPlayer{}, picked...)
+	sort.SliceStable(picked, func(i, j int) bool {
+		return posOf[picked[i].ID] < posOf[picked[j].ID]
+	})
+	return picked, nil
+}
+
 // allowancePlayers builds the draw pool once an event's planned rounds are
 // used up. max_rounds is an allowance per player, not a wave count: a
 // 29-player night spends five waves inside its first round, so the round label
-// runs out long before the players do. Everyone still under their personal cap
-// plays; capped players fill the last card only when the leftovers cannot make
-// a 2v2 by themselves ("kalau memang sudah habis yang 3-nya").
+// runs out long before the players do.
 //
 // It returns the pool and how many cards that pool can support.
 func (s *Service) allowancePlayers(ctx context.Context, id string, gb *genBase) ([]aiPlayer, int, error) {
@@ -1591,45 +1667,11 @@ func (s *Service) allowancePlayers(ctx context.Context, id string, gb *genBase) 
 	for _, c := range counts {
 		playedOf[c.PlayerID] = c.Played
 	}
-	posOf := map[string]int{}
-	for i, p := range gb.pool {
-		posOf[p.ID] = i
-	}
 
-	under := []poolPlayer{}
-	capped := []poolPlayer{}
-	for _, p := range gb.pool {
-		lim := effCap(gb.caps, gb.maxRounds, p.ID)
-		if lim > 0 && playedOf[p.ID] >= lim {
-			capped = append(capped, p)
-			continue
-		}
-		under = append(under, p)
+	picked, err := allowancePick(gb.pool, playedOf, gb.caps, gb.maxRounds)
+	if err != nil {
+		return nil, 0, err
 	}
-	if len(under) == 0 {
-		return nil, 0, httpx.Unprocessable(
-			"Semua pemain sudah mencapai batas main (" + strconv.Itoa(gb.maxRounds) + "x). Naikkan batas match di pengaturan event untuk lanjut.")
-	}
-
-	// Borrow the fewest capped players needed to round the group up to a 2v2.
-	// Prefer the ones closest to the cap so the leveling gap stays small.
-	need := (4 - len(under)%4) % 4
-	if need > len(capped) {
-		need = len(capped)
-	}
-	sort.SliceStable(capped, func(i, j int) bool {
-		if playedOf[capped[i].ID] != playedOf[capped[j].ID] {
-			return playedOf[capped[i].ID] < playedOf[capped[j].ID]
-		}
-		return posOf[capped[i].ID] < posOf[capped[j].ID]
-	})
-
-	picked := append(append([]poolPlayer{}, under...), capped[:need]...)
-	// Keep the pool in arrival order: the prompt lists players by position and
-	// the late-arrival rule reads the same index.
-	sort.SliceStable(picked, func(i, j int) bool {
-		return posOf[picked[i].ID] < posOf[picked[j].ID]
-	})
 
 	sub := make([]aiPlayer, 0, len(picked))
 	for i, p := range picked {
