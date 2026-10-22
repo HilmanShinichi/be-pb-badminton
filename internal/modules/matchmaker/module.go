@@ -1010,6 +1010,15 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 		return nil, &httpx.AppError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "Could not load history."}
 	}
 	gb.matches = matches
+	// Counts must match what the UI shows: base_played (matches credited from
+	// a previous session) plus manual adjustments, on top of the stored rows.
+	// Skipping them made every cap check off by base_played — on the real
+	// event a player on 5x looked like 4x, so the draw happily scheduled a
+	// sixth game for someone already at their limit.
+	adjust, err := s.countAdjustments(ctx, id)
+	if err != nil {
+		return nil, &httpx.AppError{Status: http.StatusInternalServerError, Code: "INTERNAL_ERROR", Message: "Could not load play counts."}
+	}
 	for i, p := range pool {
 		gb.aiPlayers = append(gb.aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
 	}
@@ -1022,19 +1031,34 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 			return out
 		}
 		gb.history = append(gb.history, aiHistoryMatch{Round: m.Round, Team1: idsOfTeam(m.Team1), Team2: idsOfTeam(m.Team2)})
+		// Only cards that actually ran count toward a player's allowance, which
+		// is what playerCounts and the UI show. UPCOMING rows are a plan, not a
+		// game: counting them made a drawn-but-unsaved round inflate every
+		// count by one and could push a 5x player to 6x.
+		if m.Status == "ENDED" || m.Status == "PLAYING" {
+			for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+				gb.playedCounts[t.PlayerID]++
+			}
+		}
 		ids := []string{}
 		for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
 			ids = append(ids, t.PlayerID)
-			gb.playedCounts[t.PlayerID]++
 		}
 		gb.seen[matchupKey(ids[:2], ids[2:])] = true
 		if m.Round > gb.maxRound {
 			gb.maxRound = m.Round
 		}
 	}
-	// Load signal for the AI: lowest played count plays first.
+	// Load signal for the AI: lowest played count plays first. base_played and
+	// manual adjustments count too, so this matches the Played column the UI
+	// renders and the cap arithmetic below.
 	for i := range gb.aiPlayers {
-		gb.aiPlayers[i].Played = gb.playedCounts[gb.aiPlayers[i].ID]
+		id := gb.aiPlayers[i].ID
+		gb.playedCounts[id] += gb.basePlayed + adjust[id].Played
+		if gb.playedCounts[id] < 0 {
+			gb.playedCounts[id] = 0
+		}
+		gb.aiPlayers[i].Played = gb.playedCounts[id]
 	}
 	applyCaps(gb.aiPlayers, gb.caps, gb.maxRounds)
 	// Soft cross-week guard: recent events of the same period (via
@@ -1272,10 +1296,13 @@ func normalizeStrategy(v string) string {
 }
 
 // dropBench removes players the resting strategy must not schedule: anyone
-// whose match is still PLAYING, and anyone who played the last wave. Both
-// would otherwise start a second game in a row. Leveling keeps them instead
-// and merely benches them first, which is why an odd pool there can still
-// fill every court.
+// whose match is still PLAYING, anyone who played the last wave, and anyone
+// who has no allowance left. All three would otherwise start a game the mode
+// is supposed to prevent — a second game in a row, or a sixth game for a
+// player whose limit is five. Leveling keeps the first two in the pool and
+// merely benches them first, which is why an odd pool there can still fill
+// every court; at-cap players stay visible there so coverage can force them in
+// when bodies run short.
 func dropBench(players []aiPlayer, bench map[string]bool, strategy string) []aiPlayer {
 	if strategy != strategyRest || len(bench) == 0 {
 		return players
@@ -1287,6 +1314,46 @@ func dropBench(players []aiPlayer, bench map[string]bool, strategy string) []aiP
 		}
 	}
 	return out
+}
+
+// cappedSet collects players with no allowance left: an explicit personal cap
+// wins, else the event limit. Everyone in it would break their own limit by
+// playing one more game, so no draw may schedule them.
+func cappedSet(players []aiPlayer, played map[string]int, caps map[string]int, eventMax int) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range players {
+		if lim := effCap(caps, eventMax, p.ID); lim > 0 && played[p.ID] >= lim {
+			out[p.ID] = true
+		}
+	}
+	return out
+}
+
+// enforceCaps drops players who have already used their allowance. A cap is a
+// hard limit: a player on 5x with max_rounds 5 must never be offered to the
+// model, or it schedules them for a sixth game — which is exactly what happened
+// on the real event, where four capped players were drawn while Hari (2x) and
+// Ivan (3x) sat out.
+//
+// Capped players are still reachable when the remaining group cannot fill a
+// single 2v2: then the pool is returned untouched and allowancePick (or the
+// coverage rule) borrows the minimum needed. Fewer than four under-cap players
+// means there is no legal card without a borrow.
+func enforceCaps(players []aiPlayer, played map[string]int, caps map[string]int, eventMax int) []aiPlayer {
+	capped := cappedSet(players, played, caps, eventMax)
+	if len(capped) == 0 {
+		return players
+	}
+	under := make([]aiPlayer, 0, len(players))
+	for _, p := range players {
+		if !capped[p.ID] {
+			under = append(under, p)
+		}
+	}
+	if len(under) < 4 {
+		return players
+	}
+	return under
 }
 
 // requireDrawable rejects a draw that cannot fill a single 2v2.
@@ -1996,11 +2063,20 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			bench[id] = true
 		}
 		aiPlayers = dropBench(aiPlayers, bench, strategy)
+		aiPlayers = enforceCaps(aiPlayers, playedCounts, gb.caps, gb.maxRounds)
 		if !allowance {
 			coverageN, coverageDefault = len(aiPlayers), len(aiPlayers)
 		}
 		if err := requireDrawable(len(aiPlayers), strategy); err != nil {
 			return httpx.WriteAppError(c, err)
+		}
+	} else {
+		// Leveling also never schedules a capped player while somebody is
+		// still short of their allowance: the whole mode exists to even the
+		// counts out, and a sixth game for a 5x player is the opposite.
+		aiPlayers = enforceCaps(aiPlayers, playedCounts, gb.caps, gb.maxRounds)
+		if !allowance {
+			coverageN, coverageDefault = len(aiPlayers), len(aiPlayers)
 		}
 	}
 
@@ -2471,9 +2547,15 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 			bench[id] = true
 		}
 		promptPlayers = dropBench(promptPlayers, bench, strategy)
+		promptPlayers = enforceCaps(promptPlayers, gb.playedCounts, gb.caps, gb.maxRounds)
 		if err := requireDrawable(len(promptPlayers), strategy); err != nil {
 			return httpx.WriteAppError(c, err)
 		}
+		for i := range promptPlayers {
+			promptPlayers[i].Index = i
+		}
+	} else {
+		promptPlayers = enforceCaps(promptPlayers, gb.playedCounts, gb.caps, gb.maxRounds)
 		for i := range promptPlayers {
 			promptPlayers[i].Index = i
 		}
@@ -2590,6 +2672,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 			bench[id] = true
 		}
 		mPlayers = dropBench(mPlayers, bench, strategy)
+		mPlayers = enforceCaps(mPlayers, gb.playedCounts, gb.caps, gb.maxRounds)
 		mCoverage = len(mPlayers)
 		if err := requireDrawable(len(mPlayers), strategy); err != nil {
 			return httpx.WriteAppError(c, err)
