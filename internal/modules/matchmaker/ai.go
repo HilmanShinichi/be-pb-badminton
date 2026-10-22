@@ -116,10 +116,14 @@ const aiSystemPrompt = `You organize balanced badminton doubles (2v2) matchups. 
 const (
 	aiMinCallGap = 8 * time.Second
 	aiCacheTTL   = 10 * time.Minute
-	// 2500: a full 7-match draw is ~700 tokens, but chatty combo models
-	// spend tokens on prose/reasoning first — a tight budget truncates
-	// them into partial coverage ("only X of Y players").
-	aiMaxTokens = 2500
+	// aiMaxTokens is a CEILING, biggest budget first. Reasoning models
+	// (deepseek-v4-flash, gpt-oss, o-series) bill their private thinking to
+	// this same number, and a full leveling draw costs 2100-6500 reasoning
+	// tokens before the answer starts. With a flat 2500 the budget ran out
+	// mid-thought: finish_reason "length", content "" — which surfaced as
+	// "balasan bukan JSON" with no clue why. A real 10-match draw is ~700
+	// tokens of answer, so the extra headroom is only ever spent on thinking.
+	aiMaxTokens = 16000
 )
 
 var (
@@ -1053,6 +1057,11 @@ func doOpenAICall(ctx context.Context, base, key string, body []byte) (string, e
 			Message struct {
 				Content string `json:"content"`
 			} `json:"message"`
+			// Truncation is reported here, not as an error: a reasoning
+			// model that spends the whole budget thinking returns 200 with
+			// empty content and finish_reason "length". Without this the
+			// caller only saw "" and reported "not valid JSON".
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Error *struct {
 			Message string `json:"message"`
@@ -1067,7 +1076,23 @@ func doOpenAICall(ctx context.Context, base, key string, body []byte) (string, e
 	if len(res.Choices) == 0 {
 		return "", httpx.BadRequest("AI_PROVIDER_ERROR", "AI provider returned no choices.")
 	}
-	return res.Choices[0].Message.Content, nil
+	content := res.Choices[0].Message.Content
+	if strings.TrimSpace(content) == "" {
+		// Empty content is never a JSON problem: either the budget ran out
+		// mid-thought (length) or the model emitted nothing (stop/filter).
+		// Name the real cause so the UI stops blaming the parser.
+		switch res.Choices[0].FinishReason {
+		case "length":
+			return "", httpx.BadRequest("AI_PROVIDER_ERROR",
+				"AI kehabisan token sebelum sempat menulis jawaban (model reasoning). Coba generate lagi.")
+		case "content_filter":
+			return "", httpx.BadRequest("AI_PROVIDER_ERROR", "AI menolak menjawab (content filter).")
+		default:
+			return "", httpx.BadRequest("AI_PROVIDER_ERROR",
+				"AI membalas kosong (finish_reason="+res.Choices[0].FinishReason+"). Coba generate lagi.")
+		}
+	}
+	return content, nil
 }
 
 func callClaude(ctx context.Context, base, key, model, user string) (string, error) {
@@ -1152,7 +1177,10 @@ func isWrappedRateLimit(status int, body []byte) bool {
 // final outcome, or (done=false, wait, nil) when the caller should wait and
 // retry after a 429.
 func postJSONOnce(ctx context.Context, url, bearer, apiKey string, body []byte, out any, normalize func([]byte) []byte) (bool, time.Duration, error) {
-	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	// A reasoning model burns 2-6.5k tokens thinking before it writes the
+	// answer, so a 25s cap cut real draws off mid-answer. The outer request
+	// context still bounds the whole generate; this only bounds one call.
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	fail := func(err error) (bool, time.Duration, error) { return true, 0, err }
 	if err := aiThrottle(ctx); err != nil {
