@@ -148,7 +148,6 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	events.Post("/:id/generate-prompt", deps.MatchMaker.GeneratePrompt)
 	events.Post("/:id/generate-manual", deps.MatchMaker.ManualGenerate)
 	events.Post("/:id/players", deps.MatchMaker.AddEventPlayers)
-	events.Delete("/:id/rounds/:round", deps.MatchMaker.DeleteRound)
 
 	genMatches := authed.Group("/generated-matches", httpx.RequirePerm(httpx.PermMatchmaker))
 	genMatches.Post("/", deps.MatchMaker.CreateMatch)

@@ -98,7 +98,7 @@ func TestIntegrationRestSetRealEvent(t *testing.T) {
 	}
 
 	live := liveSetFor(gb.matches)
-	rest := restSetFor(gb.matches, nil, gb.maxRound+1, gb.wavesPerRound)
+	rest := restSetFor(gb.matches, nil, gb.wavesPerRound)
 	for id := range live {
 		rest[id] = true
 	}
@@ -107,8 +107,8 @@ func TestIntegrationRestSetRealEvent(t *testing.T) {
 	for _, m := range gb.matches {
 		statuses[m.Status]++
 	}
-	t.Logf("matches=%d status=%v maxRound=%d wavesPerRound=%d basePlayed=%d",
-		len(gb.matches), statuses, gb.maxRound, gb.wavesPerRound, gb.basePlayed)
+	t.Logf("matches=%d status=%v maxWave=%d wavesPerRound=%d basePlayed=%d",
+		len(gb.matches), statuses, gb.maxWave, gb.wavesPerRound, gb.basePlayed)
 	t.Logf("live: %s", names(live))
 	t.Logf("rest: %s", names(rest))
 
@@ -142,8 +142,9 @@ func TestIntegrationRestSetRealEvent(t *testing.T) {
 }
 
 // TestIntegrationAllowanceModeRealEvent checks the per-player allowance draw on
-// the real event: with max_rounds spent, the pool must be everyone still under
-// their cap plus the fewest capped players needed to reach a 2v2. Read-only.
+// the real event: once a player is at their cap, the pool must be everyone
+// still under it plus the fewest capped players needed to reach a 2v2.
+// Read-only.
 func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
 	if os.Getenv("INTEGRATION_DB") != "1" {
 		t.Skip("set INTEGRATION_DB=1 to run against the real database")
@@ -160,9 +161,9 @@ func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
 		t.Fatalf("loadGenBase: %v", err)
 	}
 
-	// Precondition: this is the case the user hit — planned rounds spent.
-	if gb.maxRounds <= 0 || gb.maxRound < gb.maxRounds {
-		t.Skipf("event is not past its round budget (maxRound=%d maxRounds=%d)", gb.maxRound, gb.maxRounds)
+	// Precondition: this is the case the user hit — somebody is at their cap.
+	if gb.maxRounds <= 0 || !gb.allowanceOpen(gb.playedCounts) {
+		t.Skipf("no player is at their cap yet (maxRounds=%d)", gb.maxRounds)
 	}
 
 	sub, cards, err := s.allowancePlayers(ctx, eventID, gb)
@@ -192,8 +193,8 @@ func TestIntegrationAllowanceModeRealEvent(t *testing.T) {
 		under++
 	}
 
-	t.Logf("maxRound=%d maxRounds=%d pool=%d allowancePool=%d under=%d borrowed=%d cards=%d",
-		gb.maxRound, gb.maxRounds, len(gb.pool), len(sub), under, capped, cards)
+	t.Logf("maxWave=%d maxRounds=%d pool=%d allowancePool=%d under=%d borrowed=%d cards=%d",
+		gb.maxWave, gb.maxRounds, len(gb.pool), len(sub), under, capped, cards)
 
 	if len(sub) == 0 {
 		t.Fatalf("allowance pool is empty")
@@ -296,7 +297,7 @@ func TestIntegrationStrategyRestRealEvent(t *testing.T) {
 		t.Fatalf("loadGenBase: %v", err)
 	}
 
-	rest := restSetFor(gb.matches, nil, gb.maxRound+1, gb.wavesPerRound)
+	rest := restSetFor(gb.matches, nil, gb.wavesPerRound)
 	live := liveSetFor(gb.matches)
 	bench := map[string]bool{}
 	for id := range rest {
@@ -351,7 +352,9 @@ func TestIntegrationSoftScopeRealPeriod(t *testing.T) {
 
 	softSeen, softHistory := s.periodRecentSoft(ctx, periodID, eventID)
 
-	// Count what the old query would have produced: last round of each event.
+	// Count what a narrower guard would have produced: only the final wave
+	// of each event (the round column is gone, so the wave is the closest
+	// leftover grouping).
 	var oldStyle int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*)
@@ -360,7 +363,7 @@ func TestIntegrationSoftScopeRealPeriod(t *testing.T) {
 		JOIN mabar_sessions ms ON ms.id = e.source_session_id
 		WHERE ms.period_id = $1
 		  AND m.event_id <> $2
-		  AND m.round = (SELECT MAX(m2.round) FROM generated_matches m2 WHERE m2.event_id = m.event_id)`,
+		  AND m.wave = (SELECT MAX(m2.wave) FROM generated_matches m2 WHERE m2.event_id = m.event_id)`,
 		periodID, eventID).Scan(&oldStyle); err != nil {
 		t.Fatalf("count old scope: %v", err)
 	}
@@ -386,7 +389,7 @@ func TestIntegrationSoftScopeRealPeriod(t *testing.T) {
 	if len(softSeen) == 0 {
 		t.Errorf("expected a non-empty soft set")
 	}
-	// The new scope must cover strictly more cards than the old last-round view.
+	// The new scope must cover strictly more cards than the old last-wave view.
 	if len(softSeen) <= oldStyle {
 		t.Errorf("soft scope did not widen: %d keys vs old %d", len(softSeen), oldStyle)
 	}

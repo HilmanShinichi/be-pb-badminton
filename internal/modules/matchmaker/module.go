@@ -44,7 +44,6 @@ type Referee struct {
 type GenMatch struct {
 	ID              string       `json:"id"`
 	EventID         string       `json:"event_id"`
-	Round           int          `json:"round"`
 	Wave            int          `json:"wave"`
 	Team1           []TeamPlayer `json:"team1"`
 	Team2           []TeamPlayer `json:"team2"`
@@ -108,10 +107,9 @@ type poolPlayer struct {
 	Gender *string
 }
 
-// pending is one validated match waiting to be written: its round, its wave
-// (courts running at the same time), both sides, and the picked referee.
+// pending is one validated match waiting to be written: its wave (courts
+// running at the same time), both sides, and the picked referee.
 type pending struct {
-	round        int
 	wave         int
 	team1, team2 []TeamPlayer
 	referee      *string
@@ -233,13 +231,13 @@ func assignReferees(pool []poolPlayer, out []pending, waves map[int]int, played 
 	}
 }
 
-// localMatchups draws one round locally under the same rules the AI has to
+// localMatchups draws one batch locally under the same rules the AI has to
 // follow: 2v2, mixed doubles, no repeat, and the pool covered apart from the
 // unavoidable sit-outs. It is the fallback whenever the provider is
 // rate-limited or answers with something unusable, so generating never fails
 // just because the model could not be reached.
 func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[string]bool,
-	roundNo, waveBase, wavesPerRound int, played map[string]int,
+	waveBase, wavesPerRound int, played map[string]int,
 	newcomers []string, borrow map[string]bool, useReferee bool, caps map[string]int, eventMax int,
 	rest map[string]bool) ([]pending, error) {
 
@@ -305,7 +303,7 @@ func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[
 		return nil, httpx.Unprocessable("Not enough players to build a 2v2 matchup.")
 	}
 
-	seed := uint64(roundNo)*7919 + uint64(len(playing))*104729 + 1
+	seed := uint64(waveBase)*7919 + uint64(len(playing))*104729 + uint64(len(seen))*14713 + 1
 	rand64 := func() uint64 {
 		seed ^= seed << 13
 		seed ^= seed >> 7
@@ -363,7 +361,7 @@ func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[
 				break
 			}
 			waves[i] = waveBase + i/wavesPerRound + 1
-			out = append(out, pending{round: roundNo, wave: waves[i], team1: t1, team2: t2})
+			out = append(out, pending{wave: waves[i], team1: t1, team2: t2})
 		}
 		if !ok {
 			continue
@@ -381,13 +379,13 @@ func (s *Service) localMatchups(players []aiPlayer, pool []poolPlayer, seen map[
 
 func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT m.id::text, m.event_id::text, m.round, m.wave, m.team1::text, m.team2::text, m.status, m.court,
+		SELECT m.id::text, m.event_id::text, m.wave, m.team1::text, m.team2::text, m.status, m.court,
 		       m.started_at::text, m.ended_at::text, m.shuttlecock_used,
 		       m.referee_id::text, pl.name,
 		       m.created_at::text, m.updated_at::text
 		FROM generated_matches m
 		LEFT JOIN players pl ON pl.id = m.referee_id
-		WHERE m.event_id = $1 ORDER BY m.round, m.wave, m.created_at, m.id`, eventID)
+		WHERE m.event_id = $1 ORDER BY m.wave, m.created_at, m.id`, eventID)
 	if err != nil {
 		return nil, err
 	}
@@ -397,7 +395,7 @@ func (s *Service) listMatches(ctx context.Context, eventID string) ([]GenMatch, 
 		var m GenMatch
 		var t1, t2 string
 		var refID, refName *string
-		if err := rows.Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
+		if err := rows.Scan(&m.ID, &m.EventID, &m.Wave, &t1, &t2, &m.Status, &m.Court,
 			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed,
 			&refID, &refName, &m.CreatedAt, &m.UpdatedAt); err == nil {
 			m.Team1 = parseTeam(t1)
@@ -434,7 +432,7 @@ func (s *Service) eventPeriodID(ctx context.Context, eventID string) (string, bo
 }
 
 // periodRecentSoftEvents is how many earlier events in the same period feed the
-// cross-week no-repeat guard. The guard used to look only at the final round of
+// cross-week no-repeat guard. The guard used to look only at the final batch of
 // each event, which left most repeat matchups unguarded: an event with five
 // waves only contributed its last one.
 const periodRecentSoftEvents = 3
@@ -465,7 +463,7 @@ func (s *Service) periodRecentSoft(ctx context.Context, periodID, currentEventID
 			ORDER BY e.created_at DESC
 			LIMIT $3
 		)
-		SELECT m.round, m.team1::text, m.team2::text, m.created_at
+		SELECT m.team1::text, m.team2::text, m.created_at
 		FROM generated_matches m
 		JOIN recent r ON r.id = m.event_id
 		ORDER BY m.created_at DESC`, periodID, currentEventID, periodRecentSoftEvents)
@@ -474,10 +472,9 @@ func (s *Service) periodRecentSoft(ctx context.Context, periodID, currentEventID
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var round int
 		var t1raw, t2raw string
 		var at time.Time
-		if err := rows.Scan(&round, &t1raw, &t2raw, &at); err != nil {
+		if err := rows.Scan(&t1raw, &t2raw, &at); err != nil {
 			continue
 		}
 		t1 := parseTeam(t1raw)
@@ -498,11 +495,15 @@ func (s *Service) periodRecentSoft(ctx context.Context, periodID, currentEventID
 			}
 			return out
 		}
-		softHistory = append(softHistory, aiHistoryMatch{Round: round, Team1: names(t1), Team2: names(t2)})
+		softHistory = append(softHistory, aiHistoryMatch{Team1: names(t1), Team2: names(t2)})
 	}
 	// Hand the prompt a chronological list; it reads as a timeline.
 	for i, j := 0, len(softHistory)-1; i < j; i, j = i+1, j-1 {
 		softHistory[i], softHistory[j] = softHistory[j], softHistory[i]
+	}
+	// Number the entries chronologically so the prompt can refer to them.
+	for i := range softHistory {
+		softHistory[i].Round = i + 1
 	}
 	return softSeen, softHistory
 }
@@ -595,7 +596,7 @@ func (s *Service) ListEvents(c *fiber.Ctx) error {
 	rows, err := s.db.Query(c.Context(), `
 		SELECT e.id::text, e.name, e.status, e.court_count, e.max_rounds, e.is_public, e.created_at::text,
 		       COALESCE(jsonb_array_length(e.player_ids), 0),
-		       COUNT(m.id), COUNT(DISTINCT m.round)
+		       COUNT(m.id)
 		FROM match_events e
 		LEFT JOIN generated_matches m ON m.event_id = e.id
 		GROUP BY e.id ORDER BY e.created_at DESC, e.id DESC`)
@@ -613,12 +614,11 @@ func (s *Service) ListEvents(c *fiber.Ctx) error {
 		CreatedAt  string `json:"created_at"`
 		Players    int    `json:"players"`
 		Matches    int    `json:"matches"`
-		Rounds     int    `json:"rounds"`
 	}
 	list := []row{}
 	for rows.Next() {
 		var t row
-		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CourtCount, &t.MaxRounds, &t.IsPublic, &t.CreatedAt, &t.Players, &t.Matches, &t.Rounds); err == nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Status, &t.CourtCount, &t.MaxRounds, &t.IsPublic, &t.CreatedAt, &t.Players, &t.Matches); err == nil {
 			list = append(list, t)
 		}
 	}
@@ -910,7 +910,7 @@ func (s *Service) publicEventDetail(ctx context.Context, id string) (MatchEvent,
 // PublicEvents lists events flagged public — the live index.
 func (s *Service) PublicEvents(c *fiber.Ctx) error {
 	rows, err := s.db.Query(c.Context(), `
-		SELECT e.id::text, e.name, e.created_at::text, COUNT(m.id), COUNT(DISTINCT m.round), e.max_rounds
+		SELECT e.id::text, e.name, e.created_at::text, COUNT(m.id), e.max_rounds
 		FROM match_events e
 		LEFT JOIN generated_matches m ON m.event_id = e.id
 		WHERE e.is_public
@@ -924,13 +924,12 @@ func (s *Service) PublicEvents(c *fiber.Ctx) error {
 		Name      string `json:"name"`
 		CreatedAt string `json:"created_at"`
 		Matches   int    `json:"matches"`
-		Rounds    int    `json:"rounds"`
 		MaxRounds int    `json:"max_rounds"`
 	}
 	list := []row{}
 	for rows.Next() {
 		var t row
-		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.Matches, &t.Rounds, &t.MaxRounds); err == nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.CreatedAt, &t.Matches, &t.MaxRounds); err == nil {
 			list = append(list, t)
 		}
 	}
@@ -960,10 +959,25 @@ type genBase struct {
 	matches       []GenMatch
 	wavesPerRound int
 	maxRounds     int
-	maxRound      int
+	maxWave       int
 	basePlayed    int
 	useReferee    bool
 	caps          map[string]int
+}
+
+// allowanceOpen reports whether the event's match limit has already been
+// reached by at least one player. From then on the draw switches to allowance
+// mode: it fills cards for whoever is still below their cap first.
+func (gb *genBase) allowanceOpen(played map[string]int) bool {
+	if gb.maxRounds <= 0 {
+		return false
+	}
+	for _, p := range gb.pool {
+		if lim := gb.capOf(p.ID); lim > 0 && played[p.ID] >= lim {
+			return true
+		}
+	}
+	return false
 }
 
 // capOf resolves a player's personal cap: explicit cap wins, else the event
@@ -1022,7 +1036,7 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 	for i, p := range pool {
 		gb.aiPlayers = append(gb.aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
 	}
-	for _, m := range matches {
+	for i, m := range matches {
 		idsOfTeam := func(team []TeamPlayer) []string {
 			out := []string{}
 			for _, t := range team {
@@ -1030,10 +1044,10 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 			}
 			return out
 		}
-		gb.history = append(gb.history, aiHistoryMatch{Round: m.Round, Team1: idsOfTeam(m.Team1), Team2: idsOfTeam(m.Team2)})
+		gb.history = append(gb.history, aiHistoryMatch{Round: i + 1, Team1: idsOfTeam(m.Team1), Team2: idsOfTeam(m.Team2)})
 		// Only cards that actually ran count toward a player's allowance, which
 		// is what playerCounts and the UI show. UPCOMING rows are a plan, not a
-		// game: counting them made a drawn-but-unsaved round inflate every
+		// game: counting them made a drawn-but-unsaved batch inflate every
 		// count by one and could push a 5x player to 6x.
 		if m.Status == "ENDED" || m.Status == "PLAYING" {
 			for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
@@ -1045,8 +1059,8 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 			ids = append(ids, t.PlayerID)
 		}
 		gb.seen[matchupKey(ids[:2], ids[2:])] = true
-		if m.Round > gb.maxRound {
-			gb.maxRound = m.Round
+		if m.Wave > gb.maxWave {
+			gb.maxWave = m.Wave
 		}
 	}
 	// Load signal for the AI: lowest played count plays first. base_played and
@@ -1075,8 +1089,8 @@ func (s *Service) loadGenBase(ctx context.Context, id string) (*genBase, error) 
 }
 
 // liveSetFor collects players whose matches are still PLAYING. It scans
-// every round, not just the latest one: a forgotten PLAYING status on an
-// older round (e.g. a manual card added late) must still bench that player
+// every card, not just the newest ones: a forgotten PLAYING status on an
+// older card (e.g. a manual card added late) must still bench that player
 // in the next draw, otherwise they get scheduled again immediately.
 //
 // A match only counts as live while it can still plausibly be running. The
@@ -1176,16 +1190,15 @@ func wasPlayed(m GenMatch) bool {
 
 // lastWave rest returns the cards of the most recent wave: one wave is
 // courtCount matches, because the courts of a session run side by side.
-// Ordering runs on draw time, so a wave is picked by what was drawn last
-// instead of by round numbers, which are only display labels and may be
-// sparse, out of order, or full of leftover single cards.
-func lastWave(matches []GenMatch, roundNo, courtCount int) []GenMatch {
+// Ordering runs on draw time (tiebroken by the globally increasing wave), so a
+// wave is picked by what was drawn last instead of by any group label.
+func lastWave(matches []GenMatch, courtCount int) []GenMatch {
 	if courtCount <= 0 {
 		courtCount = 3
 	}
 	played := make([]GenMatch, 0, len(matches))
 	for _, m := range matches {
-		if !wasPlayed(m) || m.Round >= roundNo {
+		if !wasPlayed(m) {
 			continue
 		}
 		if playedAt(m).IsZero() {
@@ -1198,9 +1211,6 @@ func lastWave(matches []GenMatch, roundNo, courtCount int) []GenMatch {
 		if !ti.Equal(tj) {
 			return ti.After(tj)
 		}
-		if played[i].Round != played[j].Round {
-			return played[i].Round > played[j].Round
-		}
 		return played[i].Wave > played[j].Wave
 	})
 	if len(played) > courtCount {
@@ -1209,35 +1219,16 @@ func lastWave(matches []GenMatch, roundNo, courtCount int) []GenMatch {
 	return played
 }
 
-// lastPendingWave returns the newest wave drawn earlier in this same call:
-// the highest round, then the highest wave inside it.
-func lastPendingWave(pendings []pending, roundNo int) (round, wave int, found bool) {
-	for _, p := range pendings {
-		if p.round >= roundNo {
-			continue
-		}
-		if !found || p.round > round || (p.round == round && p.wave > wave) {
-			round, wave, found = p.round, p.wave, true
-		}
-	}
-	return round, wave, found
-}
-
-// restSetFor collects the players from the last wave so the next round lets
+// restSetFor collects the players from the last wave so the next draw lets
 // them rest first.
 //
-// It reads chronology instead of round-relative numbers: round is a display
-// label and may be sparse (a deleted round leaves a hole) or hold leftover
-// single cards, so keying off roundNo-1 hides exactly the players who need
-// the break — someone who played the last wave of round 1 while round 3
-// exists was invisible to a round-relative window.
-//
-// A wave is at most courtCount matches, matching how many courts run at once.
-// Rounds drawn earlier in this same call count as the newest wave, since a
-// generated round must not be followed immediately by its own players.
+// It reads chronology: the newest wave among cards drawn earlier in this same
+// call wins (a generated batch must not be followed immediately by its own
+// players), otherwise the newest wave on court. A wave is at most courtCount
+// matches, matching how many courts run at once.
 // Live players (still PLAYING) are merged in by the caller.
-func restSetFor(matches []GenMatch, pendings []pending, roundNo, courtCount int) map[string]bool {
-	return restSetForAt(matches, pendings, roundNo, courtCount, time.Now())
+func restSetFor(matches []GenMatch, pendings []pending, courtCount int) map[string]bool {
+	return restSetForAt(matches, pendings, courtCount, time.Now())
 }
 
 // restSetForAt is restSetFor with an explicit clock. The clock is carried for
@@ -1247,14 +1238,17 @@ func restSetFor(matches []GenMatch, pendings []pending, roundNo, courtCount int)
 // means "a PLAYING flag nobody ever cleared". Mixing the two would empty the
 // set on a resumed event, letting the last wave out again the moment the
 // session is picked back up.
-func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount int, _ time.Time) map[string]bool {
+func restSetForAt(matches []GenMatch, pendings []pending, courtCount int, _ time.Time) map[string]bool {
 	rest := map[string]bool{}
-	if roundNo <= 1 {
-		return rest
-	}
-	if pRound, pWave, ok := lastPendingWave(pendings, roundNo); ok {
+	if len(pendings) > 0 {
+		maxWave := 0
 		for _, p := range pendings {
-			if p.round != pRound || p.wave != pWave {
+			if p.wave > maxWave {
+				maxWave = p.wave
+			}
+		}
+		for _, p := range pendings {
+			if p.wave != maxWave {
 				continue
 			}
 			for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
@@ -1263,7 +1257,7 @@ func restSetForAt(matches []GenMatch, pendings []pending, roundNo, courtCount in
 		}
 		return rest
 	}
-	for _, m := range lastWave(matches, roundNo, courtCount) {
+	for _, m := range lastWave(matches, courtCount) {
 		for _, id := range append(idsOf(m.Team1), idsOf(m.Team2)...) {
 			rest[id] = true
 		}
@@ -1369,7 +1363,7 @@ func requireDrawable(n int, strategy string) error {
 }
 
 // orderPendingsByLoad applies the tired-first/load-first wave order to
-// locally drawn rounds (the AI-answer path is ordered before validating).
+// locally drawn batches (the AI-answer path is ordered before validating).
 // Waves are renumbered after sorting and referees re-picked for the new
 // waves, so the least-played run first everywhere.
 func orderPendingsByLoad(pend []pending, rest map[string]bool, played map[string]int, live map[string]bool, waveBase, wavesPerRound int, pool []poolPlayer, useReferee bool) []pending {
@@ -1641,7 +1635,7 @@ func (s *Service) catchupPlayers(ctx context.Context, id string, gb *genBase) ([
 	return catchupSubset(gb.pool, counts, target, gb.caps)
 }
 
-// allowancePick chooses who plays once the planned rounds are spent. It walks
+// allowancePick chooses who plays once some player is at their cap. It walks
 // the play counts upward from the lowest and stops as soon as a full card can
 // be filled, so the short-changed players catch up before anyone above them
 // plays again: with four players on 3x and the rest already on 5x, exactly
@@ -1719,10 +1713,9 @@ func allowancePick(pool []poolPlayer, playedOf map[string]int, caps map[string]i
 	return picked, nil
 }
 
-// allowancePlayers builds the draw pool once an event's planned rounds are
-// used up. max_rounds is an allowance per player, not a wave count: a
-// 29-player night spends five waves inside its first round, so the round label
-// runs out long before the players do.
+// allowancePlayers builds the draw pool once any player is at their cap.
+// max_rounds is an allowance per player, not a batch count: a 29-player night
+// burns five waves per batch, so batches run out long before the players do.
 //
 // It returns the pool and how many cards that pool can support.
 func (s *Service) allowancePlayers(ctx context.Context, id string, gb *genBase) ([]aiPlayer, int, error) {
@@ -1766,7 +1759,7 @@ func applyCaps(players []aiPlayer, caps map[string]int, eventMax int) {
 	}
 }
 
-// genValidator carries per-round validation state. seen is shared by
+// genValidator carries per-batch validation state. seen is shared by
 // reference so accepted matchups join the no-repeat set immediately.
 type genValidator struct {
 	pool             []poolPlayer
@@ -1805,13 +1798,13 @@ func remAfter(caps map[string]int, eventMax int, played map[string]int, pid stri
 	return cap - n
 }
 
-// validateGenRound checks one AI round: 2v2, pool members, mixed-doubles
+// validateDraw checks one AI batch: 2v2, pool members, mixed-doubles
 // rule, one appearance per player, no repeat, and FULL coverage. Waves
 // chunk the returned order by courts that can run simultaneously; the
 // referee of every match is picked afterwards from the same pool.
-// strictSoft also rejects last week's final round(s) from the same
+// strictSoft also rejects last week's final batch(es) from the same
 // period; lenient mode (retry) allows repeating them when forced.
-func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, waveBase int, strictSoft bool) ([]pending, error) {
+func (s *Service) validateDraw(v *genValidator, ms []aiMatchup, waveBase int, strictSoft bool) ([]pending, error) {
 	used := map[string]int{}
 	out := []pending{}
 	waves := map[int]int{}
@@ -1829,10 +1822,10 @@ func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, wav
 		for _, pid := range append(append([]string{}, mu.Team1...), mu.Team2...) {
 			used[pid]++
 			if used[pid] > 1 && !v.borrowAllow[pid] {
-				return nil, httpx.Unprocessable("AI listed a player twice in one round. Try generating again.")
+				return nil, httpx.Unprocessable("AI listed a player twice in one batch. Try generating again.")
 			}
 			if used[pid] > 2 {
-				return nil, httpx.Unprocessable("AI listed a player three times in one round. Try generating again.")
+				return nil, httpx.Unprocessable("AI listed a player three times in one batch. Try generating again.")
 			}
 		}
 		key := matchupKey(mu.Team1, mu.Team2)
@@ -1840,9 +1833,9 @@ func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, wav
 			return nil, httpx.Unprocessable("AI repeated a previous matchup. Try generating again.")
 		}
 		if strictSoft && v.softSeen[key] {
-			return nil, httpx.Unprocessable("AI repeated last week's final round in the same period. Try generating again.")
+			return nil, httpx.Unprocessable("AI repeated last week's final batch in the same period. Try generating again.")
 		}
-		out = append(out, pending{round: roundNo, wave: waves[len(out)], team1: t1, team2: t2})
+		out = append(out, pending{wave: waves[len(out)], team1: t1, team2: t2})
 	}
 	for _, req := range v.requireNewcomers {
 		if used[req] == 0 {
@@ -1857,9 +1850,10 @@ func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, wav
 	if len(v.requireNewcomers) > 0 && len(used)%4 != 0 {
 		return nil, httpx.Unprocessable("AI made an incomplete top-up group. Try generating again.")
 	}
-	// Leveling (non-topup only): nobody sits out while someone who played
-	// more takes the round. With odd pools someone must go ahead first, but
-	// a lower-played player may never be benched for a higher-played one.
+		// Leveling (non-topup only): nobody sits out while someone who played
+		// more takes this batch. With odd pools someone must go ahead first,
+		// but a lower-played player may never be benched for a higher-played
+		// one.
 	if len(v.requireNewcomers) == 0 && len(v.players) > 0 {
 		maxPlaying := -1
 		for _, ap := range v.players {
@@ -1874,7 +1868,7 @@ func (s *Service) validateGenRound(v *genValidator, ms []aiMatchup, roundNo, wav
 				}
 			}
 			// Rest priority (equal counts): a rested player never sits out
-			// for someone coming straight off the previous round's last wave.
+			// for someone coming straight off the previous batch's last wave.
 			for _, ap := range v.players {
 				if used[ap.ID] != 0 || v.playedCounts[ap.ID] != maxPlaying || v.rest[ap.ID] {
 					continue
@@ -1922,12 +1916,12 @@ func (s *Service) savePendings(ctx context.Context, id string, pendings []pendin
 		var m GenMatch
 		var t1, t2 string
 		err := tx.QueryRow(ctx, `
-			INSERT INTO generated_matches (id, event_id, round, wave, team1, team2, referee_id, status)
-			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, 'UPCOMING')
-			RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
+			INSERT INTO generated_matches (id, event_id, wave, team1, team2, referee_id, status)
+			VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'UPCOMING')
+			RETURNING id::text, event_id::text, wave, team1::text, team2::text, status, court,
 			          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
-			id, p.round, p.wave, mustTeamJSON(p.team1), mustTeamJSON(p.team2), p.referee,
-		).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
+			id, p.wave, mustTeamJSON(p.team1), mustTeamJSON(p.team2), p.referee,
+		).Scan(&m.ID, &m.EventID, &m.Wave, &t1, &t2, &m.Status, &m.Court,
 			&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
 		if err != nil {
 			return nil, fail
@@ -1947,14 +1941,17 @@ func (s *Service) savePendings(ctx context.Context, id string, pendings []pendin
 	return saved, nil
 }
 
-// Generate asks the AI for balanced rounds, validates every matchup (2v2,
-// pool members, one appearance per player per round, no repeat of any
+// Generate asks the AI for balanced batches of matchups, validates every one
+// (2v2, pool members, one appearance per player per batch, no repeat of any
 // previous matchup in this event), and stores them as UPCOMING.
+//
+// max_rounds is a per-player allowance, not a batch counter: as soon as one
+// player is at their cap the draw switches to allowance mode and fills cards
+// for whoever is still below theirs first.
 func (s *Service) Generate(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Rounds    int    `json:"rounds"`
-		Round     int    `json:"round"`
+		Count     int    `json:"count"`
 		TopUp     bool   `json:"topup"`
 		PlayedCap *int   `json:"played_cap"`
 		CatchUp   bool   `json:"catchup"`
@@ -1966,14 +1963,15 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Strategy tidak dikenal. Pakai \"leveling\" atau \"rest\"."))
 	}
 	restStrategy := strategy == strategyRest
-	if in.Rounds <= 0 {
-		in.Rounds = 1
+	if in.Count <= 0 {
+		in.Count = 1
 	}
-	if in.Rounds > 5 {
-		return httpx.WriteAppError(c, httpx.Unprocessable("Generate at most 5 rounds at a time."))
+	if in.Count > 5 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Generate at most 5 batches at a time."))
 	}
-	// Filter modes are exclusive and single-round: top-up fills an existing
-	// round, played_cap targets one level, catch-up evens out below target.
+	// Filter modes are exclusive and single-batch: top-up schedules players
+	// with no card yet, played_cap targets one level, catch-up evens out
+	// below target.
 	modes := 0
 	if in.TopUp {
 		modes++
@@ -1987,11 +1985,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	if modes > 1 {
 		return httpx.WriteAppError(c, httpx.Unprocessable("Pilih salah satu: susulan, filter jumlah main, atau perataan."))
 	}
-	if (in.PlayedCap != nil || in.CatchUp) && in.Rounds > 1 {
-		return httpx.WriteAppError(c, httpx.Unprocessable("Filter dan perataan hanya satu ronde per generate."))
-	}
-	if in.PlayedCap != nil || in.CatchUp {
-		in.Rounds = 1
+	if modes > 0 && in.Count > 1 {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Filter, perataan, dan susulan hanya satu batch per generate."))
 	}
 	if _, err := uuid.Parse(id); err != nil {
 		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
@@ -2003,7 +1998,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	pool, aiPlayers, history := gb.pool, gb.aiPlayers, gb.history
 	seen, softSeen, softHistory := gb.seen, gb.softSeen, gb.softHistory
 	playedCounts, matches := gb.playedCounts, gb.matches
-	wavesPerRound, maxRounds, maxRound := gb.wavesPerRound, gb.maxRounds, gb.maxRound
+	wavesPerRound := gb.wavesPerRound
 	// Filtered mode swaps the whole pool for the chosen play-count subset
 	// (required level + borrowed top-up), resolved against the same history.
 	if in.PlayedCap != nil {
@@ -2021,26 +2016,21 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		}
 		aiPlayers = sub
 	}
-	// max_rounds is a per-player allowance, not a wave budget. A 29-player
-	// night burns five waves inside round 1, so the round counter runs out
-	// while players still owe matches. Once the planned rounds are spent, keep
-	// drawing for whoever is under their cap and top the last card up from
-	// capped players when the leftovers cannot make a 2v2 alone.
+	// max_rounds is a per-player allowance: as soon as one player is at their
+	// cap the draw switches to allowance mode and fills cards for whoever is
+	// still below theirs first, topping the last card up from capped players
+	// when the leftovers cannot make a 2v2 alone.
 	coverageN := len(pool)
 	// coverageDefault is what every iteration resets coverage to: the whole
 	// pool normally, the filtered subset in cap/catch-up mode, and the
-	// allowance pool once the planned rounds are spent. Without this the loop
+	// allowance pool once someone is at their cap. Without this the loop
 	// reset it to len(pool) and the allowance validator demanded full coverage
 	// from a deliberately partial pool.
 	coverageDefault := len(pool)
 	allowance := false
-	if in.Round > 0 && maxRounds > 0 && in.Round > maxRounds && !in.CatchUp {
-		return httpx.WriteAppError(c, httpx.Unprocessable(
-			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
-	}
-	if in.Round == 0 && maxRounds > 0 && maxRound >= maxRounds && !in.CatchUp && !in.TopUp {
+	if gb.allowanceOpen(playedCounts) && !in.CatchUp && !in.TopUp && in.PlayedCap == nil {
 		allowance = true
-		in.Rounds = 1
+		in.Count = 1
 	}
 	if allowance {
 		sub, cards, err := s.allowancePlayers(c.Context(), id, gb)
@@ -2050,8 +2040,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		aiPlayers = sub
 		coverageN = len(sub)
 		coverageDefault = len(sub)
-		if in.Rounds > cards {
-			in.Rounds = cards
+		if in.Count > cards {
+			in.Count = cards
 		}
 	}
 	// Resting strategy: players still on court, and players from the last
@@ -2059,7 +2049,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// Leveling keeps them in the pool and only benches them first.
 	if restStrategy {
 		bench := liveSetFor(matches)
-		for id := range restSetFor(matches, nil, maxRound+1, gb.wavesPerRound) {
+		for id := range restSetFor(matches, nil, gb.wavesPerRound) {
 			bench[id] = true
 		}
 		aiPlayers = dropBench(aiPlayers, bench, strategy)
@@ -2080,21 +2070,21 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 		}
 	}
 
-	// One AI call per round: small responses stay valid JSON, and every
-	// earlier round (existing or generated just now) joins the history of the
-	// next call, so nothing repeats. Nothing is stored until all rounds
-	// validate — existing rounds are never touched.
+	// One AI call per batch: small responses stay valid JSON, and every
+	// earlier batch (existing or generated just now) joins the history of the
+	// next call, so nothing repeats. Nothing is stored until all batches
+	// validate — existing matches are never touched.
 	pendings := []pending{}
-	// borrowAllow marks round players borrowed to complete a top-up group
-	// (they may appear twice); requireNewcomers must all play.
+	// borrowAllow marks players borrowed to complete a top-up group (they may
+	// appear twice); requireNewcomers must all play.
 	borrowAllow := map[string]bool{}
 	requireNewcomers := []string{}
-	// aiUnavailable latches once ALL providers fail so the remaining rounds
+	// aiUnavailable latches once ALL providers fail so the remaining batches
 	// are drawn locally instead of waiting on throttled calls.
 	aiUnavailable := false
 	// usedAI tracks which endpoint produced the draw, shown in the loading
-	// UI ("Berhasil diproses AI 2"). usedFallback is true when any round
-	// came from AI 2/3, usedLocal when the deterministic draw was used.
+	// UI ("Berhasil diproses AI 2"). usedFallback is true when any batch came
+	// from AI 2/3, usedLocal when the deterministic draw was used.
 	usedAI := aiEndpoint{}
 	usedAISet := false
 	usedFallback := false
@@ -2104,184 +2094,149 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 	// of silently using the local draw.
 	aiErrMsg := ""
 
-	// Shared validation state; per-round fields (pool, borrowAllow,
+	// Shared validation state; per-batch fields (pool, borrowAllow,
 	// requireNewcomers, coverageN) are synced at the top of each iteration
 	// because top-up can grow the pool mid-loop.
 	v := &genValidator{seen: seen, softSeen: softSeen, wavesPerRound: wavesPerRound, playedCounts: playedCounts, useReferee: gb.useReferee, caps: gb.caps, eventMax: gb.maxRounds}
-	// playerBase is the pool before any per-round benching: each iteration in
-	// resting mode re-filters from here, so round 2 of a multi-round request
-	// also skips the wave drawn in round 1.
+	// playerBase is the pool before any per-batch benching: each iteration in
+	// resting mode re-filters from here, so batch 2 of a multi-batch request
+	// also skips the wave drawn in batch 1.
 	playerBase := aiPlayers
-	// Live players (still PLAYING, in any round) rest in every round
-	// prepared while their games run. Static per request: statuses here
-	// never change mid-loop (new rounds are stored UPCOMING).
+	// Live players (still PLAYING) rest in every batch prepared while their
+	// games run. Static per request: statuses here never change mid-loop (new
+	// matches are stored UPCOMING).
 	liveSet := liveSetFor(matches)
+	// Waves continue after the highest wave already stored; every batch in
+	// this request picks up where the previous one stopped.
+	waveBase := gb.maxWave
 
-	for i := 0; i < in.Rounds; i++ {
-		// Explicit round number fills one empty round (e.g. after deleting
-		// it); otherwise rounds append after the highest existing one.
-		// TopUp adds matches for pool members missing from a NON-empty round
-		// (late arrivals) without touching its existing matches.
-		roundNo := maxRound + i + 1
+	for i := 0; i < in.Count; i++ {
+		// coverageN resets per batch: top-up narrows it below, allowance mode
+		// narrowed it before the loop.
 		coverageN = coverageDefault
-		waveBase := 0
 		borrowAllow = map[string]bool{}
 		requireNewcomers = []string{}
-		if in.Round > 0 {
-			if in.Rounds > 1 {
-				return httpx.WriteAppError(c, httpx.Unprocessable("Generate one round at a time when targeting a round number."))
-			}
-			if in.Round < 1 || in.Round > 99 {
-				return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
-			}
-			var exists bool
+		if in.TopUp {
+			// Auto-pull: anyone PRESENT in the source session joins the pool
+			// first, so no manual picking is needed.
+			var source *string
 			if err := s.db.QueryRow(c.Context(),
-				`SELECT EXISTS (SELECT 1 FROM generated_matches WHERE event_id = $1 AND round = $2)`,
-				id, in.Round).Scan(&exists); err != nil {
-				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not generate.")
-			}
-			if in.TopUp {
-				if !exists {
-					return httpx.WriteAppError(c, httpx.Unprocessable("That round is empty. Generate it normally instead."))
-				}
-				// Appended matches continue the wave sequence of the round.
-				existing := 0
-				for _, m := range matches {
-					if m.Round == in.Round {
-						existing++
-					}
-				}
-				waveBase = existing / wavesPerRound
-				// Auto-pull: anyone PRESENT in the source session joins the
-				// pool first, so no manual picking is needed.
-				var source *string
-				if err := s.db.QueryRow(c.Context(),
-					`SELECT source_session_id::text FROM match_events WHERE id = $1`, id).Scan(&source); err == nil && source != nil {
-					rows, err := s.db.Query(c.Context(), `
-						SELECT a.player_id::text
-						FROM attendances a
-						JOIN players pl ON pl.id = a.player_id
-						WHERE a.session_id = $1 AND a.status IN ('PRESENT', 'LISTED', 'CONFIRMED')
-						  AND pl.status = 'ACTIVE'
-						ORDER BY a.listed_at`, *source)
-					if err == nil {
-						have := map[string]bool{}
-						for _, p := range pool {
-							have[p.ID] = true
-						}
-						merged := []string{}
-						for _, p := range pool {
-							merged = append(merged, p.ID)
-						}
-						added := false
-						addedIDs := []string{}
-						for rows.Next() {
-							var pid string
-							if err := rows.Scan(&pid); err == nil && !have[pid] {
-								have[pid] = true
-								merged = append(merged, pid)
-								addedIDs = append(addedIDs, pid)
-								added = true
-							}
-						}
-						rows.Close()
-						if added {
-							idsJSON, _ := json.Marshal(merged)
-							if _, err := s.db.Exec(c.Context(),
-								`UPDATE match_events SET player_ids = $2, updated_at = now() WHERE id = $1`,
-								id, string(idsJSON)); err == nil {
-								if np, err := s.pool(c.Context(), id); err == nil {
-									pool = np
-								}
-								// Auto-pulled newcomers start from 0, not base.
-								if gb.basePlayed > 0 && len(addedIDs) > 0 {
-									if _, err := s.db.Exec(c.Context(), `
-										INSERT INTO match_count_adjustments (event_id, player_id, played_delta, refereed_delta, is_auto)
-										SELECT $1, u.id::uuid, -($3::integer), 0, TRUE
-										FROM unnest($2::text[]) WITH ORDINALITY AS u(id, ordinality)
-										JOIN players p ON p.id::text = u.id AND p.status = 'ACTIVE'
-										ON CONFLICT (event_id, player_id) DO NOTHING`, id, addedIDs, gb.basePlayed); err != nil {
-										log.Printf("matchmaker: newcomer base offset failed for event %s: %v", id, err)
-									}
-								}
-							}
-							// Newcomers join the AI subset with pool-order arrival.
-							aiPlayers = []aiPlayer{}
-							for i, p := range pool {
-								aiPlayers = append(aiPlayers, aiPlayer{Index: i, ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: i + 1})
-							}
-						}
-					}
-				}
-				inRound := map[string]bool{}
-				for _, m := range matches {
-					if m.Round != in.Round {
-						continue
-					}
-					for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
-						inRound[t.PlayerID] = true
-					}
-				}
-				sub := []aiPlayer{}
-				for pos, p := range pool {
-					if inRound[p.ID] {
-						continue
-					}
-					sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: pos + 1})
-				}
-				// Fewer than 4 newcomers: borrow from this round's players so
-				// the group still makes 2v2. Earliest arrivals are borrowed
-				// first (they waited longest); each plays at most twice.
-				borrowAllow = map[string]bool{}
-				requireNewcomers = []string{}
-				for _, p := range sub {
-					requireNewcomers = append(requireNewcomers, p.ID)
-				}
-				if need := (4 - len(sub)%4) % 4; need > 0 {
-					borrowed := 0
+				`SELECT source_session_id::text FROM match_events WHERE id = $1`, id).Scan(&source); err == nil && source != nil {
+				rows, err := s.db.Query(c.Context(), `
+					SELECT a.player_id::text
+					FROM attendances a
+					JOIN players pl ON pl.id = a.player_id
+					WHERE a.session_id = $1 AND a.status IN ('PRESENT', 'LISTED', 'CONFIRMED')
+					  AND pl.status = 'ACTIVE'
+					ORDER BY a.listed_at`, *source)
+				if err == nil {
+					have := map[string]bool{}
 					for _, p := range pool {
-						if borrowed >= need {
-							break
-						}
-						if inRound[p.ID] && !borrowAllow[p.ID] {
-							borrowAllow[p.ID] = true
-							borrowed++
-						}
+						have[p.ID] = true
 					}
-					if borrowed < need {
-						return httpx.WriteAppError(c, httpx.Unprocessable("Not enough players to complete a top-up group."))
-					}
-					// Borrowed players join the AI subset with their real arrival.
+					merged := []string{}
 					for _, p := range pool {
-						if borrowAllow[p.ID] {
-							pos := 0
-							for i, q := range pool {
-								if q.ID == p.ID {
-									pos = i
-									break
+						merged = append(merged, p.ID)
+					}
+					added := false
+					addedIDs := []string{}
+					for rows.Next() {
+						var pid string
+						if err := rows.Scan(&pid); err == nil && !have[pid] {
+							have[pid] = true
+							merged = append(merged, pid)
+							addedIDs = append(addedIDs, pid)
+							added = true
+						}
+					}
+					rows.Close()
+					if added {
+						idsJSON, _ := json.Marshal(merged)
+						if _, err := s.db.Exec(c.Context(),
+							`UPDATE match_events SET player_ids = $2, updated_at = now() WHERE id = $1`,
+							id, string(idsJSON)); err == nil {
+							if np, err := s.pool(c.Context(), id); err == nil {
+								pool = np
+							}
+							// Auto-pulled newcomers start from 0, not base.
+							if gb.basePlayed > 0 && len(addedIDs) > 0 {
+								if _, err := s.db.Exec(c.Context(), `
+									INSERT INTO match_count_adjustments (event_id, player_id, played_delta, refereed_delta, is_auto)
+									SELECT $1, u.id::uuid, -($3::integer), 0, TRUE
+									FROM unnest($2::text[]) WITH ORDINALITY AS u(id, ordinality)
+									JOIN players p ON p.id::text = u.id AND p.status = 'ACTIVE'
+									ON CONFLICT (event_id, player_id) DO NOTHING`, id, addedIDs, gb.basePlayed); err != nil {
+									log.Printf("matchmaker: newcomer base offset failed for event %s: %v", id, err)
 								}
 							}
-							sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: pos + 1})
 						}
 					}
 				}
-				if len(sub) < 4 {
-					return httpx.WriteAppError(c, httpx.Unprocessable("Fewer than 4 players are missing from this round."))
-				}
-				aiPlayers = sub
-				coverageN = len(sub)
-				coverageDefault = len(sub)
-			} else if exists {
-				return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
 			}
-			roundNo = in.Round
+			// Subset: pool members with no card at all yet — the ones who
+			// still owe their first game.
+			scheduled := map[string]bool{}
+			for _, m := range matches {
+				for _, t := range append(append([]TeamPlayer{}, m.Team1...), m.Team2...) {
+					scheduled[t.PlayerID] = true
+				}
+			}
+			sub := []aiPlayer{}
+			requireNewcomers = []string{}
+			for pos, p := range pool {
+				if scheduled[p.ID] {
+					continue
+				}
+				requireNewcomers = append(requireNewcomers, p.ID)
+				sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: pos + 1})
+			}
+			if len(requireNewcomers) == 0 {
+				return httpx.WriteAppError(c, httpx.Unprocessable("Semua pemain sudah masuk jadwal. Tidak ada susulan yang perlu ditambahkan."))
+			}
+			// Fewer than 4 unscheduled: borrow from already scheduled players
+			// so the group still makes 2v2. Earliest arrivals are borrowed
+			// first (they waited longest); each plays at most twice.
+			if need := (4 - len(sub)%4) % 4; need > 0 {
+				borrowed := 0
+				for _, p := range pool {
+					if borrowed >= need {
+						break
+					}
+					if scheduled[p.ID] && !borrowAllow[p.ID] {
+						borrowAllow[p.ID] = true
+						borrowed++
+					}
+				}
+				if borrowed < need {
+					return httpx.WriteAppError(c, httpx.Unprocessable("Not enough players to complete a top-up group."))
+				}
+				// Borrowed players join the AI subset with their real arrival.
+				for _, p := range pool {
+					if borrowAllow[p.ID] {
+						pos := 0
+						for i, q := range pool {
+							if q.ID == p.ID {
+								pos = i
+								break
+							}
+						}
+						sub = append(sub, aiPlayer{Index: len(sub), ID: p.ID, Name: p.Name, Grade: p.Grade, Gender: p.Gender, Rank: gradeRank(p.Grade), Arrival: pos + 1})
+					}
+				}
+			}
+			if len(sub) < 4 {
+				return httpx.WriteAppError(c, httpx.Unprocessable("Fewer than 4 players are missing from the schedule."))
+			}
+			aiPlayers = sub
+			coverageN = len(sub)
+			coverageDefault = len(sub)
 		}
-		// Rest set: players from the previous round's last wave get a break
+		// Rest set: players from the previous batch's last wave get a break
 		// (bench first, else last waves), plus anyone still PLAYING live.
-		// Skipped for top-up: borrowed players are mid-round by design.
+		// Skipped for top-up: borrowed players are mid-batch by design.
 		rest := map[string]bool{}
 		if !in.TopUp {
-			rest = restSetFor(matches, pendings, roundNo, gb.wavesPerRound)
+			rest = restSetFor(matches, pendings, gb.wavesPerRound)
 			for id := range liveSet {
 				rest[id] = true
 			}
@@ -2292,25 +2247,14 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				restNames = append(restNames, p.Name)
 			}
 		}
-		// Resting mode re-filters the pool each round: the wave just drawn in
-		// this same request must sit out the next one too, otherwise a 5-round
-		// request would schedule the same people back to back.
+		// Resting mode re-filters the pool each batch: the wave just drawn in
+		// this same request must sit out the next one too, otherwise a
+		// multi-batch request would schedule the same people back to back.
 		if restStrategy && !in.TopUp {
 			aiPlayers = append([]aiPlayer{}, playerBase...)
 			drop := map[string]bool{}
 			for id := range rest {
 				drop[id] = true
-			}
-			// Pendings just accepted also count as the newest wave.
-			if pRound, pWave, ok := lastPendingWave(pendings, roundNo); ok {
-				for _, p := range pendings {
-					if p.round != pRound || p.wave != pWave {
-						continue
-					}
-					for _, id := range append(idsOf(p.team1), idsOf(p.team2)...) {
-						drop[id] = true
-					}
-				}
 			}
 			aiPlayers = dropBench(aiPlayers, drop, strategy)
 			if !allowance {
@@ -2320,7 +2264,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				return httpx.WriteAppError(c, err)
 			}
 		}
-		// Refresh load counts (earlier rounds generated just now count too).
+		// Refresh load counts (earlier batches generated just now count too).
 		for i := range aiPlayers {
 			aiPlayers[i].Played = playedCounts[aiPlayers[i].ID]
 		}
@@ -2332,16 +2276,16 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			coverageN = len(aiPlayers)
 			coverageDefault = len(aiPlayers)
 		}
-		// Sync per-round validation state (top-up may have rebuilt the pool).
+		// Sync per-batch validation state (top-up may have rebuilt the pool).
 		v.pool, v.borrowAllow, v.requireNewcomers, v.coverageN = pool, borrowAllow, requireNewcomers, coverageN
 		v.players, v.rest = aiPlayers, rest
 		var accepted []pending
 		var genErr error
 		// Two AI tries only: each one spends provider tokens, and when the
 		// model still cannot satisfy the rules the deterministic local draw
-		// below finishes the round instead of hammering the rate limit. A
+		// below finishes the batch instead of hammering the rate limit. A
 		// provider error means the whole chain (AI 1 -> AI 2 -> AI 3) failed,
-		// and once it happens the rest of the rounds stay local too.
+		// and once it happens the rest of the batches stay local too.
 		// retryNote feeds the previous attempt's rejection reason back so
 		// the retry fixes exactly what failed (e.g. partial coverage).
 		retryNote := ""
@@ -2376,7 +2320,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				continue
 			}
 			// Tired players run last so they get a break before their game.
-			accepted, genErr = s.validateGenRound(v, orderMatchesByRest(aiRounds[0].Matches, rest, playedCounts, liveSet), roundNo, waveBase, strictSoft)
+			accepted, genErr = s.validateDraw(v, orderMatchesByRest(aiRounds[0].Matches, rest, playedCounts, liveSet), waveBase, strictSoft)
 			if genErr == nil {
 				if !usedAISet {
 					usedAI, usedAISet = ep, true
@@ -2394,8 +2338,8 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 			if ae := httpx.AsAppError(genErr); aiErrMsg == "" {
 				aiErrMsg = ae.Message
 			}
-			// Local fallback tries strict first (avoid last week's final
-			// round too) and only repeats it when no other 2v2 exists.
+			// Local fallback tries strict first (avoid last week's final wave
+			// too) and only repeats it when no other 2v2 exists.
 			if len(softSeen) > 0 {
 				strictSeen := make(map[string]bool, len(seen)+len(softSeen))
 				for k := range seen {
@@ -2404,7 +2348,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				for k := range softSeen {
 					strictSeen[k] = true
 				}
-				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds, rest); localErr == nil {
+				if local, localErr := s.localMatchups(aiPlayers, pool, strictSeen, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds, rest); localErr == nil {
 					for _, p := range local {
 						seen[matchupKey(idsOf(p.team1), idsOf(p.team2))] = true
 					}
@@ -2413,7 +2357,7 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				}
 			}
 			if genErr != nil {
-				local, localErr := s.localMatchups(aiPlayers, pool, seen, roundNo, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds, rest)
+				local, localErr := s.localMatchups(aiPlayers, pool, seen, waveBase, wavesPerRound, playedCounts, requireNewcomers, borrowAllow, gb.useReferee, gb.caps, gb.maxRounds, rest)
 				if localErr == nil {
 					accepted, genErr = orderPendingsByLoad(local, rest, playedCounts, liveSet, waveBase, wavesPerRound, pool, gb.useReferee), nil
 					usedLocal = true
@@ -2429,14 +2373,18 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 				playedCounts[id]++
 			}
 		}
-		// Newly accepted matchups join the history for the next round call.
+		// Newly accepted matchups join the history for the next batch call;
+		// the label is just a sequential index for the prompt.
 		for _, p := range accepted {
 			history = append(history, aiHistoryMatch{
-				Round: p.round,
+				Round: len(history) + 1,
 				Team1: []string{p.team1[0].PlayerID, p.team1[1].PlayerID},
 				Team2: []string{p.team2[0].PlayerID, p.team2[1].PlayerID},
 			})
 		}
+		// The batch filled ceil(len/wavesPerRound) waves; the next batch in
+		// this request continues after them.
+		waveBase += (len(accepted) + wavesPerRound - 1) / wavesPerRound
 	}
 	if len(pendings) == 0 {
 		return httpx.WriteAppError(c, httpx.Unprocessable("AI returned no usable matchups. Try generating again."))
@@ -2469,13 +2417,11 @@ func (s *Service) Generate(c *fiber.Ctx) error {
 }
 
 // GeneratePrompt returns the exact prompt the API flow would send for one
-// round, so it can be copied into a web AI (ChatGPT/Groq web) that has no
-// API key. No AI is called and nothing is stored. Only the next round or
-// one empty round number is supported (one paste = one round).
+// batch, so it can be copied into a web AI (ChatGPT/Groq web) that has no
+// API key. No AI is called and nothing is stored (one paste = one batch).
 func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Round     int    `json:"round"`
 		PlayedCap *int   `json:"played_cap"`
 		CatchUp   bool   `json:"catchup"`
 		Strategy  string `json:"strategy"`
@@ -2495,31 +2441,16 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 	if err != nil {
 		return httpx.WriteAppError(c, err)
 	}
-	roundNo := gb.maxRound + 1
-	if in.Round > 0 {
-		if in.Round < 1 || in.Round > 99 {
-			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
-		}
-		var exists bool
-		if err := s.db.QueryRow(c.Context(),
-			`SELECT EXISTS (SELECT 1 FROM generated_matches WHERE event_id = $1 AND round = $2)`,
-			id, in.Round).Scan(&exists); err != nil {
-			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load round.")
-		}
-		if exists {
-			return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
-		}
-		roundNo = in.Round
-	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
-		// Planned rounds are spent, but max_rounds is a per-player allowance:
-		// draw for whoever still owes matches instead of refusing outright.
+	// max_rounds is a per-player allowance: once someone is at their cap the
+	// prompt draws for whoever still owes matches instead of the whole pool.
+	if gb.allowanceOpen(gb.playedCounts) && !in.CatchUp && in.PlayedCap == nil {
 		sub, _, aerr := s.allowancePlayers(c.Context(), id, gb)
 		if aerr != nil {
 			return httpx.WriteAppError(c, aerr)
 		}
 		gb.aiPlayers = sub
 	}
-	rest := restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound)
+	rest := restSetFor(gb.matches, nil, gb.wavesPerRound)
 	for id := range liveSetFor(gb.matches) {
 		rest[id] = true
 	}
@@ -2575,7 +2506,7 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 	if strategy == strategyRest {
 		prompt += "\nMode istirahat: jangan memakai pemain yang masih bermain atau baru selesai di wave terakhir. Pakai hanya daftar di atas."
 	}
-	return httpx.OK(c, http.StatusOK, map[string]any{"round": roundNo, "strategy": strategy, "prompt": prompt})
+	return httpx.OK(c, http.StatusOK, map[string]any{"strategy": strategy, "prompt": prompt})
 }
 
 // ManualGenerate validates a pasted web-AI answer through the same pipeline
@@ -2589,7 +2520,6 @@ func (s *Service) GeneratePrompt(c *fiber.Ctx) error {
 func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
-		Round     int    `json:"round"`
 		Raw       string `json:"raw"`
 		PlayedCap *int   `json:"played_cap"`
 		CatchUp   bool   `json:"catchup"`
@@ -2613,24 +2543,10 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	if err != nil {
 		return httpx.WriteAppError(c, err)
 	}
-	roundNo := gb.maxRound + 1
-	if in.Round > 0 {
-		if in.Round < 1 || in.Round > 99 {
-			return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
-		}
-		var exists bool
-		if err := s.db.QueryRow(c.Context(),
-			`SELECT EXISTS (SELECT 1 FROM generated_matches WHERE event_id = $1 AND round = $2)`,
-			id, in.Round).Scan(&exists); err != nil {
-			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load round.")
-		}
-		if exists {
-			return httpx.WriteAppError(c, httpx.Conflict("ROUND_EXISTS", "That round already has matches. Delete it first to regenerate."))
-		}
-		roundNo = in.Round
-	} else if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
-		// Planned rounds are spent, but max_rounds is a per-player allowance:
-		// draw for whoever still owes matches instead of refusing outright.
+	// max_rounds is a per-player allowance: once someone is at their cap the
+	// paste is validated against whoever still owes matches.
+	allowance := gb.allowanceOpen(gb.playedCounts) && !in.CatchUp && in.PlayedCap == nil
+	if allowance {
 		sub, _, aerr := s.allowancePlayers(c.Context(), id, gb)
 		if aerr != nil {
 			return httpx.WriteAppError(c, aerr)
@@ -2641,7 +2557,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	// later step (markdown names, index resolve, validation) uses them.
 	mPlayers := gb.aiPlayers
 	mCoverage := len(gb.pool)
-	if gb.maxRounds > 0 && roundNo > gb.maxRounds && !in.CatchUp {
+	if allowance {
 		// Allowance mode shrank the pool above; coverage follows it.
 		mCoverage = len(gb.aiPlayers)
 	}
@@ -2668,7 +2584,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		// court or just came off. Shrinking the accepted pool makes the
 		// validator reject those references instead of scheduling them.
 		bench := liveSetFor(gb.matches)
-		for id := range restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound) {
+		for id := range restSetFor(gb.matches, nil, gb.wavesPerRound) {
 			bench[id] = true
 		}
 		mPlayers = dropBench(mPlayers, bench, strategy)
@@ -2691,7 +2607,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 		}
 	}
 	if len(out.Rounds) == 0 || len(out.Rounds[0].Matches) == 0 {
-		return httpx.WriteAppError(c, httpx.Unprocessable("Jawaban tidak berisi ronde/match. Minta AI web balas dengan bentuk yang diminta di prompt."))
+		return httpx.WriteAppError(c, httpx.Unprocessable("Jawaban tidak berisi match. Minta AI web balas dengan bentuk yang diminta di prompt."))
 	}
 	// 2) Index refs resolve to pool players?
 	resolve := resolveIdxRefs(mPlayers)
@@ -2709,7 +2625,7 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	}
 	// 3) Full rules: 2v2, mixed doubles, one appearance, no repeat, coverage,
 	// leveling, and rest for last-wave + live players.
-	rest := restSetFor(gb.matches, nil, roundNo, gb.wavesPerRound)
+	rest := restSetFor(gb.matches, nil, gb.wavesPerRound)
 	live := liveSetFor(gb.matches)
 	for id := range live {
 		rest[id] = true
@@ -2717,7 +2633,8 @@ func (s *Service) ManualGenerate(c *fiber.Ctx) error {
 	v := &genValidator{pool: gb.pool, players: mPlayers, borrowAllow: map[string]bool{}, requireNewcomers: []string{},
 		seen: gb.seen, softSeen: gb.softSeen, rest: rest, coverageN: mCoverage,
 		wavesPerRound: gb.wavesPerRound, playedCounts: gb.playedCounts, useReferee: gb.useReferee, caps: gb.caps, eventMax: gb.maxRounds}
-	accepted, verr := s.validateGenRound(v, orderMatchesByRest(out.Rounds[0].Matches, rest, gb.playedCounts, live), roundNo, 0, len(gb.softSeen) > 0)
+	// Pasted cards continue the wave sequence after everything stored so far.
+	accepted, verr := s.validateDraw(v, orderMatchesByRest(out.Rounds[0].Matches, rest, gb.playedCounts, live), gb.maxWave, len(gb.softSeen) > 0)
 	if verr != nil {
 		return httpx.WriteAppError(c, verr)
 	}
@@ -2850,11 +2767,11 @@ func (s *Service) UpdateMatch(c *fiber.Ctx) error {
 		    ended_at = CASE WHEN $8 THEN now() WHEN $9 THEN NULL ELSE ended_at END,
 		    updated_at = now()
 		WHERE id = $1
-		RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
+		RETURNING id::text, event_id::text, wave, team1::text, team2::text, status, court,
 		          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
 		id, mustTeamJSON(team1), mustTeamJSON(team2), status, court, cocks,
 		startTimer, stopTimer, clearStop, resetTimer, refID,
-	).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1, &t2, &m.Status, &m.Court,
+	).Scan(&m.ID, &m.EventID, &m.Wave, &t1, &t2, &m.Status, &m.Court,
 		&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update match.")
@@ -2963,7 +2880,7 @@ func (s *Service) UpdateEvent(c *fiber.Ctx) error {
 
 // AddEventPlayers appends late arrivals to the pool (check-in order is the
 // given order). Existing pool members, matches, and history are untouched —
-// the next generated round simply includes the newcomers last.
+// the next generated batch simply includes the newcomers last.
 func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 	id := c.Params("id")
 	var in struct {
@@ -3060,31 +2977,9 @@ func (s *Service) AddEventPlayers(c *fiber.Ctx) error {
 	return httpx.OK(c, http.StatusOK, ev)
 }
 
-// DeleteRound removes every match of one round group (e.g. a bad draw).
-// The round number stays free: generating with {"round": N} fills it again.
-func (s *Service) DeleteRound(c *fiber.Ctx) error {
-	eventID := c.Params("id")
-	round, err := parseRoundParam(c.Params("round"))
-	if err != nil {
-		return httpx.WriteAppError(c, err)
-	}
-	if _, err := uuid.Parse(eventID); err != nil {
-		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
-	}
-	tag, err := s.db.Exec(c.Context(),
-		`DELETE FROM generated_matches WHERE event_id = $1 AND round = $2`, eventID, round)
-	if err != nil {
-		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not delete round.")
-	}
-	if tag.RowsAffected() == 0 {
-		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Round not found.")
-	}
-	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "round": round})
-}
-
 // DeleteMatch removes one generated card. Players freed by the deletion
-// become missing from their round, so TopUp (or a round regenerate) can fill
-// the round again afterwards with freshly drawn matchups.
+// become missing from the schedule, so Susulan can draw them a card again
+// afterwards with freshly drawn matchups.
 func (s *Service) DeleteMatch(c *fiber.Ctx) error {
 	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
@@ -3102,13 +2997,12 @@ func (s *Service) DeleteMatch(c *fiber.Ctx) error {
 
 // CreateMatch records one hand-made card (e.g. games already played before
 // the event was created). Teams go through the same 2v2 / pool /
-// mixed-doubles checks as generated ones, and the card lands in the round's
+// mixed-doubles checks as generated ones, and the card lands in the current
 // last wave. No-repeat is deliberately NOT enforced: reality is recorded
 // as-is, and the card joins the history future AI draws avoid.
 func (s *Service) CreateMatch(c *fiber.Ctx) error {
 	var in struct {
 		EventID         string   `json:"event_id"`
-		Round           int      `json:"round"`
 		Team1           []string `json:"team1"`
 		Team2           []string `json:"team2"`
 		Court           *int     `json:"court"`
@@ -3122,23 +3016,16 @@ func (s *Service) CreateMatch(c *fiber.Ctx) error {
 	if _, err := uuid.Parse(in.EventID); err != nil {
 		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid event ID."))
 	}
-	if in.Round < 1 || in.Round > 99 {
-		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid round number."))
-	}
 	pool, err := s.pool(c.Context(), in.EventID)
 	if err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Event not found.")
 	}
-	wavesPerRound, maxRounds, courtCap := 3, 0, 0
+	wavesPerRound, courtCap := 3, 0
 	_ = s.db.QueryRow(c.Context(),
-		`SELECT COALESCE(NULLIF(court_count, 0), 3), max_rounds, court_count FROM match_events WHERE id = $1`,
-		in.EventID).Scan(&wavesPerRound, &maxRounds, &courtCap)
+		`SELECT COALESCE(NULLIF(court_count, 0), 3), court_count FROM match_events WHERE id = $1`,
+		in.EventID).Scan(&wavesPerRound, &courtCap)
 	if wavesPerRound <= 0 {
 		wavesPerRound = 3
-	}
-	if maxRounds > 0 && in.Round > maxRounds {
-		return httpx.WriteAppError(c, httpx.Unprocessable(
-			"Round "+strconv.Itoa(in.Round)+" is past this event's match limit ("+strconv.Itoa(maxRounds)+"). Raise the limit in event settings first."))
 	}
 	t1, t2, err := s.resolveTeams(pool, in.Team1, in.Team2)
 	if err != nil {
@@ -3195,22 +3082,33 @@ func (s *Service) CreateMatch(c *fiber.Ctx) error {
 		}
 		refID = &ref
 	}
-	var existing int
-	_ = s.db.QueryRow(c.Context(),
-		`SELECT COUNT(*) FROM generated_matches WHERE event_id = $1 AND round = $2`,
-		in.EventID, in.Round).Scan(&existing)
-	wave := existing/wavesPerRound + 1
+	// The card joins the current last wave while it still has room, and
+	// starts the next wave once the courts of that wave are full.
+	var maxWave, inMaxWave int
+	_ = s.db.QueryRow(c.Context(), `
+		SELECT COALESCE(MAX(wave), 0),
+		       (SELECT COUNT(*) FROM generated_matches m2
+		         WHERE m2.event_id = $1
+		           AND m2.wave = COALESCE((SELECT MAX(wave) FROM generated_matches m3 WHERE m3.event_id = $1), 0))
+		FROM generated_matches WHERE event_id = $1`, in.EventID).Scan(&maxWave, &inMaxWave)
+	wave := 1
+	if maxWave > 0 {
+		wave = maxWave + 1
+		if inMaxWave < wavesPerRound {
+			wave = maxWave
+		}
+	}
 	var m GenMatch
 	var t1raw, t2raw string
 	err = s.db.QueryRow(c.Context(), `
-		INSERT INTO generated_matches (id, event_id, round, wave, team1, team2, referee_id, status, court, shuttlecock_used, started_at, ended_at)
-		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9,
-		        CASE WHEN $7 IN ('PLAYING', 'ENDED') THEN now() END,
-		        CASE WHEN $7 = 'ENDED' THEN now() END)
-		RETURNING id::text, event_id::text, round, wave, team1::text, team2::text, status, court,
+		INSERT INTO generated_matches (id, event_id, wave, team1, team2, referee_id, status, court, shuttlecock_used, started_at, ended_at)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8,
+		        CASE WHEN $6 IN ('PLAYING', 'ENDED') THEN now() END,
+		        CASE WHEN $6 = 'ENDED' THEN now() END)
+		RETURNING id::text, event_id::text, wave, team1::text, team2::text, status, court,
 		          started_at::text, ended_at::text, shuttlecock_used, created_at::text, updated_at::text`,
-		in.EventID, in.Round, wave, mustTeamJSON(t1), mustTeamJSON(t2), refID, status, court, cocks,
-	).Scan(&m.ID, &m.EventID, &m.Round, &m.Wave, &t1raw, &t2raw, &m.Status, &m.Court,
+		in.EventID, wave, mustTeamJSON(t1), mustTeamJSON(t2), refID, status, court, cocks,
+	).Scan(&m.ID, &m.EventID, &m.Wave, &t1raw, &t2raw, &m.Status, &m.Court,
 		&m.StartedAt, &m.EndedAt, &m.ShuttlecockUsed, &m.CreatedAt, &m.UpdatedAt)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save match.")
@@ -3232,19 +3130,6 @@ func strOrEmpty(s *string) string {
 	return *s
 }
 
-func parseRoundParam(raw string) (int, error) {
-	n := 0
-	for _, ch := range raw {
-		if ch < '0' || ch > '9' {
-			return 0, httpx.BadRequest("BAD_REQUEST", "Invalid round number.")
-		}
-		n = n*10 + int(ch-'0')
-	}
-	if n <= 0 || n > 99 {
-		return 0, httpx.BadRequest("BAD_REQUEST", "Invalid round number.")
-	}
-	return n, nil
-}
 func (s *Service) DeleteEvent(c *fiber.Ctx) error {
 	id := c.Params("id")
 	tag, err := s.db.Exec(c.Context(), `DELETE FROM match_events WHERE id = $1`, id)

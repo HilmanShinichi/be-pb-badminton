@@ -40,8 +40,8 @@ func TestLiveLevelingDraw(t *testing.T) {
 		players[i].Played = gb.playedCounts[players[i].ID]
 	}
 	applyCaps(players, gb.caps, gb.maxRounds)
-	t.Logf("leveling pool=%d (from %d), maxRounds=%d maxRound=%d",
-		len(players), len(gb.aiPlayers), gb.maxRounds, gb.maxRound)
+	t.Logf("leveling pool=%d (from %d), maxRounds=%d maxWave=%d",
+		len(players), len(gb.aiPlayers), gb.maxRounds, gb.maxWave)
 
 	user := buildUserPrompt(players, gb.history, gb.softHistory, 1, 0, nil, "", gb.pool)
 	t.Logf("prompt bytes=%d", len(user))

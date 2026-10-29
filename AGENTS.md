@@ -11,7 +11,7 @@ re-explore dari nol.
 - Module: `internal/modules/<nama>/module.go` (handler + query), di-wire manual
   di `internal/app/app.go`.
 - Migrasi: taruh `.sql` di `internal/database/migrations/`, nomor berikutnya
-  `0027_...`. Dijalankan otomatis saat boot, urut nama file.
+  `0028_...`. Dijalankan otomatis saat boot, urut nama file.
 - `.env.example` **wajib** ikut di-update kalau menambah env var.
 - Test: `go test ./...`. Test fixture match-maker ada di
   `internal/modules/matchmaker/*_test.go`.

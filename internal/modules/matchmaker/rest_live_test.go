@@ -38,28 +38,28 @@ func keys(m map[string]bool) []string {
 	return out
 }
 
-// TestLiveSetForScansEveryRound: a PLAYING card on an old round still benches
-// its players. Round numbers cannot gate this, because a manual card added
-// late lands in an older round while its match is on.
-func TestLiveSetForScansEveryRound(t *testing.T) {
+// TestLiveSetForScansEveryCard: a PLAYING card from an old wave still benches
+// its players. Wave numbers cannot gate this, because a manual card added
+// late lands in an older wave while its match is on.
+func TestLiveSetForScansEveryCard(t *testing.T) {
 	matches := []GenMatch{
-		{Round: 4, Wave: 1, Status: "ENDED", CreatedAt: "2026-10-18T06:00:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
-		{Round: 1, Wave: 4, Status: "PLAYING", CreatedAt: "2026-10-18T07:29:40Z", Team1: tp("solihin", "agus"), Team2: tp("ilham", "rama")},
-		{Round: 4, Wave: 1, Status: "UPCOMING", CreatedAt: "2026-10-18T08:00:00Z", Team1: tp("e", "f"), Team2: tp("g", "h")},
+		{Wave: 1, Status: "ENDED", CreatedAt: "2026-10-18T06:00:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
+		{Wave: 4, Status: "PLAYING", CreatedAt: "2026-10-18T07:29:40Z", Team1: tp("solihin", "agus"), Team2: tp("ilham", "rama")},
+		{Wave: 1, Status: "UPCOMING", CreatedAt: "2026-10-18T08:00:00Z", Team1: tp("e", "f"), Team2: tp("g", "h")},
 	}
 	live := liveSetForAt(matches, mustParse(t, "2026-10-18T08:00:00Z"))
 	wantSet(t, live, "solihin", "agus", "ilham", "rama")
 }
 
-// TestSetsEmpty: no cards and round 1 produce an empty set instead of panicking.
+// TestSetsEmpty: no cards produce an empty set instead of panicking.
 func TestSetsEmpty(t *testing.T) {
 	if got := liveSetForAt(nil, time.Now()); len(got) != 0 {
 		t.Fatalf("live = %v, want empty", got)
 	}
-	if got := restSetForAt(nil, nil, 1, 4, time.Now()); len(got) != 0 {
+	if got := restSetForAt(nil, nil, 4, time.Now()); len(got) != 0 {
 		t.Fatalf("rest = %v, want empty", got)
 	}
-	if got := restSetForAt(nil, nil, 4, 4, time.Now()); len(got) != 0 {
+	if got := restSetForAt(nil, nil, 4, time.Now()); len(got) != 0 {
 		t.Fatalf("rest with no cards = %v, want empty", got)
 	}
 }
@@ -68,7 +68,7 @@ func TestSetsEmpty(t *testing.T) {
 // forgotten tap, not a running game, so it must not bench anyone forever.
 func TestLiveSetDropsAbandonedCard(t *testing.T) {
 	matches := []GenMatch{
-		{Round: 1, Wave: 4, Status: "PLAYING", CreatedAt: "2026-10-18T07:29:40Z", Team1: tp("solihin", "agus"), Team2: tp("ilham", "rama")},
+		{Wave: 4, Status: "PLAYING", CreatedAt: "2026-10-18T07:29:40Z", Team1: tp("solihin", "agus"), Team2: tp("ilham", "rama")},
 	}
 	now := mustParse(t, "2026-10-21T09:33:00Z")
 	if got := liveSetForAt(matches, now); len(got) != 0 {
@@ -82,16 +82,16 @@ func TestLiveSetDropsAbandonedCard(t *testing.T) {
 // TestRestSetIsLastWave: one wave is courtCount cards, picked by draw order.
 func TestRestSetIsLastWave(t *testing.T) {
 	matches := []GenMatch{
-		{Round: 1, Wave: 3, Status: "ENDED", CreatedAt: "2026-10-18T07:00:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
-		{Round: 1, Wave: 4, Status: "ENDED", CreatedAt: "2026-10-18T07:10:00Z", Team1: tp("e", "f"), Team2: tp("g", "h")},
-		{Round: 2, Wave: 1, Status: "ENDED", CreatedAt: "2026-10-18T07:20:00Z", Team1: tp("i", "j"), Team2: tp("k", "l")},
-		{Round: 2, Wave: 2, Status: "ENDED", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("m", "n"), Team2: tp("o", "p")},
+		{Wave: 3, Status: "ENDED", CreatedAt: "2026-10-18T07:00:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
+		{Wave: 4, Status: "ENDED", CreatedAt: "2026-10-18T07:10:00Z", Team1: tp("e", "f"), Team2: tp("g", "h")},
+		{Wave: 1, Status: "ENDED", CreatedAt: "2026-10-18T07:20:00Z", Team1: tp("i", "j"), Team2: tp("k", "l")},
+		{Wave: 2, Status: "ENDED", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("m", "n"), Team2: tp("o", "p")},
 	}
 	now := mustParse(t, "2026-10-18T07:40:00Z")
 	// courtCount 2 -> the two newest cards only.
-	wantSet(t, restSetForAt(matches, nil, 4, 2, now), "i", "j", "k", "l", "m", "n", "o", "p")
+	wantSet(t, restSetForAt(matches, nil, 2, now), "i", "j", "k", "l", "m", "n", "o", "p")
 	// courtCount 4 -> all four cards.
-	wantSet(t, restSetForAt(matches, nil, 4, 4, now),
+	wantSet(t, restSetForAt(matches, nil, 4, now),
 		"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p")
 }
 
@@ -139,14 +139,14 @@ func TestParseMatchTimePostgresFormat(t *testing.T) {
 // checks that window on liveSetFor, not on restSetFor.
 func TestRestSetStaleWaveIsIdle(t *testing.T) {
 	matches := []GenMatch{
-		{Round: 1, Wave: 4, Status: "ENDED", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
+		{Wave: 4, Status: "ENDED", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
 	}
 	now := mustParse(t, "2026-10-21T09:33:00Z")
 	// rest still holds the last wave, even three days later.
-	wantSet(t, restSetForAt(matches, nil, 4, 4, now), "a", "b", "c", "d")
+	wantSet(t, restSetForAt(matches, nil, 4, now), "a", "b", "c", "d")
 	// live flags do expire, though.
 	live := []GenMatch{
-		gmS(1, 4, "PLAYING", "2026-10-18T07:30:00Z", "2026-10-18T07:30:00Z", tp("a", "b"), tp("c", "d")),
+		gmS(4, "PLAYING", "2026-10-18T07:30:00Z", "2026-10-18T07:30:00Z", tp("a", "b"), tp("c", "d")),
 	}
 	if got := liveSetForAt(live, now); len(got) != 0 {
 		t.Fatalf("live = %v, want empty (match is 3 days old)", got)
@@ -157,26 +157,26 @@ func TestRestSetStaleWaveIsIdle(t *testing.T) {
 	}
 }
 
-// TestRestSetFromPendings: rounds drawn earlier in the same call are the
+// TestRestSetFromPendings: batches drawn earlier in the same call are the
 // newest wave, so their players rest instead of playing back to back.
 func TestRestSetFromPendings(t *testing.T) {
 	pend := []pending{
-		{round: 1, wave: 1, team1: tp("a", "b"), team2: tp("c", "d")},
-		{round: 1, wave: 2, team1: tp("e", "f"), team2: tp("g", "h")},
+		{wave: 1, team1: tp("a", "b"), team2: tp("c", "d")},
+		{wave: 2, team1: tp("e", "f"), team2: tp("g", "h")},
 	}
-	got := restSetForAt(nil, pend, 2, 4, time.Now())
+	got := restSetForAt(nil, pend, 4, time.Now())
 	wantSet(t, got, "e", "f", "g", "h")
 }
 
-// TestRestSetIgnoresTargetRound: cards already in the round being generated
-// are not history, they are the round itself.
-func TestRestSetIgnoresTargetRound(t *testing.T) {
+// TestRestSetSkipsUpcoming: UPCOMING cards are a plan, not history, so only
+// the cards that already ran decide who rests.
+func TestRestSetSkipsUpcoming(t *testing.T) {
 	matches := []GenMatch{
-		{Round: 4, Wave: 1, Status: "UPCOMING", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
-		{Round: 3, Wave: 2, Status: "ENDED", CreatedAt: "2026-10-18T07:20:00Z", Team1: tp("e", "f"), Team2: tp("g", "h")},
+		{Wave: 1, Status: "UPCOMING", CreatedAt: "2026-10-18T07:30:00Z", Team1: tp("a", "b"), Team2: tp("c", "d")},
+		{Wave: 2, Status: "ENDED", CreatedAt: "2026-10-18T07:20:00Z", Team1: tp("e", "f"), Team2: tp("g", "h")},
 	}
 	now := mustParse(t, "2026-10-18T07:40:00Z")
-	wantSet(t, restSetForAt(matches, nil, 4, 4, now), "e", "f", "g", "h")
+	wantSet(t, restSetForAt(matches, nil, 4, now), "e", "f", "g", "h")
 }
 
 func mustParse(t *testing.T, s string) time.Time {
