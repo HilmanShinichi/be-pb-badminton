@@ -368,8 +368,10 @@ func buildUserPrompt(players []aiPlayer, history []aiHistoryMatch, softHistory [
 		}
 	}
 	if len(rest) > 0 {
-		user += "\nRest these players first (they played the last wave of the previous round, or are still playing live right now): " + strings.Join(rest, ", ") +
-			". Bench them before anyone else with equal play counts. Matches with the lowest play counts open the first wave, even beside tired teammates."
+		user += "\nTired players (they played the last wave of the previous round, or are still playing live): " + strings.Join(rest, ", ") +
+			". They sit out FIRST only if this round must leave players out — leave out at most N mod 4 players, never more. " +
+			"When N mod 4 == 0 nobody sits out: cover every player with N/4 matches, tired or not. " +
+			"Matches with the lowest play counts open the first wave, even beside tired teammates."
 	}
 	return user
 }
