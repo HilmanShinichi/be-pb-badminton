@@ -1018,12 +1018,18 @@ type MatrixMemberRow struct {
 }
 
 type MatrixNonMemberRow struct {
-	SessionID  string `json:"session_id"`
-	PlayerID   string `json:"player_id"`
-	PlayerName string `json:"player_name"`
-	Fee        int64  `json:"fee"`
-	Paid       bool   `json:"paid"`
-	Note       string `json:"note"`
+	SessionID   string `json:"session_id"`
+	SessionDate string `json:"session_date"`
+	PlayerID    string `json:"player_id"`
+	PlayerName  string `json:"player_name"`
+	Fee         int64  `json:"fee"`
+	Paid        bool   `json:"paid"`
+	Note        string `json:"note"`
+	// CarryOver menandai tagihan non-member dari sesi SEBELUM period ini yang
+	// masih UNPAID. Ikut dikirim di rekap period terbaru supaya tunggakan lama
+	// tidak hilang; SessionID/SessionDate menunjuk sesi lamanya, bukan sesi
+	// period ini.
+	CarryOver bool `json:"carry_over"`
 }
 
 // AttendanceMatrix aggregates attendance and kas kok data across all sessions
@@ -1155,7 +1161,7 @@ func (s *Service) AttendanceMatrix(c *fiber.Ctx) error {
 		nonMemberFee = 25000
 	}
 	nmRows, err := s.db.Query(c.Context(), `
-		SELECT a.session_id::text, a.player_id::text, pl.name,
+		SELECT a.session_id::text, ms.date::text, a.player_id::text, pl.name,
 		       COALESCE(b.total, $2),
 		       COALESCE(b.payment_status, 'PAID'),
 		       COALESCE(b.payment_method, a.no_show_reason, '')
@@ -1171,13 +1177,43 @@ func (s *Service) AttendanceMatrix(c *fiber.Ctx) error {
 		for nmRows.Next() {
 			var nm MatrixNonMemberRow
 			var payStatus, payMethod string
-			if err := nmRows.Scan(&nm.SessionID, &nm.PlayerID, &nm.PlayerName, &nm.Fee, &payStatus, &payMethod); err == nil {
+			if err := nmRows.Scan(&nm.SessionID, &nm.SessionDate, &nm.PlayerID, &nm.PlayerName, &nm.Fee, &payStatus, &payMethod); err == nil {
 				nm.Paid = payStatus == "PAID"
 				nm.Note = payMethod
 				nonMembers = append(nonMembers, nm)
 			}
 		}
 		nmRows.Close()
+	}
+
+	// 5b. Carry-over: tagihan non-member dari sesi sebelum period ini yang
+	// masih UNPAID ikut tampil di rekap period terbaru (mis. tamu openplay
+	// bulan lalu yang belum bayar sampai sekarang). Definisi non-member-nya
+	// relatif terhadap periode sesi tagihannya sendiri, dan sesi tanpa period
+	// (openplay harian) tetap ikut karena semua pemainnya tamu.
+	coRows, err := s.db.Query(c.Context(), `
+		SELECT ms.id::text, ms.date::text, a.player_id::text, pl.name,
+		       COALESCE(b.total, $2)
+		FROM player_bills b
+		JOIN mabar_sessions ms ON ms.id = b.session_id
+		JOIN attendances a ON a.session_id = b.session_id AND a.player_id = b.player_id
+		JOIN players pl ON pl.id = b.player_id
+		WHERE b.payment_status <> 'PAID'
+		  AND ms.date < $1::date
+		  AND a.status = 'PRESENT'
+		  AND (a.is_member = false OR a.player_id NOT IN (
+		      SELECT player_id FROM memberships WHERE period_id = ms.period_id AND status <> 'WITHDRAWN'
+		  ))
+		ORDER BY ms.date ASC, a.listed_at ASC, pl.name ASC`, p.StartDate, nonMemberFee)
+	if err == nil {
+		for coRows.Next() {
+			var nm MatrixNonMemberRow
+			if err := coRows.Scan(&nm.SessionID, &nm.SessionDate, &nm.PlayerID, &nm.PlayerName, &nm.Fee); err == nil {
+				nm.CarryOver = true
+				nonMembers = append(nonMembers, nm)
+			}
+		}
+		coRows.Close()
 	}
 
 	// 6. Calculate totals
