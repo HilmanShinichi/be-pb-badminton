@@ -34,42 +34,42 @@ func vDefInt(p *int, def int) int {
 }
 
 type Session struct {
-	ID               string  `json:"id"`
-	Type             string  `json:"type"`
-	PeriodID         *string `json:"period_id"`
-	PeriodName       *string `json:"period_name"`
-	VenueID          *string `json:"venue_id"`
-	VenueName        *string `json:"venue_name"`
-	Date             string  `json:"date"`
-	StartTime        *string `json:"start_time"`
-	EndTime          *string `json:"end_time"`
-	DurationMinutes  *int    `json:"duration_minutes"`
-	Description      *string `json:"description"`
-	VenueDescription *string `json:"venue_description"`
-	CourtCost        int64   `json:"court_cost"`
-	PricingMode      *string `json:"pricing_mode"`
-	ShuttlecockPrice int64   `json:"shuttlecock_price"`
-	ShuttlePackPrice int64   `json:"shuttle_pack_price"`
-	ShuttleUnitsPerPack int  `json:"shuttle_units_per_pack"`
-	Status           string  `json:"status"`
-	CreatedAt        string  `json:"created_at"`
+	ID                  string  `json:"id"`
+	Type                string  `json:"type"`
+	PeriodID            *string `json:"period_id"`
+	PeriodName          *string `json:"period_name"`
+	VenueID             *string `json:"venue_id"`
+	VenueName           *string `json:"venue_name"`
+	Date                string  `json:"date"`
+	StartTime           *string `json:"start_time"`
+	EndTime             *string `json:"end_time"`
+	DurationMinutes     *int    `json:"duration_minutes"`
+	Description         *string `json:"description"`
+	VenueDescription    *string `json:"venue_description"`
+	CourtCost           int64   `json:"court_cost"`
+	PricingMode         *string `json:"pricing_mode"`
+	ShuttlecockPrice    int64   `json:"shuttlecock_price"`
+	ShuttlePackPrice    int64   `json:"shuttle_pack_price"`
+	ShuttleUnitsPerPack int     `json:"shuttle_units_per_pack"`
+	Status              string  `json:"status"`
+	CreatedAt           string  `json:"created_at"`
 }
 
 type sessionInput struct {
-	Type             *string `json:"type"`
-	PeriodID         *string `json:"period_id"`
-	VenueID          *string `json:"venue_id"`
-	Date             *string `json:"date"`
-	StartTime        *string `json:"start_time"`
-	EndTime          *string `json:"end_time"`
-	Description      *string `json:"description"`
-	VenueDescription *string `json:"venue_description"`
-	CourtCost        *int64  `json:"court_cost"`
-	PricingMode      *string `json:"pricing_mode"`
-	ShuttlecockPrice *int64  `json:"shuttlecock_price"`
-	ShuttlePackPrice *int64  `json:"shuttle_pack_price"`
-	ShuttleUnitsPerPack *int `json:"shuttle_units_per_pack"`
-	Status           *string `json:"status"`
+	Type                *string `json:"type"`
+	PeriodID            *string `json:"period_id"`
+	VenueID             *string `json:"venue_id"`
+	Date                *string `json:"date"`
+	StartTime           *string `json:"start_time"`
+	EndTime             *string `json:"end_time"`
+	Description         *string `json:"description"`
+	VenueDescription    *string `json:"venue_description"`
+	CourtCost           *int64  `json:"court_cost"`
+	PricingMode         *string `json:"pricing_mode"`
+	ShuttlecockPrice    *int64  `json:"shuttlecock_price"`
+	ShuttlePackPrice    *int64  `json:"shuttle_pack_price"`
+	ShuttleUnitsPerPack *int    `json:"shuttle_units_per_pack"`
+	Status              *string `json:"status"`
 }
 
 const sessionCols = `s.id::text, s.type, s.period_id::text, p.name, s.venue_id::text, v.name,
@@ -176,6 +176,25 @@ func (s *Service) Get(c *fiber.Ctx) error {
 	return httpx.OK(c, http.StatusOK, sess)
 }
 
+// sessionOnDateExists reports whether the period already has a session on
+// that date. The form (and any API client) can otherwise create the same
+// date twice, and two open plays on one day silently split the attendance.
+// excludeID skips the row being updated so an edit that keeps its own date
+// passes. A nil period (daily/event session) is never a duplicate: those
+// are standalone and have no period calendar to clash with.
+func (s *Service) sessionOnDateExists(ctx context.Context, periodID, date, excludeID string) (bool, error) {
+	if periodID == "" {
+		return false, nil
+	}
+	var exists bool
+	err := s.db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM mabar_sessions
+			WHERE period_id = $1 AND date = $2::date AND id <> COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+		)`, periodID, date, excludeID).Scan(&exists)
+	return exists, err
+}
+
 func (s *Service) Create(c *fiber.Ctx) error {
 	var in sessionInput
 	if err := httpx.Decode(c, &in); err != nil {
@@ -192,6 +211,18 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		}
 		if status == "COMPLETED" {
 			return httpx.WriteAppError(c, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
+		}
+	}
+	// One period runs one session per date. Refuse the second create instead
+	// of silently ending up with two open plays sharing a day.
+	if in.PeriodID != nil {
+		dup, err := s.sessionOnDateExists(c.Context(), *in.PeriodID, *in.Date, "")
+		if err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not check the period schedule.")
+		}
+		if dup {
+			return httpx.WriteAppError(c, httpx.Conflict("SESSION_DATE_EXISTS",
+				"This period already has a session on that date. Open or delete it instead of creating a second one."))
 		}
 	}
 	var newID string
@@ -244,6 +275,18 @@ func (s *Service) Update(c *fiber.Ctx) error {
 	}
 	if err := in.validate(); err != nil {
 		return httpx.WriteAppError(c, err)
+	}
+	// Moving a session onto a date the period already uses would recreate the
+	// duplicate through the edit form, so the same guard applies here.
+	if in.PeriodID != nil {
+		dup, err := s.sessionOnDateExists(c.Context(), *in.PeriodID, *in.Date, id)
+		if err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not check the period schedule.")
+		}
+		if dup {
+			return httpx.WriteAppError(c, httpx.Conflict("SESSION_DATE_EXISTS",
+				"This period already has a session on that date. Open or delete it instead of moving this one onto it."))
+		}
 	}
 	tag, err := s.db.Exec(c.Context(), `
 		UPDATE mabar_sessions SET
