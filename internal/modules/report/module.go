@@ -656,9 +656,10 @@ func (s *Service) Financial(c *fiber.Ctx) error {
 }
 
 // InactiveMembers flags players with no PRESENT attendance for the
-// configured threshold. PRD §39.
+// configured threshold, or who have never attended. PRD §39.
 func (s *Service) InactiveMembers(c *fiber.Ctx) error {
-	months := 6
+	f := parseScopeFilter(c)
+	months := 2
 	if v := c.Query("months"); len(v) > 0 && (v[0] >= '1' && v[0] <= '9') {
 		n := 0
 		for _, c := range v {
@@ -671,22 +672,49 @@ func (s *Service) InactiveMembers(c *fiber.Ctx) error {
 			months = n
 		}
 	}
-	rows, err := s.db.Query(c.Context(), `
+
+	var baseFrom string
+	var whereScope string
+	args := []any{months}
+
+	if f.PeriodID != "" {
+		args = append(args, f.PeriodID)
+		baseFrom = "memberships m JOIN players pl ON pl.id = m.player_id"
+		whereScope = fmt.Sprintf("m.period_id = $%d AND pl.status = 'ACTIVE'", len(args))
+	} else if f.Scope == "PERIOD" {
+		baseFrom = "(SELECT DISTINCT player_id FROM memberships WHERE status <> 'WITHDRAWN') m JOIN players pl ON pl.id = m.player_id"
+		whereScope = "pl.status = 'ACTIVE'"
+	} else {
+		baseFrom = "players pl"
+		whereScope = "pl.status = 'ACTIVE'"
+	}
+
+	query := fmt.Sprintf(`
 		SELECT pl.name,
-		       COALESCE(TO_CHAR(MAX(a.present_at), 'YYYY-MM-DD'), '-'),
-		       COALESCE(cnt.total, 0),
-		       COALESCE((EXTRACT(EPOCH FROM now() - MAX(a.present_at)) / 86400)::int, 0)
-		FROM players pl
+		       COALESCE(TO_CHAR(att.last_played_date, 'YYYY-MM-DD'), '-'),
+		       COALESCE(att.total_present, 0),
+		       CASE 
+		           WHEN att.last_played_date IS NOT NULL THEN (CURRENT_DATE - att.last_played_date)
+		           ELSE (CURRENT_DATE - pl.created_at::date)
+		       END AS days_inactive
+		FROM %s
 		LEFT JOIN (
-			SELECT player_id, listed_at AS present_at FROM attendances WHERE status = 'PRESENT'
-		) a ON a.player_id = pl.id
-		LEFT JOIN (
-			SELECT player_id, COUNT(*) AS total FROM attendances WHERE status = 'PRESENT' GROUP BY player_id
-		) cnt ON cnt.player_id = pl.id
-		WHERE pl.status = 'ACTIVE'
-		GROUP BY pl.name, cnt.total
-		HAVING COALESCE(MAX(a.present_at), 'epoch') < now() - make_interval(months => $1)
-		ORDER BY MAX(a.present_at) NULLS FIRST`, months)
+		    SELECT a.player_id,
+		           MAX(ms.date) AS last_played_date,
+		           COUNT(*) AS total_present
+		    FROM attendances a
+		    JOIN mabar_sessions ms ON ms.id = a.session_id
+		    WHERE a.status = 'PRESENT'
+		    GROUP BY a.player_id
+		) att ON att.player_id = pl.id
+		WHERE %s
+		  AND (
+		      att.last_played_date IS NULL 
+		      OR att.last_played_date <= CURRENT_DATE - make_interval(months => $1)
+		  )
+		ORDER BY att.last_played_date ASC NULLS FIRST, days_inactive DESC, pl.name`, baseFrom, whereScope)
+
+	rows, err := s.db.Query(c.Context(), query, args...)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load inactive members.")
 	}
@@ -705,6 +733,16 @@ func (s *Service) InactiveMembers(c *fiber.Ctx) error {
 			list = append(list, t)
 		}
 	}
+
+	if wantCSV(c) {
+		header := []string{"player", "last_present", "total_present", "days_inactive"}
+		csvRows := make([][]string, len(list))
+		for i, r := range list {
+			csvRows[i] = []string{r.Name, r.LastPresent, it(r.Total), it(r.DaysInactive)}
+		}
+		return sendCSV(c, "inactive-members-report.csv", header, csvRows)
+	}
+
 	return httpx.OK(c, http.StatusOK, map[string]any{"threshold_months": months, "players": list})
 }
 

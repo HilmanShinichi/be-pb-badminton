@@ -2,6 +2,7 @@ package mabar
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pb-kecebong/backend/internal/httpx"
@@ -117,6 +119,37 @@ func (in sessionInput) validate() error {
 	return nil
 }
 
+// dupSessionErr is the shared 409 for "this period already has a session on
+// that date" — one session per period per date is a hard rule (migration 0028).
+func dupSessionErr() error {
+	return httpx.Conflict("SESSION_EXISTS", "This period already has a session on that date.")
+}
+
+// isUniqueViolation reports a Postgres unique-constraint violation (SQLSTATE
+// 23505), i.e. two writes racing past the app-level check for the same
+// period + date.
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+// periodDateTaken reports whether the period already owns a session on the
+// given date (excluding the session being updated).
+func (s *Service) periodDateTaken(ctx context.Context, periodID, date, excludeID string) bool {
+	var taken bool
+	q := `SELECT EXISTS (SELECT 1 FROM mabar_sessions WHERE period_id = $1 AND date = $2`
+	args := []any{periodID, date}
+	if excludeID != "" {
+		q += ` AND id <> $3`
+		args = append(args, excludeID)
+	}
+	q += `)`
+	if err := s.db.QueryRow(ctx, q, args...).Scan(&taken); err != nil {
+		return false
+	}
+	return taken
+}
+
 func (s *Service) List(c *fiber.Ctx) error {
 	sql := `SELECT ` + sessionCols + ` FROM mabar_sessions s
 		LEFT JOIN membership_periods p ON p.id = s.period_id
@@ -212,6 +245,9 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		if status == "COMPLETED" {
 			return httpx.WriteAppError(c, httpx.Conflict("PERIOD_COMPLETED", "Period is completed and cannot be changed."))
 		}
+		if *in.PeriodID != "" && s.periodDateTaken(c.Context(), *in.PeriodID, *in.Date, "") {
+			return httpx.WriteAppError(c, dupSessionErr())
+		}
 	}
 	// One period runs one session per date. Refuse the second create instead
 	// of silently ending up with two open plays sharing a day.
@@ -245,6 +281,9 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
 		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12)).Scan(&newID)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return httpx.WriteAppError(c, dupSessionErr())
+		}
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 	}
 	// Period sessions start with every active member already PRESENT —
@@ -300,7 +339,13 @@ func (s *Service) Update(c *fiber.Ctx) error {
 		id, *in.Type, in.PeriodID, in.VenueID, *in.Date, in.StartTime, in.EndTime,
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
 		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12))
-	if err != nil || tag.RowsAffected() == 0 {
+	if err != nil {
+		if isUniqueViolation(err) {
+			return httpx.WriteAppError(c, dupSessionErr())
+		}
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")
+	}
+	if tag.RowsAffected() == 0 {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")
 	}
 	sess, _ := s.fetch(c.Context(), id)
