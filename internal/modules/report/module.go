@@ -708,10 +708,7 @@ func (s *Service) InactiveMembers(c *fiber.Ctx) error {
 		    GROUP BY a.player_id
 		) att ON att.player_id = pl.id
 		WHERE %s
-		  AND (
-		      att.last_played_date IS NULL 
-		      OR att.last_played_date <= CURRENT_DATE - make_interval(months => $1)
-		  )
+		  AND COALESCE(att.last_played_date, pl.created_at::date) <= CURRENT_DATE - make_interval(months => $1)
 		ORDER BY att.last_played_date ASC NULLS FIRST, days_inactive DESC, pl.name`, baseFrom, whereScope)
 
 	rows, err := s.db.Query(c.Context(), query, args...)
