@@ -219,12 +219,19 @@ func (s *Service) sessionOnDateExists(ctx context.Context, periodID, date, exclu
 	if periodID == "" {
 		return false, nil
 	}
+	// Bind excludeID only when present: an empty string sent as $3::uuid is
+	// invalid input for the uuid type (''::uuid), which fails the whole check.
+	q := `SELECT EXISTS (
+		SELECT 1 FROM mabar_sessions
+		WHERE period_id = $1 AND date = $2::date`
+	args := []any{periodID, date}
+	if excludeID != "" {
+		q += ` AND id <> $3::uuid`
+		args = append(args, excludeID)
+	}
+	q += `)`
 	var exists bool
-	err := s.db.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM mabar_sessions
-			WHERE period_id = $1 AND date = $2::date AND id <> COALESCE($3::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-		)`, periodID, date, excludeID).Scan(&exists)
+	err := s.db.QueryRow(ctx, q, args...).Scan(&exists)
 	return exists, err
 }
 
