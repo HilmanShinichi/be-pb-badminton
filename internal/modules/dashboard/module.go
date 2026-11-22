@@ -126,29 +126,41 @@ func (s *Service) Get(c *fiber.Ctx) error {
 	limitPH := `$` + strconv.Itoa(len(recentArgs)-1)
 	offsetPH := `$` + strconv.Itoa(len(recentArgs))
 	rows, err = s.db.Query(c.Context(), `
-		WITH avg_unit AS (
-			SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0) AS price
+		WITH prod_avg AS (
+			SELECT t.product_id,
+			       SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0) AS price
 			FROM shuttlecock_transactions t
 			JOIN shuttlecock_products pr ON pr.id = t.product_id
 			WHERE t.type = 'PURCHASE'
+			GROUP BY t.product_id
 		)
 		SELECT s.id::text, s.type, s.date::text, p.name, v.name, s.court_cost,
 		       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0),
 		       COALESCE(sh_u.units, 0),
-		       ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
-		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float)),
+		       COALESCE(sc.cost, 0),
 		       COALESCE(ex.total, 0),
 		       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0)
 		           - CASE WHEN s.type = 'PERIOD' THEN 0 ELSE s.court_cost END
-		           - ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
-		           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float))
+		           - COALESCE(sc.cost, 0)
 		           - COALESCE(ex.total, 0),
 		       '',
 		       COALESCE(bl.total, 0), COALESCE(bl.paid, 0)
 		FROM mabar_sessions s
 		LEFT JOIN membership_periods p ON p.id = s.period_id
 		LEFT JOIN venues v ON v.id = s.venue_id
-		LEFT JOIN avg_unit a ON TRUE
+		LEFT JOIN (
+			SELECT t.session_id,
+			       ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+			           NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+			           COALESCE(NULLIF(ms.shuttle_pack_price, 0)::numeric
+			               / NULLIF(ms.shuttle_units_per_pack, 0), 0), 0)), 0)) AS cost
+			FROM shuttlecock_transactions t
+			JOIN mabar_sessions ms ON ms.id = t.session_id
+			JOIN shuttlecock_products sp ON sp.id = t.product_id
+			LEFT JOIN prod_avg pa ON pa.product_id = t.product_id
+			WHERE t.type = 'USAGE'
+			GROUP BY t.session_id
+		) sc ON sc.session_id = s.id
 		LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM revenues GROUP BY session_id) rv ON rv.session_id = s.id
 		LEFT JOIN (SELECT session_id, SUM(units) AS units FROM shuttlecock_transactions WHERE type = 'USAGE' GROUP BY session_id) sh_u ON sh_u.session_id = s.id
 		LEFT JOIN (SELECT session_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE payment_status = 'PAID') AS paid,
@@ -285,24 +297,36 @@ func (s *Service) Get(c *fiber.Ctx) error {
 	fundRemainder := fundCollected - fundPlanned
 	if fundPeriodID != nil {
 		srows, err := s.db.Query(c.Context(), `
-			WITH avg_unit AS (
-				SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0) AS price
+			WITH prod_avg AS (
+				SELECT t.product_id,
+				       SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0) AS price
 				FROM shuttlecock_transactions t
 				JOIN shuttlecock_products pr ON pr.id = t.product_id
 				WHERE t.type = 'PURCHASE'
+				GROUP BY t.product_id
 			)
 			SELECT s.date::text,
 			       COALESCE(rv.total, 0) + COALESCE(bl.paid_total, 0)
-			           - ROUND(COALESCE(sh_u.units, 0) * COALESCE(NULLIF(a.price, 0),
-			           s.shuttle_pack_price / NULLIF(s.shuttle_units_per_pack, 0)::float))
+			           - COALESCE(sc.cost, 0)
 			           - COALESCE(ex.total, 0)
 			FROM mabar_sessions s
-			LEFT JOIN avg_unit a ON TRUE
+			LEFT JOIN (
+				SELECT t.session_id,
+				       ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+				           NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+				           COALESCE(NULLIF(ms.shuttle_pack_price, 0)::numeric
+				               / NULLIF(ms.shuttle_units_per_pack, 0), 0), 0)), 0)) AS cost
+				FROM shuttlecock_transactions t
+				JOIN mabar_sessions ms ON ms.id = t.session_id
+				JOIN shuttlecock_products sp ON sp.id = t.product_id
+				LEFT JOIN prod_avg pa ON pa.product_id = t.product_id
+				WHERE t.type = 'USAGE'
+				GROUP BY t.session_id
+			) sc ON sc.session_id = s.id
 			LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM revenues GROUP BY session_id) rv ON rv.session_id = s.id
 			LEFT JOIN (SELECT session_id, COUNT(*) AS total, COUNT(*) FILTER (WHERE payment_status = 'PAID') AS paid,
 			                  SUM(total) FILTER (WHERE payment_status = 'PAID') AS paid_total
 			           FROM player_bills GROUP BY session_id) bl ON bl.session_id = s.id
-			LEFT JOIN (SELECT session_id, SUM(units) AS units FROM shuttlecock_transactions WHERE type = 'USAGE' GROUP BY session_id) sh_u ON sh_u.session_id = s.id
 			LEFT JOIN (SELECT session_id, SUM(amount) AS total FROM expenses WHERE category <> 'SHUTTLECOCK_PURCHASE' GROUP BY session_id) ex ON ex.session_id = s.id
 			WHERE s.period_id = $1 AND s.type = 'PERIOD' AND s.date < (now() AT TIME ZONE 'Asia/Jakarta')::date
 			ORDER BY s.date`, *fundPeriodID)

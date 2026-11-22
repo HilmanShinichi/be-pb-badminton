@@ -293,20 +293,28 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 		Scan(&revenue, &otherExpense, &unitsUsed, &billedPaid)
 	revenue += billedPaid
 
-	var avgPerUnit int64
-	_ = s.db.QueryRow(c.Context(), `
-		SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
-		FROM shuttlecock_transactions t
-		JOIN shuttlecock_products pr ON pr.id = t.product_id
-		WHERE t.type = 'PURCHASE'`).Scan(&avgPerUnit)
-
+	// Kok cost follows the product it came from: each brand is priced at its
+	// own average purchase cost instead of one blend across every brand the
+	// club ever bought. The session pack price only covers a product that
+	// has no purchase on record.
 	var shuttleCost int64
-	if avgPerUnit == 0 && sess.ShuttleUnitsPerPack > 0 {
-		// No purchase recorded yet: estimate exact from the session pack price.
-		shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(sess.ShuttlePackPrice, int64(sess.ShuttleUnitsPerPack), int64(unitsUsed)))
-	} else {
-		shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(avgPerUnit, 1, int64(unitsUsed)))
-	}
+	_ = s.db.QueryRow(c.Context(), `
+		WITH prod_avg AS (
+			SELECT t.product_id,
+			       SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0) AS price
+			FROM shuttlecock_transactions t
+			JOIN shuttlecock_products pr ON pr.id = t.product_id
+			WHERE t.type = 'PURCHASE'
+			GROUP BY t.product_id
+		)
+		SELECT ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+		    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+		    COALESCE(NULLIF($2::numeric, 0) / NULLIF($3, 0), 0), 0)), 0))
+		FROM shuttlecock_transactions t
+		JOIN shuttlecock_products sp ON sp.id = t.product_id
+		LEFT JOIN prod_avg pa ON pa.product_id = t.product_id
+		WHERE t.type = 'USAGE' AND t.session_id = $1`,
+		id, sess.ShuttlePackPrice, sess.ShuttleUnitsPerPack).Scan(&shuttleCost)
 	operatingCost := sess.CourtCost + shuttleCost + otherExpense
 	// Upfront member money (commitment fees) pre-funds the courts: spread
 	// what the period has actually collected across its planned sessions so

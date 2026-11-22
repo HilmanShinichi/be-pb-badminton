@@ -585,20 +585,30 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 			(SELECT COUNT(*) FROM mabar_sessions WHERE period_id = $1)`, id).
 		Scan(&revenue, &venueCost, &purchaseCost, &unitsUsed, &unitsPurchased, &sessions)
 
-	// Per-unit avg: unit_price is stored per pack, so divide by pack size.
-	var avgPerUnit int64
-	_ = s.db.QueryRow(c.Context(), `
-		SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
-		FROM shuttlecock_transactions t
-		JOIN shuttlecock_products pr ON pr.id = t.product_id
-		WHERE t.type = 'PURCHASE'`).Scan(&avgPerUnit)
-
+	// Kok cost follows the product it came from: each brand is priced at its
+	// own average purchase cost, never blended with other brands — a
+	// 120.000 Victoris tube used to be averaged together with 125.000 ones.
+	// Products with no purchase fall back to the catalog price, then to the
+	// period's own pack price.
 	var shuttleCost int64
-	if avgPerUnit == 0 && p.ShuttleUnitsPerPack > 0 {
-		shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(p.ShuttlePackPrice, int64(p.ShuttleUnitsPerPack), unitsUsed))
-	} else {
-		shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(avgPerUnit, 1, unitsUsed))
-	}
+	_ = s.db.QueryRow(c.Context(), `
+		WITH prod_avg AS (
+			SELECT t.product_id,
+			       SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0) AS price
+			FROM shuttlecock_transactions t
+			JOIN shuttlecock_products pr ON pr.id = t.product_id
+			WHERE t.type = 'PURCHASE'
+			GROUP BY t.product_id
+		)
+		SELECT ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+		    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+		    COALESCE(NULLIF($2::numeric, 0) / NULLIF($3, 0), 0), 0)), 0))
+		FROM shuttlecock_transactions t
+		JOIN shuttlecock_products sp ON sp.id = t.product_id
+		LEFT JOIN prod_avg pa ON pa.product_id = t.product_id
+		WHERE t.type = 'USAGE'
+		  AND t.session_id IN (SELECT id FROM mabar_sessions WHERE period_id = $1)`,
+		id, p.ShuttlePackPrice, p.ShuttleUnitsPerPack).Scan(&shuttleCost)
 	operatingCost := venueCost + shuttleCost
 	profit := revenue - operatingCost
 
@@ -759,25 +769,24 @@ func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
 	}
 
 	type sess struct {
-		ID       string
-		Date     string
-		Court    int64
-		Pack     int64
-		PerPack  int
-		Present  int
-		Revenue  int64
-		Units    int
+		ID      string
+		Date    string
+		Court   int64
+		Present int
+		Revenue int64
+		Units   int
+		Cost    int64
 	}
 	sessions := []sess{}
 	srows, err := s.db.Query(c.Context(), `
-		SELECT id::text, date::text, court_cost, shuttle_pack_price, shuttle_units_per_pack
+		SELECT id::text, date::text, court_cost
 		FROM mabar_sessions WHERE period_id = $1 ORDER BY date`, id)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load sessions.")
 	}
 	for srows.Next() {
 		var x sess
-		if err := srows.Scan(&x.ID, &x.Date, &x.Court, &x.Pack, &x.PerPack); err == nil {
+		if err := srows.Scan(&x.ID, &x.Date, &x.Court); err == nil {
 			sessions = append(sessions, x)
 		}
 	}
@@ -817,12 +826,30 @@ func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
 		WHERE type = 'USAGE' AND session_id `+inPeriod+` GROUP BY session_id`,
 		func(x *sess, n int64) { x.Units = int(n) })
 
-	var avgPerUnit int64
-	_ = s.db.QueryRow(c.Context(), `
-		SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
+	// Each night's kok usage is priced at the average purchase cost of the
+	// product it actually came from, so a session that used Victoris is not
+	// charged the blended price of every brand the club ever bought.
+	collect(c.Context(), `
+		WITH prod_avg AS (
+			SELECT t.product_id,
+			       SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0) AS price
+			FROM shuttlecock_transactions t
+			JOIN shuttlecock_products pr ON pr.id = t.product_id
+			WHERE t.type = 'PURCHASE'
+			GROUP BY t.product_id
+		)
+		SELECT t.session_id::text,
+		       ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+		           NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+		           COALESCE(NULLIF(ms.shuttle_pack_price, 0)::numeric
+		               / NULLIF(ms.shuttle_units_per_pack, 0), 0), 0)), 0))
 		FROM shuttlecock_transactions t
-		JOIN shuttlecock_products pr ON pr.id = t.product_id
-		WHERE t.type = 'PURCHASE'`).Scan(&avgPerUnit)
+		JOIN mabar_sessions ms ON ms.id = t.session_id
+		JOIN shuttlecock_products sp ON sp.id = t.product_id
+		LEFT JOIN prod_avg pa ON pa.product_id = t.product_id
+		WHERE t.type = 'USAGE' AND t.session_id `+inPeriod+`
+		GROUP BY t.session_id`,
+		func(x *sess, n int64) { x.Cost = n })
 
 	type outRow struct {
 		SessionID      string `json:"session_id"`
@@ -838,17 +865,11 @@ func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
 	}
 	out := make([]outRow, 0, len(sessions))
 	for _, x := range sessions {
-		var shuttleCost int64
-		if avgPerUnit == 0 && x.PerPack > 0 {
-			shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(x.Pack, int64(x.PerPack), int64(x.Units)))
-		} else {
-			shuttleCost = finance.RoundHalfUp(finance.ShuttlecockCost(avgPerUnit, 1, int64(x.Units)))
-		}
-		opCost := x.Court + shuttleCost
+		opCost := x.Court + x.Cost
 		out = append(out, outRow{
 			SessionID: x.ID, Date: x.Date, PlayersPresent: x.Present,
 			Revenue: x.Revenue, CourtCost: x.Court,
-			ShuttlecockUsed: x.Units, ShuttlecockCost: shuttleCost,
+			ShuttlecockUsed: x.Units, ShuttlecockCost: x.Cost,
 			OperatingCost: opCost, Profit: x.Revenue - opCost,
 			Status: finance.FinancialStatus(x.Revenue, opCost),
 		})

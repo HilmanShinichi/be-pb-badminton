@@ -81,16 +81,29 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 	}
 
 	var unitsUsed int64
-	var avgPerUnit int64
+	var shuttleUsageCost int64
 	if err := s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(units), 0) FROM shuttlecock_transactions WHERE type = 'USAGE'`).Scan(&unitsUsed); err == nil {
+		// Usage is priced per product at its own average purchase cost: one
+		// blended rate across brands would charge Victoris at the average of
+		// every kok the club has ever bought.
 		_ = s.db.QueryRow(c.Context(), `
-			SELECT COALESCE(SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0), 0)
-			FROM shuttlecock_transactions t
-			JOIN shuttlecock_products pr ON pr.id = t.product_id
-			WHERE t.type = 'PURCHASE'`).Scan(&avgPerUnit)
+			WITH prod_avg AS (
+				SELECT t.product_id,
+				       SUM(t.unit_price * t.units / NULLIF(pr.units_per_pack, 0)) / NULLIF(SUM(t.units), 0) AS price
+				FROM shuttlecock_transactions t
+				JOIN shuttlecock_products pr ON pr.id = t.product_id
+				WHERE t.type = 'PURCHASE'
+				GROUP BY t.product_id
+			)
+			SELECT ROUND(COALESCE(SUM(u.units * COALESCE(NULLIF(pa.price, 0),
+			    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0), 0)), 0))
+			FROM (SELECT product_id, SUM(units) AS units
+			      FROM shuttlecock_transactions WHERE type = 'USAGE'
+			      GROUP BY product_id) u
+			JOIN shuttlecock_products sp ON sp.id = u.product_id
+			LEFT JOIN prod_avg pa ON pa.product_id = u.product_id`).Scan(&shuttleUsageCost)
 	}
-	shuttleUsageCost := finance.RoundHalfUp(finance.ShuttlecockCost(avgPerUnit, 1, unitsUsed))
 
 	venue := byCategory["VENUE"]
 	operatingCost := venue + shuttleUsageCost
