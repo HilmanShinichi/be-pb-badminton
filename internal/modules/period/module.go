@@ -585,11 +585,10 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 			(SELECT COUNT(*) FROM mabar_sessions WHERE period_id = $1)`, id).
 		Scan(&revenue, &venueCost, &purchaseCost, &unitsUsed, &unitsPurchased, &sessions)
 
-	// Kok cost follows the product it came from: each brand is priced at its
-	// own average purchase cost, never blended with other brands — a
-	// 120.000 Victoris tube used to be averaged together with 125.000 ones.
-	// Products with no purchase fall back to the catalog price, then to the
-	// period's own pack price.
+	// Kok cost follows the product it came from: each brand is priced at the
+	// pack price entered in inventory, so a 120.000 Victoris tube is never
+	// blended with 125.000 ones. A product with no inventory price falls
+	// back to its own purchase history, then to the period's pack price.
 	var shuttleCost int64
 	_ = s.db.QueryRow(c.Context(), `
 		WITH prod_avg AS (
@@ -600,8 +599,9 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 			WHERE t.type = 'PURCHASE'
 			GROUP BY t.product_id
 		)
-		SELECT ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+		SELECT ROUND(COALESCE(SUM(t.units * COALESCE(
 		    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+		    NULLIF(pa.price, 0),
 		    COALESCE(NULLIF($2::numeric, 0) / NULLIF($3, 0), 0), 0)), 0))
 		FROM shuttlecock_transactions t
 		JOIN shuttlecock_products sp ON sp.id = t.product_id
@@ -826,7 +826,7 @@ func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
 		WHERE type = 'USAGE' AND session_id `+inPeriod+` GROUP BY session_id`,
 		func(x *sess, n int64) { x.Units = int(n) })
 
-	// Each night's kok usage is priced at the average purchase cost of the
+	// Each night's kok usage is priced at the inventory pack price of the
 	// product it actually came from, so a session that used Victoris is not
 	// charged the blended price of every brand the club ever bought.
 	collect(c.Context(), `
@@ -839,8 +839,9 @@ func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
 			GROUP BY t.product_id
 		)
 		SELECT t.session_id::text,
-		       ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+		       ROUND(COALESCE(SUM(t.units * COALESCE(
 		           NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+		           NULLIF(pa.price, 0),
 		           COALESCE(NULLIF(ms.shuttle_pack_price, 0)::numeric
 		               / NULLIF(ms.shuttle_units_per_pack, 0), 0), 0)), 0))
 		FROM shuttlecock_transactions t

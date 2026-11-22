@@ -150,8 +150,9 @@ func (s *Service) Get(c *fiber.Ctx) error {
 		LEFT JOIN venues v ON v.id = s.venue_id
 		LEFT JOIN (
 			SELECT t.session_id,
-			       ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+			       ROUND(COALESCE(SUM(t.units * COALESCE(
 			           NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+			           NULLIF(pa.price, 0),
 			           COALESCE(NULLIF(ms.shuttle_pack_price, 0)::numeric
 			               / NULLIF(ms.shuttle_units_per_pack, 0), 0), 0)), 0)) AS cost
 			FROM shuttlecock_transactions t
@@ -312,8 +313,9 @@ func (s *Service) Get(c *fiber.Ctx) error {
 			FROM mabar_sessions s
 			LEFT JOIN (
 				SELECT t.session_id,
-				       ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+				       ROUND(COALESCE(SUM(t.units * COALESCE(
 				           NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+				           NULLIF(pa.price, 0),
 				           COALESCE(NULLIF(ms.shuttle_pack_price, 0)::numeric
 				               / NULLIF(ms.shuttle_units_per_pack, 0), 0), 0)), 0)) AS cost
 				FROM shuttlecock_transactions t

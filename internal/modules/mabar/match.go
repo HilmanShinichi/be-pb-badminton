@@ -293,10 +293,10 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 		Scan(&revenue, &otherExpense, &unitsUsed, &billedPaid)
 	revenue += billedPaid
 
-	// Kok cost follows the product it came from: each brand is priced at its
-	// own average purchase cost instead of one blend across every brand the
-	// club ever bought. The session pack price only covers a product that
-	// has no purchase on record.
+	// Kok cost follows the product it came from: each brand is priced at the
+	// pack price entered in inventory instead of one blend across every brand
+	// the club ever bought. A product with no inventory price falls back to
+	// its own purchase history, then the session pack price.
 	var shuttleCost int64
 	_ = s.db.QueryRow(c.Context(), `
 		WITH prod_avg AS (
@@ -307,8 +307,9 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 			WHERE t.type = 'PURCHASE'
 			GROUP BY t.product_id
 		)
-		SELECT ROUND(COALESCE(SUM(t.units * COALESCE(NULLIF(pa.price, 0),
+		SELECT ROUND(COALESCE(SUM(t.units * COALESCE(
 		    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+		    NULLIF(pa.price, 0),
 		    COALESCE(NULLIF($2::numeric, 0) / NULLIF($3, 0), 0), 0)), 0))
 		FROM shuttlecock_transactions t
 		JOIN shuttlecock_products sp ON sp.id = t.product_id

@@ -84,9 +84,9 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 	var shuttleUsageCost int64
 	if err := s.db.QueryRow(c.Context(), `
 		SELECT COALESCE(SUM(units), 0) FROM shuttlecock_transactions WHERE type = 'USAGE'`).Scan(&unitsUsed); err == nil {
-		// Usage is priced per product at its own average purchase cost: one
-		// blended rate across brands would charge Victoris at the average of
-		// every kok the club has ever bought.
+		// Usage is priced per product at the pack price entered in
+		// inventory: one blended rate across brands would charge Victoris
+		// at the average of every kok the club has ever bought.
 		_ = s.db.QueryRow(c.Context(), `
 			WITH prod_avg AS (
 				SELECT t.product_id,
@@ -96,8 +96,9 @@ func (s *Service) Summary(c *fiber.Ctx) error {
 				WHERE t.type = 'PURCHASE'
 				GROUP BY t.product_id
 			)
-			SELECT ROUND(COALESCE(SUM(u.units * COALESCE(NULLIF(pa.price, 0),
-			    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0), 0)), 0))
+			SELECT ROUND(COALESCE(SUM(u.units * COALESCE(
+			    NULLIF(sp.purchase_price, 0)::numeric / NULLIF(sp.units_per_pack, 0),
+			    NULLIF(pa.price, 0), 0)), 0))
 			FROM (SELECT product_id, SUM(units) AS units
 			      FROM shuttlecock_transactions WHERE type = 'USAGE'
 			      GROUP BY product_id) u
