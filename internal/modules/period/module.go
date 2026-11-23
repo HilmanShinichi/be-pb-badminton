@@ -866,7 +866,10 @@ func (s *Service) SessionBreakdown(c *fiber.Ctx) error {
 	}
 	out := make([]outRow, 0, len(sessions))
 	for _, x := range sessions {
-		opCost := x.Court + x.Cost
+		// In a period, court costs are pre-funded upfront by commitment fees
+		// (iuran), so operating cost at the session level reflects shuttlecock
+		// usage (matching the Dashboard session profit).
+		opCost := x.Cost
 		out = append(out, outRow{
 			SessionID: x.ID, Date: x.Date, PlayersPresent: x.Present,
 			Revenue: x.Revenue, CourtCost: x.Court,
