@@ -36,6 +36,14 @@ type Config struct {
 	// AIDebug logs truncated raw AI responses (AI_DEBUG=1). For diagnosing
 	// why an endpoint's answer was unusable. Off by default.
 	AIDebug bool
+	// Supabase S3-compatible storage
+	S3Endpoint  string
+	S3Region    string
+	S3Bucket    string
+	S3AccessKey string
+	S3SecretKey string
+	S3PublicURL string
+	UploadDir   string
 }
 
 // LoadDotEnv reads KEY=VALUE lines from path into the environment. Existing
@@ -83,6 +91,13 @@ func Load() Config {
 		AIBaseURL3:      env("AI_BASE_URL_3", ""),
 		AIAPIKey3:       env("AI_API_KEY_3", ""),
 		AIDebug:         envBool("AI_DEBUG", false),
+		S3Endpoint:      env("S3_ENDPOINT", ""),
+		S3Region:        env("S3_REGION", "ap-southeast-1"),
+		S3Bucket:        env("S3_BUCKET", "payment-proofs"),
+		S3AccessKey:     env("S3_ACCESS_KEY", ""),
+		S3SecretKey:     env("S3_SECRET_KEY", ""),
+		S3PublicURL:     env("S3_PUBLIC_URL", ""),
+		UploadDir:       env("UPLOAD_DIR", "./uploads"),
 	}
 }
 

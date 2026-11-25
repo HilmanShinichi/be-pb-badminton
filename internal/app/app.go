@@ -20,6 +20,7 @@ import (
 	"github.com/pb-kecebong/backend/internal/modules/player"
 	"github.com/pb-kecebong/backend/internal/modules/report"
 	"github.com/pb-kecebong/backend/internal/modules/venue"
+	"github.com/pb-kecebong/backend/internal/storage"
 )
 
 // Run builds the application and owns its external resource lifecycle.
@@ -49,6 +50,25 @@ func Run(cfg config.Config) {
 		log.Fatalf("admin setup: %v", err)
 	}
 
+	storageSvc := storage.New(cfg)
+	periodSvc := period.NewService(pool, storageSvc)
+
+	// Background ticker for expiring stale unsubmitted WAITING_PAYMENT payments.
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if n, err := periodSvc.ExpireStalePayments(ctx); err == nil && n > 0 {
+					log.Printf("expired %d stale membership payment(s)", n)
+				}
+			}
+		}
+	}()
+
 	app := httpapi.NewRouter(httpapi.Dependencies{
 		Auth:       authSvc,
 		Dashboard:  dashboard.NewService(pool),
@@ -56,7 +76,7 @@ func Run(cfg config.Config) {
 		Inventory:  inventory.NewService(pool),
 		Mabar:      mabar.NewService(pool),
 		MatchMaker: matchmaker.NewService(pool, cfg),
-		Period:     period.NewService(pool),
+		Period:     periodSvc,
 		Player:     player.NewService(pool),
 		Report:     report.NewService(pool),
 		Venue:      venue.NewService(pool),

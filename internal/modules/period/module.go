@@ -14,11 +14,17 @@ import (
 
 	"github.com/pb-kecebong/backend/internal/domain/finance"
 	"github.com/pb-kecebong/backend/internal/httpx"
+	"github.com/pb-kecebong/backend/internal/storage"
 )
 
-type Service struct{ db *pgxpool.Pool }
+type Service struct {
+	db      *pgxpool.Pool
+	storage storage.Storage
+}
 
-func NewService(db *pgxpool.Pool) *Service { return &Service{db: db} }
+func NewService(db *pgxpool.Pool, st storage.Storage) *Service {
+	return &Service{db: db, storage: st}
+}
 
 type Period struct {
 	ID                 string  `json:"id"`
@@ -38,6 +44,7 @@ type Period struct {
 	SessionWeekdays    []int32 `json:"session_weekdays"`
 	DefaultStartTime   *string `json:"default_start_time"`
 	DefaultEndTime     *string `json:"default_end_time"`
+	IsRegistrationOpen bool    `json:"is_registration_open"`
 	CreatedAt          string  `json:"created_at"`
 }
 
@@ -77,19 +84,20 @@ type periodInput struct {
 	SessionWeekdays    *[]int32 `json:"session_weekdays"`
 	DefaultStartTime   *string  `json:"default_start_time"`
 	DefaultEndTime     *string  `json:"default_end_time"`
+	IsRegistrationOpen *bool    `json:"is_registration_open"`
 }
 
 const periodCols = `id::text, name, start_date::text, end_date::text, number_of_sessions,
 	max_members, commitment_fee, member_contribution, non_member_fee,
 	venue_cost_total, shuttle_pack_price, shuttle_units_per_pack, shuttle_per_session,
-	status, session_weekdays, default_start_time::text, default_end_time::text, created_at::text`
+	status, session_weekdays, default_start_time::text, default_end_time::text, is_registration_open, created_at::text`
 
 func scanPeriod(row pgx.Row) (Period, error) {
 	var p Period
 	err := row.Scan(&p.ID, &p.Name, &p.StartDate, &p.EndDate, &p.NumberOfSessions,
 		&p.MaxMembers, &p.CommitmentFee, &p.MemberContribution, &p.NonMemberFee,
 		&p.VenueCostTotal, &p.ShuttlePackPrice, &p.ShuttleUnitsPerPack, &p.ShuttlePerSession,
-		&p.Status, &p.SessionWeekdays, &p.DefaultStartTime, &p.DefaultEndTime, &p.CreatedAt)
+		&p.Status, &p.SessionWeekdays, &p.DefaultStartTime, &p.DefaultEndTime, &p.IsRegistrationOpen, &p.CreatedAt)
 	return p, err
 }
 
@@ -202,13 +210,13 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		 (id, name, start_date, end_date, number_of_sessions, max_members,
 		  commitment_fee, member_contribution, non_member_fee,
 		  venue_cost_total, shuttle_pack_price, shuttle_units_per_pack, shuttle_per_session,
-		  status, session_weekdays, default_start_time, default_end_time)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'DRAFT', $13, $14, $15)
+		  status, session_weekdays, default_start_time, default_end_time, is_registration_open)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'DRAFT', $13, $14, $15, $16)
 		 RETURNING `+periodCols,
 		strings.TrimSpace(*in.Name), *in.StartDate, *in.EndDate, sessions, in.MaxMembers,
 		val64(in.CommitmentFee), val64(in.MemberContribution), val64(in.NonMemberFee),
 		val64(in.VenueCostTotal), valDef64(in.ShuttlePackPrice, 125000), valDefInt(in.ShuttleUnitsPerPack, 12), valDefInt(in.ShuttlePerSession, 24),
-		weekdays, in.DefaultStartTime, in.DefaultEndTime))
+		weekdays, in.DefaultStartTime, in.DefaultEndTime, valDefBool(in.IsRegistrationOpen, false)))
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save period.")
 	}
@@ -272,7 +280,8 @@ func (s *Service) Update(c *fiber.Ctx) error {
 			 non_member_fee = $9, venue_cost_total = $10,
 			 shuttle_pack_price = $11, shuttle_units_per_pack = $12, shuttle_per_session = $13,
 			 status = $14, session_weekdays = $15,
-			 default_start_time = $16, default_end_time = $17, updated_at = now()
+			 default_start_time = $16, default_end_time = $17,
+			 is_registration_open = $18, updated_at = now()
 			 WHERE id = $1 RETURNING `+periodCols,
 			id, strings.TrimSpace(*in.Name), *in.StartDate, *in.EndDate, sessions, in.MaxMembers,
 			coalesce64(in.CommitmentFee, cur.CommitmentFee),
@@ -283,7 +292,8 @@ func (s *Service) Update(c *fiber.Ctx) error {
 			coalesceInt(in.ShuttleUnitsPerPack, cur.ShuttleUnitsPerPack),
 			coalesceInt(in.ShuttlePerSession, cur.ShuttlePerSession),
 			status,
-			weekdays, in.DefaultStartTime, in.DefaultEndTime))
+			weekdays, in.DefaultStartTime, in.DefaultEndTime,
+			coalesceBool(in.IsRegistrationOpen, cur.IsRegistrationOpen)))
 		if err != nil {
 			return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 		}
@@ -306,7 +316,8 @@ func (s *Service) Update(c *fiber.Ctx) error {
 		 non_member_fee = $9, venue_cost_total = $10,
 		 shuttle_pack_price = $11, shuttle_units_per_pack = $12, shuttle_per_session = $13,
 		 status = $14, session_weekdays = $15,
-		 default_start_time = $16, default_end_time = $17, updated_at = now()
+		 default_start_time = $16, default_end_time = $17,
+		 is_registration_open = $18, updated_at = now()
 		 WHERE id = $1 RETURNING `+periodCols,
 		id, strings.TrimSpace(*in.Name), *in.StartDate, *in.EndDate, sessions, in.MaxMembers,
 		val64(in.CommitmentFee), val64(in.MemberContribution), val64(in.NonMemberFee),
@@ -315,7 +326,8 @@ func (s *Service) Update(c *fiber.Ctx) error {
 		coalesceInt(in.ShuttleUnitsPerPack, cur.ShuttleUnitsPerPack),
 		coalesceInt(in.ShuttlePerSession, cur.ShuttlePerSession),
 		status,
-		weekdays, in.DefaultStartTime, in.DefaultEndTime))
+		weekdays, in.DefaultStartTime, in.DefaultEndTime,
+		coalesceBool(in.IsRegistrationOpen, cur.IsRegistrationOpen)))
 	if err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 	}
@@ -1017,6 +1029,20 @@ func coalesce64(p *int64, cur int64) int64 {
 }
 
 func coalesceInt(p *int, cur int) int {
+	if p == nil {
+		return cur
+	}
+	return *p
+}
+
+func valDefBool(p *bool, def bool) bool {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+func coalesceBool(p *bool, cur bool) bool {
 	if p == nil {
 		return cur
 	}

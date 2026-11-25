@@ -58,6 +58,9 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	// Deploy check: no auth, no DB. Bump BuildTag in the same commit as a fix.
 	app.Get("/version", Version)
 
+	// Serve locally uploaded files if S3 is not configured
+	app.Static("/uploads", cfg.UploadDir)
+
 	v1 := app.Group("/api/v1")
 	v1.Post("/auth/login", deps.Auth.Login)
 
@@ -65,6 +68,13 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	v1.Get("/public/match-events", deps.MatchMaker.PublicEvents)
 	v1.Get("/public/match-events/:id", deps.MatchMaker.PublicEvent)
 	v1.Get("/public/schedule", deps.Mabar.List)
+
+	// Public period registration & member payments: no token needed.
+	v1.Get("/public/periods", deps.Period.ListOpenRegistrationPeriods)
+	v1.Get("/public/periods/:id/registration", deps.Period.GetRegistrationInfo)
+	v1.Post("/public/periods/:id/payments", deps.Period.InitiatePayment)
+	v1.Get("/public/payments/:id", deps.Period.GetPayment)
+	v1.Post("/public/payments/:id/proof", deps.Period.SubmitPaymentProof)
 
 	authed := v1.Group("", httpx.RequireAuth(cfg.JWTSecret))
 	authed.Get("/auth/me", deps.Auth.Me)
@@ -96,6 +106,9 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	periods.Patch("/:id", deps.Period.Update)
 	periods.Delete("/:id", deps.Period.Delete)
 	periods.Post("/:id/complete", deps.Period.Complete)
+	periods.Patch("/:id/registration-status", deps.Period.SetRegistrationStatus)
+	periods.Get("/:id/payments", deps.Period.ListPayments)
+	periods.Patch("/:id/payments/:paymentId/verify", deps.Period.VerifyPayment)
 	periods.Post("/:id/generate-sessions", deps.Period.GenerateSessions)
 	periods.Get("/:id/members", deps.Period.ListMembers)
 	periods.Post("/:id/members", deps.Period.AddMember)
