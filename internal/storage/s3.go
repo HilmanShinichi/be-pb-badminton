@@ -20,6 +20,7 @@ import (
 
 type Storage interface {
 	Upload(ctx context.Context, key string, data []byte, contentType string) (publicURL string, err error)
+	Delete(ctx context.Context, keyOrURL string) error
 }
 
 type S3Storage struct {
@@ -148,6 +149,135 @@ func (s *S3Storage) uploadS3(ctx context.Context, key string, data []byte, conte
 	}
 
 	return s.getPublicURL(key), nil
+}
+
+// Delete removes an object from storage (S3 or local disk).
+// keyOrURL can be either a relative storage key (e.g. "proofs/.../img.jpg") or a full public URL.
+func (s *S3Storage) Delete(ctx context.Context, keyOrURL string) error {
+	key := s.resolveKey(keyOrURL)
+	if key == "" {
+		return nil
+	}
+
+	if s.IsS3Configured() {
+		return s.deleteS3(ctx, key)
+	}
+	return s.deleteLocal(ctx, key)
+}
+
+func (s *S3Storage) resolveKey(keyOrURL string) string {
+	raw := strings.TrimSpace(keyOrURL)
+	if raw == "" {
+		return ""
+	}
+
+	// If it's a URL, parse path
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		u, err := url.Parse(raw)
+		if err == nil {
+			path := strings.Trim(u.Path, "/")
+			if s.publicURL != "" {
+				if pubU, err := url.Parse(s.publicURL); err == nil && pubU.Path != "" {
+					prefix := strings.Trim(pubU.Path, "/")
+					if strings.HasPrefix(path, prefix) {
+						path = strings.TrimPrefix(path, prefix)
+						path = strings.Trim(path, "/")
+					}
+				}
+			}
+			parts := strings.Split(path, "/")
+			for i, p := range parts {
+				if (p == "public" || p == "authenticated") && i+2 < len(parts) && parts[i+1] == s.bucket {
+					return strings.Join(parts[i+2:], "/")
+				}
+			}
+			if len(parts) > 1 && parts[0] == s.bucket {
+				return strings.Join(parts[1:], "/")
+			}
+			if idx := strings.Index(path, "proofs/"); idx != -1 {
+				return path[idx:]
+			}
+			raw = path
+		}
+	}
+
+	raw = strings.TrimPrefix(raw, "/uploads/")
+	raw = strings.TrimPrefix(raw, "uploads/")
+	if s.bucket != "" {
+		raw = strings.TrimPrefix(raw, s.bucket+"/")
+	}
+
+	return strings.Trim(raw, "/")
+}
+
+func (s *S3Storage) deleteLocal(ctx context.Context, key string) error {
+	candidates := []string{
+		filepath.Join(s.uploadDir, s.bucket, filepath.FromSlash(key)),
+		filepath.Join(s.uploadDir, s.bucket, filepath.Base(key)),
+		filepath.Join(s.uploadDir, filepath.FromSlash(key)),
+	}
+
+	for _, targetPath := range candidates {
+		if err := os.Remove(targetPath); err == nil {
+			return nil
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to delete local file: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *S3Storage) deleteS3(ctx context.Context, key string) error {
+	reqURL := fmt.Sprintf("%s/%s/%s", s.endpoint, s.bucket, key)
+	u, err := url.Parse(reqURL)
+	if err != nil {
+		return fmt.Errorf("invalid s3 delete URL: %w", err)
+	}
+
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := now.Format("20060102")
+
+	const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+	canonicalURI := u.EscapedPath()
+	if canonicalURI == "" {
+		canonicalURI = "/"
+	}
+
+	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n", u.Host, emptyPayloadSHA256, amzDate)
+	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	canonicalReq := fmt.Sprintf("DELETE\n%s\n\n%s\n%s\n%s", canonicalURI, canonicalHeaders, signedHeaders, emptyPayloadSHA256)
+
+	credentialScope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, s.region)
+	reqHash := sha256.Sum256([]byte(canonicalReq))
+	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%x", amzDate, credentialScope, reqHash)
+
+	signingKey := getSignatureKey(s.secretKey, dateStamp, s.region, "s3")
+	signature := fmt.Sprintf("%x", hmacSHA256(signingKey, []byte(stringToSign)))
+	authHeader := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		s.accessKey, credentialScope, signedHeaders, signature)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create s3 delete request: %w", err)
+	}
+	req.Header.Set("x-amz-date", amzDate)
+	req.Header.Set("x-amz-content-sha256", emptyPayloadSHA256)
+	req.Header.Set("Authorization", authHeader)
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("s3 delete request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("s3 delete failed (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 func (s *S3Storage) getPublicURL(key string) string {

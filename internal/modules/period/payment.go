@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net/http"
 	"path/filepath"
@@ -145,7 +146,9 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 
 	registeredMembers := []RegisteredMemberItem{}
 	mRows, err := s.db.Query(c.Context(), `
-		SELECT p.id::text, p.name, COALESCE(p.tier, ''), to_char(m.joined_at, 'YYYY-MM-DD"T"HH24:MI:SSZ'), m.status
+		SELECT p.id::text, p.name, 
+		       COALESCE(to_char(m.joined_at, 'YYYY-MM-DD"T"HH24:MI:SSZ'), to_char(now(), 'YYYY-MM-DD"T"HH24:MI:SSZ')), 
+		       m.status
 		FROM memberships m
 		JOIN players p ON p.id = m.player_id
 		WHERE m.period_id = $1 AND m.status <> 'WITHDRAWN'
@@ -154,7 +157,7 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 		defer mRows.Close()
 		for mRows.Next() {
 			var it RegisteredMemberItem
-			if err := mRows.Scan(&it.PlayerID, &it.Name, &it.Tier, &it.JoinedAt, &it.Status); err == nil {
+			if err := mRows.Scan(&it.PlayerID, &it.Name, &it.JoinedAt, &it.Status); err == nil {
 				registeredMembers = append(registeredMembers, it)
 			}
 		}
@@ -738,10 +741,10 @@ func (s *Service) VerifyPayment(c *fiber.Ctx) error {
 
 		// 2. Add or activate member in period
 		_, err = tx.Exec(c.Context(), `
-			INSERT INTO memberships (id, period_id, player_id, commitment_fee, status)
-			VALUES (gen_random_uuid(), $1, $2, $3, 'ACTIVE')
+			INSERT INTO memberships (id, period_id, player_id, commitment_fee, status, joined_at)
+			VALUES (gen_random_uuid(), $1, $2, $3, 'ACTIVE', now())
 			ON CONFLICT (period_id, player_id) DO UPDATE
-			SET status = 'ACTIVE', commitment_fee = EXCLUDED.commitment_fee`,
+			SET status = 'ACTIVE', commitment_fee = EXCLUDED.commitment_fee, joined_at = now()`,
 			periodID, playerID, baseAmount)
 		if err != nil {
 			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menambahkan pemain sebagai member.")
@@ -810,3 +813,88 @@ func (s *Service) VerifyPayment(c *fiber.Ctx) error {
 
 	return httpx.OK(c, http.StatusOK, mp)
 }
+
+// DeletePayment lets admin delete a membership payment record regardless of its status.
+// If the payment was already PAID, it atomically deletes the membership and commitment fee revenue.
+func (s *Service) DeletePayment(c *fiber.Ctx) error {
+	periodID := c.Params("id")
+	paymentID := c.Params("paymentId")
+	if _, err := uuid.Parse(periodID); err != nil || uuid.Validate(paymentID) != nil {
+		return httpx.BadRequest("BAD_REQUEST", "Invalid ID.")
+	}
+
+	if err := s.guardImmutable(c.Context(), periodID); err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+
+	tx, err := s.db.Begin(c.Context())
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not start transaction.")
+	}
+	defer tx.Rollback(c.Context())
+
+	var playerID string
+	var status string
+	var proofPath, proofURL *string
+	err = tx.QueryRow(c.Context(), `
+		SELECT player_id::text, status, proof_path, proof_url
+		FROM membership_payments
+		WHERE id = $1 AND period_id = $2
+		FOR UPDATE`, paymentID, periodID).
+		Scan(&playerID, &status, &proofPath, &proofURL)
+	if err != nil {
+		return httpx.NotFound("Pembayaran tidak ditemukan.")
+	}
+
+	if status == "PAID" {
+		// 1. Delete revenue recorded for commitment fee
+		_, err = tx.Exec(c.Context(), `
+			DELETE FROM revenues
+			WHERE period_id = $1 AND player_id = $2 AND source = 'COMMITMENT_FEE'`,
+			periodID, playerID)
+		if err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menghapus catatan penerimaan kas.")
+		}
+
+		// 2. Delete membership
+		_, err = tx.Exec(c.Context(), `
+			DELETE FROM memberships
+			WHERE period_id = $1 AND player_id = $2`,
+			periodID, playerID)
+		if err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menghapus status keanggotaan.")
+		}
+	}
+
+	// 3. Delete membership payment record
+	tag, err := tx.Exec(c.Context(), `
+		DELETE FROM membership_payments
+		WHERE id = $1 AND period_id = $2`,
+		paymentID, periodID)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menghapus data pembayaran.")
+	}
+	if tag.RowsAffected() == 0 {
+		return httpx.NotFound("Pembayaran tidak ditemukan.")
+	}
+
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal menyelesaikan penghapusan pembayaran.")
+	}
+
+	// 4. Delete payment proof asset from storage (S3 Supabase / local)
+	var assetKey string
+	if proofPath != nil && *proofPath != "" {
+		assetKey = *proofPath
+	} else if proofURL != nil && *proofURL != "" {
+		assetKey = *proofURL
+	}
+	if assetKey != "" && s.storage != nil {
+		if err := s.storage.Delete(context.Background(), assetKey); err != nil {
+			log.Printf("[period] warning: failed to delete payment proof asset from storage (%s): %v", assetKey, err)
+		}
+	}
+
+	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "id": paymentID})
+}
+
