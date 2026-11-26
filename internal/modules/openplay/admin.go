@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
 
@@ -19,7 +20,7 @@ func (s *Service) UpdateSession(c *fiber.Ctx) error {
 		return httpx.WriteAppError(c, httpx.BadRequest("INVALID_REQUEST", "Invalid request body"))
 	}
 
-	if req.Name == nil && req.Status == nil && req.MaxMembers == nil {
+	if req.Name == nil && req.Status == nil && req.MaxMembers == nil && req.AdminNote == nil {
 		return httpx.WriteAppError(c, httpx.Unprocessable("No fields to update"))
 	}
 
@@ -30,6 +31,18 @@ func (s *Service) UpdateSession(c *fiber.Ctx) error {
 	if req.Name != nil {
 		query += fmt.Sprintf("name = $%d, ", argCount)
 		args = append(args, *req.Name)
+		argCount++
+	}
+
+	if req.Description != nil {
+		query += fmt.Sprintf("description = $%d, ", argCount)
+		args = append(args, *req.Description)
+		argCount++
+	}
+
+	if req.AdminNote != nil {
+		query += fmt.Sprintf("admin_note = $%d, ", argCount)
+		args = append(args, *req.AdminNote)
 		argCount++
 	}
 
@@ -450,4 +463,79 @@ func (s *Service) UnlinkMabarSession(c *fiber.Ctx) error {
 		"message": "Mabar session unlinked successfully",
 		"mabar_session_id": mabarID,
 	})
+}
+
+// AddPlayerManually adds a new non-member player manually to a session (admin only)
+func (s *Service) AddPlayerManually(c *fiber.Ctx) error {
+	sessionID := c.Params("id")
+	var req struct {
+		PlayerName string `json:"player_name"`
+		PhoneNumber *string `json:"phone_number"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("INVALID_REQUEST", "Invalid request body"))
+	}
+
+	if req.PlayerName == "" {
+		return httpx.WriteAppError(c, httpx.BadRequest("VALIDATION_ERROR", "player_name is required"))
+	}
+
+	ctx := context.Background()
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("DB_ERROR", "Failed to start transaction"))
+	}
+	defer tx.Rollback(ctx)
+
+	// Check if session exists
+	var maxNonMembers int
+	getSessionQuery := `SELECT max_non_members FROM open_play_sessions WHERE id = $1`
+	err = tx.QueryRow(ctx, getSessionQuery, sessionID).Scan(&maxNonMembers)
+	if err == pgx.ErrNoRows {
+		return httpx.WriteAppError(c, httpx.NotFound("Session not found"))
+	}
+	if err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("DB_ERROR", "Failed to fetch session"))
+	}
+
+	// Create a temporary player record for this non-member
+	playerID := generateUUID()
+	createPlayerQuery := `
+		INSERT INTO players (id, name, phone_number, created_at, updated_at)
+		VALUES ($1, $2, $3, NOW(), NOW())
+	`
+	_, err = tx.Exec(ctx, createPlayerQuery, playerID, req.PlayerName, req.PhoneNumber)
+	if err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("DB_ERROR", "Failed to create player record"))
+	}
+
+	// Add participant to session
+	participantID := generateUUID()
+	addParticipantQuery := `
+		INSERT INTO open_play_participants (id, session_id, player_id, participant_type, participant_status, joined_at)
+		VALUES ($1, $2, $3, 'NON_MEMBER', 'REGISTERED', NOW())
+		ON CONFLICT (session_id, player_id) DO NOTHING
+	`
+	result, err := tx.Exec(ctx, addParticipantQuery, participantID, sessionID, playerID)
+	if err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("DB_ERROR", "Failed to add participant"))
+	}
+
+	if result.RowsAffected() == 0 {
+		return httpx.WriteAppError(c, httpx.BadRequest("DUPLICATE", "Player already registered in this session"))
+	}
+
+	if err = tx.Commit(ctx); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("DB_ERROR", "Failed to commit transaction"))
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "Player added successfully",
+		"player_id": playerID,
+		"participant_id": participantID,
+	})
+}
+
+func generateUUID() string {
+	return uuid.New().String()
 }

@@ -11,7 +11,7 @@ import (
 
 var attendanceStatuses = map[string]bool{
 	"NOT_LISTED": true, "LISTED": true, "CONFIRMED": true, "PRESENT": true,
-	"CANCELLED": true, "ABSENT": true, "NO_SHOW": true,
+	"CANCELLED": true, "ABSENT": true, "NO_SHOW": true, "WAITING": true,
 }
 
 type Attendance struct {

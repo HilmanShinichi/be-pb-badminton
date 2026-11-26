@@ -36,55 +36,73 @@ func vDefInt(p *int, def int) int {
 }
 
 type Session struct {
-	ID                  string  `json:"id"`
-	Type                string  `json:"type"`
-	PeriodID            *string `json:"period_id"`
-	PeriodName          *string `json:"period_name"`
-	VenueID             *string `json:"venue_id"`
-	VenueName           *string `json:"venue_name"`
-	Date                string  `json:"date"`
-	StartTime           *string `json:"start_time"`
-	EndTime             *string `json:"end_time"`
-	DurationMinutes     *int    `json:"duration_minutes"`
-	Description         *string `json:"description"`
-	VenueDescription    *string `json:"venue_description"`
-	CourtCost           int64   `json:"court_cost"`
-	PricingMode         *string `json:"pricing_mode"`
-	ShuttlecockPrice    int64   `json:"shuttlecock_price"`
-	ShuttlePackPrice    int64   `json:"shuttle_pack_price"`
-	ShuttleUnitsPerPack int     `json:"shuttle_units_per_pack"`
-	Status              string  `json:"status"`
-	CreatedAt           string  `json:"created_at"`
+	ID                         string  `json:"id"`
+	Type                       string  `json:"type"`
+	PeriodID                   *string `json:"period_id"`
+	PeriodName                 *string `json:"period_name"`
+	VenueID                    *string `json:"venue_id"`
+	VenueName                  *string `json:"venue_name"`
+	Date                       string  `json:"date"`
+	StartTime                  *string `json:"start_time"`
+	EndTime                    *string `json:"end_time"`
+	DurationMinutes            *int    `json:"duration_minutes"`
+	Description                *string `json:"description"`
+	VenueDescription           *string `json:"venue_description"`
+	CourtCost                  int64   `json:"court_cost"`
+	PricingMode                *string `json:"pricing_mode"`
+	ShuttlecockPrice           int64   `json:"shuttlecock_price"`
+	ShuttlePackPrice           int64   `json:"shuttle_pack_price"`
+	ShuttleUnitsPerPack        int     `json:"shuttle_units_per_pack"`
+	Status                     string  `json:"status"`
+	RegistrationOpensAt        *string `json:"registration_opens_at"`
+	MemberRegistrationClosesAt *string `json:"member_registration_closes_at"`
+	RegistrationClosesAt       *string `json:"registration_closes_at"`
+	MaxMembers                 int     `json:"max_members"`
+	MaxNonMembers              int     `json:"max_non_members"`
+	MaxWaitingList             int     `json:"max_waiting_list"`
+	AdminNote                  *string `json:"admin_note"`
+	CreatedAt                  string  `json:"created_at"`
 }
 
 type sessionInput struct {
-	Type                *string `json:"type"`
-	PeriodID            *string `json:"period_id"`
-	VenueID             *string `json:"venue_id"`
-	Date                *string `json:"date"`
-	StartTime           *string `json:"start_time"`
-	EndTime             *string `json:"end_time"`
-	Description         *string `json:"description"`
-	VenueDescription    *string `json:"venue_description"`
-	CourtCost           *int64  `json:"court_cost"`
-	PricingMode         *string `json:"pricing_mode"`
-	ShuttlecockPrice    *int64  `json:"shuttlecock_price"`
-	ShuttlePackPrice    *int64  `json:"shuttle_pack_price"`
-	ShuttleUnitsPerPack *int    `json:"shuttle_units_per_pack"`
-	Status              *string `json:"status"`
+	Type                       *string `json:"type"`
+	PeriodID                   *string `json:"period_id"`
+	VenueID                    *string `json:"venue_id"`
+	Date                       *string `json:"date"`
+	StartTime                  *string `json:"start_time"`
+	EndTime                    *string `json:"end_time"`
+	Description                *string `json:"description"`
+	VenueDescription           *string `json:"venue_description"`
+	CourtCost                  *int64  `json:"court_cost"`
+	PricingMode                *string `json:"pricing_mode"`
+	ShuttlecockPrice           *int64  `json:"shuttlecock_price"`
+	ShuttlePackPrice           *int64  `json:"shuttle_pack_price"`
+	ShuttleUnitsPerPack        *int    `json:"shuttle_units_per_pack"`
+	Status                     *string `json:"status"`
+	RegistrationOpensAt        *string `json:"registration_opens_at"`
+	MemberRegistrationClosesAt *string `json:"member_registration_closes_at"`
+	RegistrationClosesAt       *string `json:"registration_closes_at"`
+	MaxMembers                 *int    `json:"max_members"`
+	MaxNonMembers              *int    `json:"max_non_members"`
+	MaxWaitingList             *int    `json:"max_waiting_list"`
+	AdminNote                  *string `json:"admin_note"`
 }
 
 const sessionCols = `s.id::text, s.type, s.period_id::text, p.name, s.venue_id::text, v.name,
 	s.date::text, s.start_time::text, s.end_time::text, s.duration_minutes, s.description,
 	s.venue_description, s.court_cost, s.pricing_mode, s.shuttlecock_price,
-	s.shuttle_pack_price, s.shuttle_units_per_pack, s.status, s.created_at::text`
+	s.shuttle_pack_price, s.shuttle_units_per_pack, s.status, s.registration_opens_at::text,
+	s.member_registration_closes_at::text, s.registration_closes_at::text,
+	s.max_members, s.max_non_members, s.max_waiting_list, s.admin_note, s.created_at::text`
 
 func scanSession(row pgx.Row) (Session, error) {
 	var s Session
 	err := row.Scan(&s.ID, &s.Type, &s.PeriodID, &s.PeriodName, &s.VenueID, &s.VenueName,
 		&s.Date, &s.StartTime, &s.EndTime, &s.DurationMinutes, &s.Description,
 		&s.VenueDescription, &s.CourtCost, &s.PricingMode, &s.ShuttlecockPrice,
-		&s.ShuttlePackPrice, &s.ShuttleUnitsPerPack, &s.Status, &s.CreatedAt)
+		&s.ShuttlePackPrice, &s.ShuttleUnitsPerPack, &s.Status, &s.RegistrationOpensAt,
+		&s.MemberRegistrationClosesAt, &s.RegistrationClosesAt,
+		&s.MaxMembers, &s.MaxNonMembers, &s.MaxWaitingList, &s.AdminNote, &s.CreatedAt)
 	return s, err
 }
 
@@ -278,15 +296,20 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		INSERT INTO mabar_sessions
 		(id, type, period_id, venue_id, date, start_time, end_time, duration_minutes,
 		 description, venue_description, court_cost, pricing_mode, shuttlecock_price,
-		 shuttle_pack_price, shuttle_units_per_pack)
+		 shuttle_pack_price, shuttle_units_per_pack, registration_opens_at,
+		 member_registration_closes_at, registration_closes_at,
+		 max_members, max_non_members, max_waiting_list, admin_note)
 		VALUES (gen_random_uuid(), $1, $2, $3, $4, $5::time, $6::time,
 		 CASE WHEN $5::time IS NOT NULL AND $6::time IS NOT NULL
 		      THEN (EXTRACT(EPOCH FROM ($6::time - $5::time)) / 60)::int ELSE NULL END,
-		 $7, $8, $9, $10, $11, $12, $13)
+		 $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15::timestamptz, $16::timestamptz,
+		 $17, $18, $19, $20)
 		RETURNING id::text`,
 		*in.Type, in.PeriodID, in.VenueID, *in.Date, in.StartTime, in.EndTime,
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
-		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12)).Scan(&newID)
+		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12), in.RegistrationOpensAt,
+		in.MemberRegistrationClosesAt, in.RegistrationClosesAt,
+		vDefInt(in.MaxMembers, 20), vDefInt(in.MaxNonMembers, 18), vDefInt(in.MaxWaitingList, 3), in.AdminNote).Scan(&newID)
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httpx.WriteAppError(c, dupSessionErr())
@@ -341,16 +364,57 @@ func (s *Service) Update(c *fiber.Ctx) error {
 		      THEN (EXTRACT(EPOCH FROM ($7::time - $6::time)) / 60)::int ELSE NULL END,
 		 description = $8, venue_description = $9, court_cost = $10,
 		 pricing_mode = $11, shuttlecock_price = $12,
-		 shuttle_pack_price = $13, shuttle_units_per_pack = $14, updated_at = now()
+		 shuttle_pack_price = $13, shuttle_units_per_pack = $14,
+		 registration_opens_at = $15::timestamptz,
+		 member_registration_closes_at = $16::timestamptz,
+		 registration_closes_at = $17::timestamptz,
+		 max_members = $18, max_non_members = $19, max_waiting_list = $20,
+		 updated_at = now()
 		WHERE id = $1`,
 		id, *in.Type, in.PeriodID, in.VenueID, *in.Date, in.StartTime, in.EndTime,
 		in.Description, in.VenueDescription, v64(in.CourtCost), in.PricingMode, v64(in.ShuttlecockPrice),
-		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12))
+		v64(in.ShuttlePackPrice), vDefInt(in.ShuttleUnitsPerPack, 12),
+		in.RegistrationOpensAt, in.MemberRegistrationClosesAt, in.RegistrationClosesAt,
+		vDefInt(in.MaxMembers, 20), vDefInt(in.MaxNonMembers, 18), vDefInt(in.MaxWaitingList, 3))
 	if err != nil {
 		if isUniqueViolation(err) {
 			return httpx.WriteAppError(c, dupSessionErr())
 		}
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")
+	}
+	if tag.RowsAffected() == 0 {
+		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")
+	}
+	sess, _ := s.fetch(c.Context(), id)
+	return httpx.OK(c, http.StatusOK, sess)
+}
+
+type noteInput struct {
+	AdminNote *string `json:"admin_note"`
+}
+
+func (s *Service) UpdateNote(c *fiber.Ctx) error {
+	id := c.Params("id")
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.BadRequest("BAD_REQUEST", "Invalid session ID.")
+	}
+	var in noteInput
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
+	}
+	var normalized *string
+	if in.AdminNote != nil {
+		trimmed := strings.TrimSpace(*in.AdminNote)
+		if trimmed != "" {
+			normalized = &trimmed
+		}
+	}
+	tag, err := s.db.Exec(c.Context(), `
+		UPDATE mabar_sessions
+		SET admin_note = $2, updated_at = now()
+		WHERE id = $1`, id, normalized)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update admin note.")
 	}
 	if tag.RowsAffected() == 0 {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Session not found.")

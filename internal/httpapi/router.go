@@ -78,6 +78,11 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	v1.Get("/public/payments/:id", deps.Period.GetPayment)
 	v1.Post("/public/payments/:id/proof", deps.Period.SubmitPaymentProof)
 
+	// Public mabar / open play registration & cancellation: no token needed.
+	v1.Get("/public/mabar/:id/registration", deps.Mabar.GetRegistrationInfo)
+	v1.Post("/public/mabar/:id/register", deps.Mabar.RegisterOpenPlay)
+	v1.Post("/public/mabar/:id/cancel", deps.Mabar.SubmitCancellation)
+
 	// Public open play sessions: no token needed, read-only.
 	v1.Get("/public/open-play", deps.OpenPlay.ListSessions)
 	v1.Get("/public/open-play/:id", deps.OpenPlay.GetSession)
@@ -136,6 +141,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	mabar.Get("/:id", deps.Mabar.Get)
 	mabar.Post("/", deps.Mabar.Create)
 	mabar.Patch("/:id", deps.Mabar.Update)
+	mabar.Patch("/:id/note", deps.Mabar.UpdateNote)
 	mabar.Delete("/:id", deps.Mabar.Delete)
 	mabar.Post("/:id/attendance", deps.Mabar.SetAttendance)
 	mabar.Post("/:id/fill-members", deps.Mabar.FillPeriodMembers)
@@ -153,6 +159,9 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	mabar.Get("/:id/expenses", deps.Mabar.ListExpenses)
 	mabar.Post("/:id/expenses", deps.Mabar.AddExpense)
 	mabar.Delete("/:id/expenses/:expenseId", deps.Mabar.DeleteExpense)
+	mabar.Get("/:id/cancellations", deps.Mabar.ListCancellations)
+	mabar.Post("/:id/cancellations/:cancellationId/approve", deps.Mabar.ApproveCancellation)
+	mabar.Post("/:id/cancellations/:cancellationId/reject", deps.Mabar.RejectCancellation)
 
 	matches := authed.Group("/matches", httpx.RequirePerm(httpx.PermMabar))
 	matches.Patch("/:id", deps.Mabar.UpdateMatch)
@@ -226,6 +235,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	openPlayAdmin.Delete("/:id/participants/:participant_id", deps.OpenPlay.RemoveParticipant)
 	openPlayAdmin.Post("/:id/link-mabar", deps.OpenPlay.LinkMabarSession)
 	openPlayAdmin.Post("/:id/unlink-mabar", deps.OpenPlay.UnlinkMabarSession)
+	openPlayAdmin.Post("/:id/add-player", deps.OpenPlay.AddPlayerManually)
 
 	return app
 }

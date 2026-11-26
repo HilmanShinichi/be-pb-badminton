@@ -25,6 +25,7 @@ type OpenPlaySession struct {
 	ID                       string     `json:"id"`
 	Name                     string     `json:"name"`
 	Description              *string    `json:"description"`
+	AdminNote                *string    `json:"admin_note"`
 	ScheduleDate             string     `json:"schedule_date"` // YYYY-MM-DD
 	StartTime                string     `json:"start_time"`    // HH:MM
 	EndTime                  *string    `json:"end_time"`      // HH:MM
@@ -91,6 +92,7 @@ type CreateSessionRequest struct {
 type UpdateSessionRequest struct {
 	Name                    *string `json:"name"`
 	Description             *string `json:"description"`
+	AdminNote               *string `json:"admin_note"`
 	ScheduleDate            *string `json:"schedule_date"`
 	StartTime               *string `json:"start_time"`
 	EndTime                 *string `json:"end_time"`
