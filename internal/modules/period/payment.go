@@ -92,6 +92,10 @@ func (s *Service) ExpireStalePayments(ctx context.Context) (int64, error) {
 // GetRegistrationInfo returns public period registration details and quota status.
 func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 	periodID := c.Params("id")
+	if _, err := uuid.Parse(periodID); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid period ID."))
+	}
+	_, _ = s.autoClosePeriodIfExpired(c.Context(), periodID)
 	p, err := s.fetch(c.Context(), periodID)
 	if err != nil {
 		return httpx.WriteAppError(c, err)
@@ -112,13 +116,16 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 	}
 
 	isFull := p.MaxMembers != nil && currentMembers >= *p.MaxMembers
-	canRegister := p.IsRegistrationOpen && !isFull && p.Status == "ACTIVE"
+	isExpired := isRegistrationDeadlinePassed(p.RegistrationExpiresAt, time.Now().UTC())
+	canRegister := p.IsRegistrationOpen && !isFull && !isExpired && p.Status == "ACTIVE"
 
 	closeReason := ""
 	if p.Status != "ACTIVE" {
 		closeReason = "Periode ini belum aktif atau sudah selesai."
 	} else if isFull {
 		closeReason = "Kuota member untuk periode ini sudah penuh."
+	} else if isExpired {
+		closeReason = "Batas waktu pendaftaran member untuk periode ini telah berakhir."
 	} else if !p.IsRegistrationOpen {
 		closeReason = "Pendaftaran member untuk periode ini sedang ditutup oleh pengurus."
 	}
@@ -198,10 +205,13 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 
 // ListOpenRegistrationPeriods returns active periods currently accepting member registrations.
 func (s *Service) ListOpenRegistrationPeriods(c *fiber.Ctx) error {
+	_, _ = s.autoCloseExpiredRegistrations(c.Context())
 	rows, err := s.db.Query(c.Context(), `
 		SELECT `+periodCols+`
 		FROM membership_periods
-		WHERE status = 'ACTIVE' AND is_registration_open = TRUE
+		WHERE status = 'ACTIVE'
+		  AND is_registration_open = TRUE
+		  AND (registration_expires_at IS NULL OR registration_expires_at > now())
 		ORDER BY start_date DESC`)
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load periods.")
@@ -274,6 +284,10 @@ type initiatePaymentInput struct {
 // InitiatePayment generates a nominal with unique 3-digit code and a 30-minute countdown.
 func (s *Service) InitiatePayment(c *fiber.Ctx) error {
 	periodID := c.Params("id")
+	if _, err := uuid.Parse(periodID); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid period ID."))
+	}
+	_, _ = s.autoClosePeriodIfExpired(c.Context(), periodID)
 	p, err := s.fetch(c.Context(), periodID)
 	if err != nil {
 		return httpx.WriteAppError(c, err)
@@ -281,6 +295,9 @@ func (s *Service) InitiatePayment(c *fiber.Ctx) error {
 
 	if p.Status != "ACTIVE" {
 		return httpx.Conflict("PERIOD_INACTIVE", "Periode ini belum aktif atau sudah selesai.")
+	}
+	if isRegistrationDeadlinePassed(p.RegistrationExpiresAt, time.Now().UTC()) {
+		return httpx.Conflict("REGISTRATION_EXPIRED", "Batas waktu pendaftaran untuk periode ini telah berakhir.")
 	}
 	if !p.IsRegistrationOpen {
 		return httpx.Conflict("REGISTRATION_CLOSED", "Pendaftaran untuk periode ini sedang ditutup.")
@@ -588,14 +605,16 @@ func (s *Service) SubmitPaymentProof(c *fiber.Ctx) error {
 }
 
 type updateRegStatusInput struct {
-	IsOpen bool `json:"is_registration_open"`
+	IsOpen                *bool   `json:"is_registration_open"`
+	RegistrationExpiresAt *string `json:"registration_expires_at"`
 }
 
-// SetRegistrationStatus lets admin open or close period registration.
+// SetRegistrationStatus lets admin open/close registration and update the registration deadline.
 func (s *Service) SetRegistrationStatus(c *fiber.Ctx) error {
 	periodID := c.Params("id")
-	if _, err := uuid.Parse(periodID); err != nil {
-		return httpx.BadRequest("BAD_REQUEST", "Invalid period ID.")
+	cur, err := s.fetch(c.Context(), periodID)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
 	}
 
 	var in updateRegStatusInput
@@ -603,17 +622,79 @@ func (s *Service) SetRegistrationStatus(c *fiber.Ctx) error {
 		return httpx.BadRequest("BAD_REQUEST", "Invalid request body.")
 	}
 
-	tag, err := s.db.Exec(c.Context(), `
+	isOpen := cur.IsRegistrationOpen
+	if in.IsOpen != nil {
+		isOpen = *in.IsOpen
+	}
+	expiresAt, err := coalesceOptionalUTCTimestamp(in.RegistrationExpiresAt, cur.RegistrationExpiresAt)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+
+	now := time.Now().UTC()
+	if expiresAt != nil && !expiresAt.After(now) {
+		if in.IsOpen != nil && *in.IsOpen {
+			return httpx.Conflict("REGISTRATION_DEADLINE_PASSED", "Batas waktu pendaftaran sudah lewat. Perpanjang atau kosongkan batas waktu terlebih dahulu sebelum membuka pendaftaran.")
+		}
+		if in.RegistrationExpiresAt != nil && strings.TrimSpace(*in.RegistrationExpiresAt) != "" {
+			return httpx.Unprocessable("Batas waktu pendaftaran harus di masa depan.")
+		}
+		isOpen = false
+	}
+
+	var savedExpires *string
+	err = s.db.QueryRow(c.Context(), `
 		UPDATE membership_periods
-		SET is_registration_open = $2, updated_at = now()
-		WHERE id = $1`, periodID, in.IsOpen)
-	if err != nil || tag.RowsAffected() == 0 {
+		SET is_registration_open = $2,
+		    registration_expires_at = $3,
+		    updated_at = now()
+		WHERE id = $1
+		RETURNING to_char(registration_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		periodID, isOpen, expiresAt).Scan(&savedExpires)
+	if err != nil {
 		return httpx.NotFound("Periode tidak ditemukan.")
 	}
 
 	return httpx.OK(c, http.StatusOK, fiber.Map{
-		"period_id":            periodID,
-		"is_registration_open": in.IsOpen,
+		"period_id":               periodID,
+		"is_registration_open":    isOpen,
+		"registration_expires_at": savedExpires,
+	})
+}
+
+type updateRegNotesInput struct {
+	RegistrationNotes *string `json:"registration_notes"`
+}
+
+// UpdateRegistrationNotes lets admin customize member registration notes / S&K.
+func (s *Service) UpdateRegistrationNotes(c *fiber.Ctx) error {
+	periodID := c.Params("id")
+	if _, err := uuid.Parse(periodID); err != nil {
+		return httpx.BadRequest("BAD_REQUEST", "Invalid period ID.")
+	}
+	if err := s.guardImmutable(c.Context(), periodID); err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+
+	var in updateRegNotesInput
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.BadRequest("BAD_REQUEST", "Invalid request body.")
+	}
+
+	notes := normalizeOptionalText(in.RegistrationNotes)
+	var saved *string
+	err := s.db.QueryRow(c.Context(), `
+		UPDATE membership_periods
+		SET registration_notes = $2, updated_at = now()
+		WHERE id = $1
+		RETURNING registration_notes`, periodID, notes).Scan(&saved)
+	if err != nil {
+		return httpx.NotFound("Periode tidak ditemukan.")
+	}
+
+	return httpx.OK(c, http.StatusOK, fiber.Map{
+		"period_id":          periodID,
+		"registration_notes": saved,
 	})
 }
 
@@ -726,6 +807,27 @@ func (s *Service) VerifyPayment(c *fiber.Ctx) error {
 	}
 
 	if in.Status == "PAID" {
+		var maxMembers *int
+		if err := tx.QueryRow(c.Context(), `
+			SELECT max_members FROM membership_periods
+			WHERE id = $1
+			FOR UPDATE`, periodID).Scan(&maxMembers); err != nil {
+			return httpx.NotFound("Periode tidak ditemukan.")
+		}
+
+		var otherMemberCount int
+		if err := tx.QueryRow(c.Context(), `
+			SELECT COUNT(*) FROM memberships
+			WHERE period_id = $1 AND status <> 'WITHDRAWN' AND player_id <> $2`,
+			periodID, playerID).Scan(&otherMemberCount); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal memeriksa kuota member.")
+		}
+
+		canApprove, fillsLastSlot := evaluateQuotaForApproval(maxMembers, otherMemberCount)
+		if !canApprove {
+			return httpx.Conflict("PERIOD_FULL", "Kuota member untuk periode ini sudah penuh.")
+		}
+
 		// 1. Update payment status to PAID
 		_, err = tx.Exec(c.Context(), `
 			UPDATE membership_payments
@@ -765,6 +867,24 @@ func (s *Service) VerifyPayment(c *fiber.Ctx) error {
 			periodID, playerID, totalAmount, revenueDate)
 		if err != nil {
 			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal mencatat penerimaan kas.")
+		}
+
+		// 4. Auto-fail remaining pending/waiting payments once the final slot is filled
+		if fillsLastSlot {
+			_, err = tx.Exec(c.Context(), `
+				UPDATE membership_payments
+				SET status = 'FAILED',
+				    verified_by = $2,
+				    verified_at = now(),
+				    rejection_reason = 'Kuota member untuk periode ini sudah penuh.',
+				    updated_at = now()
+				WHERE period_id = $1
+				  AND id <> $3
+				  AND status IN ('WAITING_PAYMENT', 'PENDING')`,
+				periodID, adminUserID, paymentID)
+			if err != nil {
+				return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Gagal memperbarui sisa antrean pembayaran.")
+			}
 		}
 	} else {
 		// FAILED
@@ -896,5 +1016,15 @@ func (s *Service) DeletePayment(c *fiber.Ctx) error {
 	}
 
 	return httpx.OK(c, http.StatusOK, map[string]any{"ok": true, "id": paymentID})
+}
+
+func evaluateQuotaForApproval(maxMembers *int, otherMemberCount int) (canApprove bool, fillsLastSlot bool) {
+	if maxMembers == nil || *maxMembers <= 0 {
+		return true, false
+	}
+	if otherMemberCount >= *maxMembers {
+		return false, false
+	}
+	return true, otherMemberCount+1 >= *maxMembers
 }
 

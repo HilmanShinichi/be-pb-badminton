@@ -107,6 +107,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	periods.Delete("/:id", deps.Period.Delete)
 	periods.Post("/:id/complete", deps.Period.Complete)
 	periods.Patch("/:id/registration-status", deps.Period.SetRegistrationStatus)
+	periods.Patch("/:id/registration-notes", deps.Period.UpdateRegistrationNotes)
 	periods.Get("/:id/payments", deps.Period.ListPayments)
 	periods.Patch("/:id/payments/:paymentId/verify", deps.Period.VerifyPayment)
 	periods.Delete("/:id/payments/:paymentId", deps.Period.DeletePayment)

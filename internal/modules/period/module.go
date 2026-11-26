@@ -42,10 +42,12 @@ type Period struct {
 	ShuttlePerSession  int     `json:"shuttle_per_session"`
 	Status             string  `json:"status"`
 	SessionWeekdays    []int32 `json:"session_weekdays"`
-	DefaultStartTime   *string `json:"default_start_time"`
-	DefaultEndTime     *string `json:"default_end_time"`
-	IsRegistrationOpen bool    `json:"is_registration_open"`
-	CreatedAt          string  `json:"created_at"`
+	DefaultStartTime      *string `json:"default_start_time"`
+	DefaultEndTime        *string `json:"default_end_time"`
+	IsRegistrationOpen    bool    `json:"is_registration_open"`
+	RegistrationNotes     *string `json:"registration_notes"`
+	RegistrationExpiresAt *string `json:"registration_expires_at"`
+	CreatedAt             string  `json:"created_at"`
 }
 
 type Membership struct {
@@ -82,26 +84,30 @@ type periodInput struct {
 	ShuttlePerSession  *int     `json:"shuttle_per_session"`
 	Status             *string  `json:"status"`
 	SessionWeekdays    *[]int32 `json:"session_weekdays"`
-	DefaultStartTime   *string  `json:"default_start_time"`
-	DefaultEndTime     *string  `json:"default_end_time"`
-	IsRegistrationOpen *bool    `json:"is_registration_open"`
+	DefaultStartTime      *string  `json:"default_start_time"`
+	DefaultEndTime        *string  `json:"default_end_time"`
+	IsRegistrationOpen    *bool    `json:"is_registration_open"`
+	RegistrationNotes     *string  `json:"registration_notes"`
+	RegistrationExpiresAt *string  `json:"registration_expires_at"`
 }
 
 const periodCols = `id::text, name, start_date::text, end_date::text, number_of_sessions,
 	max_members, commitment_fee, member_contribution, non_member_fee,
 	venue_cost_total, shuttle_pack_price, shuttle_units_per_pack, shuttle_per_session,
-	status, session_weekdays, default_start_time::text, default_end_time::text, is_registration_open, created_at::text`
+	status, session_weekdays, default_start_time::text, default_end_time::text, is_registration_open, registration_notes,
+	to_char(registration_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), created_at::text`
 
 func scanPeriod(row pgx.Row) (Period, error) {
 	var p Period
 	err := row.Scan(&p.ID, &p.Name, &p.StartDate, &p.EndDate, &p.NumberOfSessions,
 		&p.MaxMembers, &p.CommitmentFee, &p.MemberContribution, &p.NonMemberFee,
 		&p.VenueCostTotal, &p.ShuttlePackPrice, &p.ShuttleUnitsPerPack, &p.ShuttlePerSession,
-		&p.Status, &p.SessionWeekdays, &p.DefaultStartTime, &p.DefaultEndTime, &p.IsRegistrationOpen, &p.CreatedAt)
+		&p.Status, &p.SessionWeekdays, &p.DefaultStartTime, &p.DefaultEndTime, &p.IsRegistrationOpen, &p.RegistrationNotes, &p.RegistrationExpiresAt, &p.CreatedAt)
 	return p, err
 }
 
 func (s *Service) List(c *fiber.Ctx) error {
+	_, _ = s.autoCloseExpiredRegistrations(c.Context())
 	rows, err := s.db.Query(c.Context(),
 		`SELECT `+periodCols+` FROM membership_periods ORDER BY start_date DESC`)
 	if err != nil {
@@ -118,7 +124,12 @@ func (s *Service) List(c *fiber.Ctx) error {
 }
 
 func (s *Service) Get(c *fiber.Ctx) error {
-	p, err := s.fetch(c.Context(), c.Params("id"))
+	id := c.Params("id")
+	if _, err := uuid.Parse(id); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid period ID."))
+	}
+	_, _ = s.autoClosePeriodIfExpired(c.Context(), id)
+	p, err := s.fetch(c.Context(), id)
 	if err != nil {
 		return httpx.WriteAppError(c, err)
 	}
@@ -186,6 +197,9 @@ func (in periodInput) validate() error {
 	if in.Status != nil && !map[string]bool{"DRAFT": true, "ACTIVE": true, "COMPLETED": true, "CANCELLED": true}[*in.Status] {
 		return httpx.Unprocessable("Invalid period status.")
 	}
+	if _, err := parseOptionalUTCTimestamp(in.RegistrationExpiresAt); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -195,6 +209,10 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		return httpx.Err(c, http.StatusBadRequest, "BAD_REQUEST", "Invalid request body.")
 	}
 	if err := in.validate(); err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	expiresAt, err := parseOptionalUTCTimestamp(in.RegistrationExpiresAt)
+	if err != nil {
 		return httpx.WriteAppError(c, err)
 	}
 	weekdays := weekdaysOr(in.SessionWeekdays)
@@ -210,13 +228,13 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		 (id, name, start_date, end_date, number_of_sessions, max_members,
 		  commitment_fee, member_contribution, non_member_fee,
 		  venue_cost_total, shuttle_pack_price, shuttle_units_per_pack, shuttle_per_session,
-		  status, session_weekdays, default_start_time, default_end_time, is_registration_open)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'DRAFT', $13, $14, $15, $16)
+		  status, session_weekdays, default_start_time, default_end_time, is_registration_open, registration_notes, registration_expires_at)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'DRAFT', $13, $14, $15, $16, $17, $18)
 		 RETURNING `+periodCols,
 		strings.TrimSpace(*in.Name), *in.StartDate, *in.EndDate, sessions, in.MaxMembers,
 		val64(in.CommitmentFee), val64(in.MemberContribution), val64(in.NonMemberFee),
 		val64(in.VenueCostTotal), valDef64(in.ShuttlePackPrice, 125000), valDefInt(in.ShuttleUnitsPerPack, 12), valDefInt(in.ShuttlePerSession, 24),
-		weekdays, in.DefaultStartTime, in.DefaultEndTime, valDefBool(in.IsRegistrationOpen, false)))
+		weekdays, in.DefaultStartTime, in.DefaultEndTime, valDefBool(in.IsRegistrationOpen, false), normalizeOptionalText(in.RegistrationNotes), expiresAt))
 	if err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save period.")
 	}
@@ -272,6 +290,14 @@ func (s *Service) Update(c *fiber.Ctx) error {
 			sessions = *in.NumberOfSessions
 		}
 		status := *in.Status
+		expiresAt, err := coalesceOptionalUTCTimestamp(in.RegistrationExpiresAt, cur.RegistrationExpiresAt)
+		if err != nil {
+			return httpx.WriteAppError(c, err)
+		}
+		isRegOpen := coalesceBool(in.IsRegistrationOpen, cur.IsRegistrationOpen)
+		if expiresAt != nil && !expiresAt.After(time.Now().UTC()) {
+			isRegOpen = false
+		}
 		// Keep existing cost settings when the edit form omits them.
 		p, err := scanPeriod(s.db.QueryRow(c.Context(),
 			`UPDATE membership_periods SET
@@ -281,7 +307,8 @@ func (s *Service) Update(c *fiber.Ctx) error {
 			 shuttle_pack_price = $11, shuttle_units_per_pack = $12, shuttle_per_session = $13,
 			 status = $14, session_weekdays = $15,
 			 default_start_time = $16, default_end_time = $17,
-			 is_registration_open = $18, updated_at = now()
+			 is_registration_open = $18, registration_notes = $19,
+			 registration_expires_at = $20, updated_at = now()
 			 WHERE id = $1 RETURNING `+periodCols,
 			id, strings.TrimSpace(*in.Name), *in.StartDate, *in.EndDate, sessions, in.MaxMembers,
 			coalesce64(in.CommitmentFee, cur.CommitmentFee),
@@ -293,7 +320,9 @@ func (s *Service) Update(c *fiber.Ctx) error {
 			coalesceInt(in.ShuttlePerSession, cur.ShuttlePerSession),
 			status,
 			weekdays, in.DefaultStartTime, in.DefaultEndTime,
-			coalesceBool(in.IsRegistrationOpen, cur.IsRegistrationOpen)))
+			isRegOpen,
+			coalesceOptionalText(in.RegistrationNotes, cur.RegistrationNotes),
+			expiresAt))
 		if err != nil {
 			return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 		}
@@ -309,6 +338,14 @@ func (s *Service) Update(c *fiber.Ctx) error {
 	}
 	// Keep existing cost settings when the edit form omits them.
 	cur, _ := s.fetch(c.Context(), id)
+	expiresAt, err := coalesceOptionalUTCTimestamp(in.RegistrationExpiresAt, cur.RegistrationExpiresAt)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	isRegOpen := coalesceBool(in.IsRegistrationOpen, cur.IsRegistrationOpen)
+	if expiresAt != nil && !expiresAt.After(time.Now().UTC()) {
+		isRegOpen = false
+	}
 	p, err := scanPeriod(s.db.QueryRow(c.Context(),
 		`UPDATE membership_periods SET
 		 name = $2, start_date = $3, end_date = $4, number_of_sessions = $5,
@@ -317,7 +354,8 @@ func (s *Service) Update(c *fiber.Ctx) error {
 		 shuttle_pack_price = $11, shuttle_units_per_pack = $12, shuttle_per_session = $13,
 		 status = $14, session_weekdays = $15,
 		 default_start_time = $16, default_end_time = $17,
-		 is_registration_open = $18, updated_at = now()
+		 is_registration_open = $18, registration_notes = $19,
+		 registration_expires_at = $20, updated_at = now()
 		 WHERE id = $1 RETURNING `+periodCols,
 		id, strings.TrimSpace(*in.Name), *in.StartDate, *in.EndDate, sessions, in.MaxMembers,
 		val64(in.CommitmentFee), val64(in.MemberContribution), val64(in.NonMemberFee),
@@ -327,7 +365,9 @@ func (s *Service) Update(c *fiber.Ctx) error {
 		coalesceInt(in.ShuttlePerSession, cur.ShuttlePerSession),
 		status,
 		weekdays, in.DefaultStartTime, in.DefaultEndTime,
-		coalesceBool(in.IsRegistrationOpen, cur.IsRegistrationOpen)))
+		isRegOpen,
+		coalesceOptionalText(in.RegistrationNotes, cur.RegistrationNotes),
+		expiresAt))
 	if err != nil {
 		return httpx.Err(c, http.StatusNotFound, "NOT_FOUND", "Period not found.")
 	}
@@ -1047,6 +1087,85 @@ func coalesceBool(p *bool, cur bool) bool {
 		return cur
 	}
 	return *p
+}
+
+func normalizeOptionalText(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*p)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
+}
+
+func coalesceOptionalText(p *string, cur *string) *string {
+	if p == nil {
+		return cur
+	}
+	return normalizeOptionalText(p)
+}
+
+func parseOptionalUTCTimestamp(p *string) (*time.Time, error) {
+	if p == nil {
+		return nil, nil
+	}
+	trimmed := strings.TrimSpace(*p)
+	if trimmed == "" {
+		return nil, nil
+	}
+	if t, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		u := t.UTC()
+		return &u, nil
+	}
+	if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		u := t.UTC()
+		return &u, nil
+	}
+	return nil, httpx.Unprocessable("Registration expiration must be a valid ISO-8601 timestamp.")
+}
+
+func coalesceOptionalUTCTimestamp(in *string, cur *string) (*time.Time, error) {
+	if in == nil {
+		return parseOptionalUTCTimestamp(cur)
+	}
+	return parseOptionalUTCTimestamp(in)
+}
+
+func isRegistrationDeadlinePassed(expiresAt *string, now time.Time) bool {
+	t, err := parseOptionalUTCTimestamp(expiresAt)
+	if err != nil || t == nil {
+		return false
+	}
+	return !t.After(now.UTC())
+}
+
+func (s *Service) autoClosePeriodIfExpired(ctx context.Context, periodID string) (bool, error) {
+	tag, err := s.db.Exec(ctx, `
+		UPDATE membership_periods
+		SET is_registration_open = FALSE, updated_at = now()
+		WHERE id = $1
+		  AND is_registration_open = TRUE
+		  AND registration_expires_at IS NOT NULL
+		  AND registration_expires_at <= now()`, periodID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func (s *Service) autoCloseExpiredRegistrations(ctx context.Context) (int64, error) {
+	tag, err := s.db.Exec(ctx, `
+		UPDATE membership_periods
+		SET is_registration_open = FALSE, updated_at = now()
+		WHERE is_registration_open = TRUE
+		  AND registration_expires_at IS NOT NULL
+		  AND registration_expires_at <= now()`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 type MatrixSession struct {
