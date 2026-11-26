@@ -293,12 +293,12 @@ func (s *Service) Create(c *fiber.Ctx) error {
 		}
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save session.")
 	}
-	// Period sessions start with every active member already PRESENT —
-	// the admin then only marks whoever didn't show up.
+	// Period sessions start with every active member already added with NOT_LISTED status —
+	// they can confirm attendance or change status via open play registration.
 	if in.PeriodID != nil {
 		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO attendances (id, session_id, player_id, status, is_member)
-			SELECT gen_random_uuid(), $1, m.player_id, 'PRESENT', true
+			SELECT gen_random_uuid(), $1, m.player_id, 'NOT_LISTED', true
 			FROM memberships m
 			JOIN players pl ON pl.id = m.player_id
 			WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'`,

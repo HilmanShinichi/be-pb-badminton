@@ -17,6 +17,7 @@ import (
 	"github.com/pb-kecebong/backend/internal/modules/inventory"
 	"github.com/pb-kecebong/backend/internal/modules/mabar"
 	"github.com/pb-kecebong/backend/internal/modules/matchmaker"
+	"github.com/pb-kecebong/backend/internal/modules/openplay"
 	"github.com/pb-kecebong/backend/internal/modules/period"
 	"github.com/pb-kecebong/backend/internal/modules/player"
 	"github.com/pb-kecebong/backend/internal/modules/report"
@@ -31,6 +32,7 @@ type Dependencies struct {
 	Inventory  *inventory.Service
 	Mabar      *mabar.Service
 	MatchMaker *matchmaker.Service
+	OpenPlay   *openplay.Service
 	Period     *period.Service
 	Player     *player.Service
 	Report     *report.Service
@@ -75,6 +77,11 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	v1.Post("/public/periods/:id/payments", deps.Period.InitiatePayment)
 	v1.Get("/public/payments/:id", deps.Period.GetPayment)
 	v1.Post("/public/payments/:id/proof", deps.Period.SubmitPaymentProof)
+
+	// Public open play sessions: no token needed, read-only.
+	v1.Get("/public/open-play", deps.OpenPlay.ListSessions)
+	v1.Get("/public/open-play/:id", deps.OpenPlay.GetSession)
+	v1.Get("/public/open-play/:id/participants", deps.OpenPlay.GetParticipants)
 
 	authed := v1.Group("", httpx.RequireAuth(cfg.JWTSecret))
 	authed.Get("/auth/me", deps.Auth.Me)
@@ -131,6 +138,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	mabar.Patch("/:id", deps.Mabar.Update)
 	mabar.Delete("/:id", deps.Mabar.Delete)
 	mabar.Post("/:id/attendance", deps.Mabar.SetAttendance)
+	mabar.Post("/:id/fill-members", deps.Mabar.FillPeriodMembers)
 	mabar.Delete("/:id/attendance/:playerId", deps.Mabar.RemoveAttendance)
 	mabar.Get("/:id/attendance/stats", deps.Mabar.AttendanceStats)
 	mabar.Get("/:id/matches", deps.Mabar.ListMatches)
@@ -202,6 +210,22 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 
 	authed.Post("/simulator/period", httpx.RequirePerm(httpx.PermSimulator), simulator.RunPeriod)
 	authed.Post("/simulator/daily-event", httpx.RequirePerm(httpx.PermSimulator), simulator.RunDailyEvent)
+
+	// Open play sessions: member join (authenticated)
+	openPlayMember := authed.Group("/open-play")
+	openPlayMember.Post("/:id/join", deps.OpenPlay.JoinSession)
+	openPlayMember.Post("/:id/participants/:participant_id/cancel", deps.OpenPlay.CancelParticipation)
+
+	// Open play admin management
+	openPlayAdmin := authed.Group("/open-play", httpx.RequirePerm(httpx.PermMabar))
+	openPlayAdmin.Post("/", deps.OpenPlay.CreateSession)
+	openPlayAdmin.Patch("/:id", deps.OpenPlay.UpdateSession)
+	openPlayAdmin.Delete("/:id", deps.OpenPlay.DeleteSession)
+	openPlayAdmin.Get("/:id/cancellations", deps.OpenPlay.GetPendingCancellations)
+	openPlayAdmin.Post("/:id/cancellations/:cancellation_id/approve", deps.OpenPlay.ApproveCancellation)
+	openPlayAdmin.Delete("/:id/participants/:participant_id", deps.OpenPlay.RemoveParticipant)
+	openPlayAdmin.Post("/:id/link-mabar", deps.OpenPlay.LinkMabarSession)
+	openPlayAdmin.Post("/:id/unlink-mabar", deps.OpenPlay.UnlinkMabarSession)
 
 	return app
 }

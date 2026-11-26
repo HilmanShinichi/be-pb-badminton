@@ -107,11 +107,12 @@ func (s *Service) SetAttendance(c *fiber.Ctx) error {
 	if in.SeedMembers && sess.PeriodID != nil {
 		if _, err := tx.Exec(c.Context(), `
 			INSERT INTO attendances (id, session_id, player_id, status, is_member)
-			SELECT gen_random_uuid(), $1, m.player_id, 'PRESENT', true
+			SELECT gen_random_uuid(), $1, m.player_id, 'NOT_LISTED', true
 			FROM memberships m
 			JOIN players pl ON pl.id = m.player_id
 			WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'
-			ON CONFLICT (session_id, player_id) DO NOTHING`, id, *sess.PeriodID); err != nil {
+			ON CONFLICT (session_id, player_id) DO NOTHING
+		`, id, *sess.PeriodID); err != nil {
 			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 		}
 	}
@@ -152,6 +153,47 @@ func (s *Service) SetAttendance(c *fiber.Ctx) error {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not save attendance.")
 	}
 	return s.ListAttendance(c)
+}
+
+// FillPeriodMembers seeds all active period members into the session's attendance list.
+func (s *Service) FillPeriodMembers(c *fiber.Ctx) error {
+	id := c.Params("id")
+	sess, err := s.fetch(c.Context(), id)
+	if err != nil {
+		return httpx.WriteAppError(c, err)
+	}
+	if sess.PeriodID == nil || *sess.PeriodID == "" {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Only period sessions can be filled with members."))
+	}
+	
+	tx, err := s.db.Begin(c.Context())
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not seed members.")
+	}
+	defer tx.Rollback(c.Context())
+	
+	// Insert active period members with NOT_LISTED status (skip those already added)
+	tag, err := tx.Exec(c.Context(), `
+		INSERT INTO attendances (id, session_id, player_id, status, is_member)
+		SELECT gen_random_uuid(), $1, m.player_id, 'NOT_LISTED', true
+		FROM memberships m
+		JOIN players pl ON pl.id = m.player_id
+		WHERE m.period_id = $2 AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'
+		ON CONFLICT (session_id, player_id) DO NOTHING`, id, *sess.PeriodID)
+	
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not seed members.")
+	}
+	
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not seed members.")
+	}
+	
+	seededCount := tag.RowsAffected()
+	return httpx.OK(c, http.StatusOK, map[string]any{
+		"ok": true,
+		"seeded": seededCount,
+	})
 }
 
 // RemoveAttendance deletes one player's attendance row from a session. It is

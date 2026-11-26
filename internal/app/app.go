@@ -16,6 +16,7 @@ import (
 	"github.com/pb-kecebong/backend/internal/modules/inventory"
 	"github.com/pb-kecebong/backend/internal/modules/mabar"
 	"github.com/pb-kecebong/backend/internal/modules/matchmaker"
+	"github.com/pb-kecebong/backend/internal/modules/openplay"
 	"github.com/pb-kecebong/backend/internal/modules/period"
 	"github.com/pb-kecebong/backend/internal/modules/player"
 	"github.com/pb-kecebong/backend/internal/modules/report"
@@ -76,6 +77,7 @@ func Run(cfg config.Config) {
 		Inventory:  inventory.NewService(pool),
 		Mabar:      mabar.NewService(pool),
 		MatchMaker: matchmaker.NewService(pool, cfg),
+		OpenPlay:   openplay.NewService(pool),
 		Period:     periodSvc,
 		Player:     player.NewService(pool),
 		Report:     report.NewService(pool),
