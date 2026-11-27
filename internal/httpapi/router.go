@@ -82,6 +82,7 @@ func NewRouter(deps Dependencies, cfg config.Config) *fiber.App {
 	v1.Get("/public/mabar/:id/registration", deps.Mabar.GetRegistrationInfo)
 	v1.Post("/public/mabar/:id/register", deps.Mabar.RegisterOpenPlay)
 	v1.Post("/public/mabar/:id/cancel", deps.Mabar.SubmitCancellation)
+	v1.Post("/public/mabar/:id/absent", deps.Mabar.MarkMemberAbsent)
 
 	// Public open play sessions: no token needed, read-only.
 	v1.Get("/public/open-play", deps.OpenPlay.ListSessions)

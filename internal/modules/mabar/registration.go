@@ -57,6 +57,7 @@ type RegistrationPeriodMember struct {
 	Phone            *string `json:"phone"`
 	AttendanceStatus string  `json:"attendance_status"`
 	IsRegistered     bool    `json:"is_registered"`
+	IsAbsent         bool    `json:"is_absent"`
 	CommitmentFee    int64   `json:"commitment_fee"`
 }
 
@@ -76,9 +77,10 @@ type ParticipantItem struct {
 }
 
 type RegistrationParticipants struct {
-	Members     []ParticipantItem `json:"members"`
-	NonMembers  []ParticipantItem `json:"non_members"`
-	WaitingList []ParticipantItem `json:"waiting_list"`
+	Members       []ParticipantItem `json:"members"`
+	NonMembers    []ParticipantItem `json:"non_members"`
+	WaitingList   []ParticipantItem `json:"waiting_list"`
+	AbsentMembers []ParticipantItem `json:"absent_members"`
 }
 
 type RegistrationResponse struct {
@@ -167,6 +169,17 @@ func computeRegistrationQuotas(
 	}
 }
 
+func transferMemberSlot(maxMembers, maxNonMembers int) (int, int, bool) {
+	if maxMembers <= 0 {
+		return maxMembers, maxNonMembers, false
+	}
+	return maxMembers - 1, maxNonMembers + 1, true
+}
+
+func isAbsenceEligibleAttendanceStatus(status string) bool {
+	return status == "NOT_LISTED"
+}
+
 func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 	id := c.Params("id")
 	if _, err := uuid.Parse(id); err != nil {
@@ -240,7 +253,8 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 	periodMembers := []RegistrationPeriodMember{}
 	if sess.PeriodID != nil {
 		rows, err := s.db.Query(c.Context(), `
-			SELECT pl.id::text, pl.name, pl.phone, COALESCE(a.status, 'NOT_LISTED'), 
+			SELECT pl.id::text, pl.name, pl.phone, COALESCE(a.status, 'NOT_LISTED'),
+			       EXISTS(SELECT 1 FROM absent ab WHERE ab.session_id = $1 AND ab.player_id = pl.id),
 			       m.commitment_fee
 			FROM memberships m
 			JOIN players pl ON pl.id = m.player_id
@@ -251,7 +265,7 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 			defer rows.Close()
 			for rows.Next() {
 				var pm RegistrationPeriodMember
-				if err := rows.Scan(&pm.ID, &pm.Name, &pm.Phone, &pm.AttendanceStatus, &pm.CommitmentFee); err == nil {
+				if err := rows.Scan(&pm.ID, &pm.Name, &pm.Phone, &pm.AttendanceStatus, &pm.IsAbsent, &pm.CommitmentFee); err == nil {
 					pm.IsRegistered = pm.AttendanceStatus == "LISTED" || pm.AttendanceStatus == "CONFIRMED" || pm.AttendanceStatus == "PRESENT" || pm.AttendanceStatus == "WAITING"
 					periodMembers = append(periodMembers, pm)
 				}
@@ -299,9 +313,10 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 
 	// Participants
 	participants := RegistrationParticipants{
-		Members:     []ParticipantItem{},
-		NonMembers:  []ParticipantItem{},
-		WaitingList: []ParticipantItem{},
+		Members:       []ParticipantItem{},
+		NonMembers:    []ParticipantItem{},
+		WaitingList:   []ParticipantItem{},
+		AbsentMembers: []ParticipantItem{},
 	}
 
 	pRows, err := s.db.Query(c.Context(), `
@@ -328,6 +343,29 @@ func (s *Service) GetRegistrationInfo(c *fiber.Ctx) error {
 	}
 	if err := pRows.Err(); err != nil {
 		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not read participants.")
+	}
+
+	absentRows, err := s.db.Query(c.Context(), `
+		SELECT a.id::text, a.player_id::text, pl.name, a.is_member, a.status, a.listed_at::text
+		FROM absent ab
+		JOIN attendances a ON a.session_id = ab.session_id AND a.player_id = ab.player_id
+		JOIN players pl ON pl.id = a.player_id
+		WHERE ab.session_id = $1
+		ORDER BY ab.marked_at ASC`, id)
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load absent members.")
+	}
+	defer absentRows.Close()
+	for absentRows.Next() {
+		var p ParticipantItem
+		if err := absentRows.Scan(&p.AttendanceID, &p.PlayerID, &p.PlayerName, &p.IsMember, &p.Status, &p.ListedAt); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not read absent members.")
+		}
+		p.Status = "ABSENT"
+		participants.AbsentMembers = append(participants.AbsentMembers, p)
+	}
+	if err := absentRows.Err(); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not read absent members.")
 	}
 
 	return httpx.OK(c, http.StatusOK, RegistrationResponse{
@@ -485,6 +523,18 @@ func (s *Service) RegisterOpenPlay(c *fiber.Ctx) error {
 		}
 	}
 
+	if isMember {
+		var alreadyAbsent bool
+		if err := tx.QueryRow(c.Context(), `
+			SELECT EXISTS(SELECT 1 FROM absent WHERE session_id = $1 AND player_id = $2)`,
+			id, targetPlayerID).Scan(&alreadyAbsent); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not check absence status.")
+		}
+		if alreadyAbsent {
+			return httpx.Conflict("ALREADY_ABSENT", "Member has already marked themselves absent.")
+		}
+	}
+
 	// Check if already registered or in waiting list
 	var currentStatus string
 	var existingAttendanceID string
@@ -579,6 +629,138 @@ func (s *Service) RegisterOpenPlay(c *fiber.Ctx) error {
 		Status:   assignedStatus,
 		IsMember: isMember,
 		Message:  responseMsg,
+	})
+}
+
+type markMemberAbsentInput struct {
+	PlayerID string `json:"player_id"`
+}
+
+func (s *Service) MarkMemberAbsent(c *fiber.Ctx) error {
+	sessionID := c.Params("id")
+	if _, err := uuid.Parse(sessionID); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid session ID."))
+	}
+
+	var in markMemberAbsentInput
+	if err := httpx.Decode(c, &in); err != nil {
+		return httpx.WriteAppError(c, httpx.BadRequest("BAD_REQUEST", "Invalid request body."))
+	}
+	in.PlayerID = strings.TrimSpace(in.PlayerID)
+	if _, err := uuid.Parse(in.PlayerID); err != nil {
+		return httpx.WriteAppError(c, httpx.Unprocessable("A valid member ID is required."))
+	}
+
+	tx, err := s.db.Begin(c.Context())
+	if err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not begin transaction.")
+	}
+	defer tx.Rollback(c.Context())
+
+	var periodID *string
+	var opensAt, memberClosesAt, closesAt *time.Time
+	var maxMembers, maxNonMembers int
+	err = tx.QueryRow(c.Context(), `
+		SELECT period_id::text, registration_opens_at, member_registration_closes_at,
+		       registration_closes_at, max_members, max_non_members
+		FROM mabar_sessions
+		WHERE id = $1
+		FOR UPDATE`, sessionID).Scan(&periodID, &opensAt, &memberClosesAt, &closesAt, &maxMembers, &maxNonMembers)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return httpx.WriteAppError(c, httpx.NotFound("Session not found."))
+		}
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load session.")
+	}
+
+	now := time.Now().UTC()
+	status := computeRegistrationStatus(opensAt, memberClosesAt, closesAt, now)
+	if status != "MEMBER_ONLY" && status != "OPEN" {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Absence can only be marked while registration is open."))
+	}
+	if periodID == nil {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Only period members can mark themselves absent."))
+	}
+
+	var isPeriodMember bool
+	if err := tx.QueryRow(c.Context(), `
+		SELECT EXISTS(
+			SELECT 1
+			FROM memberships m
+			JOIN players pl ON pl.id = m.player_id
+			WHERE m.period_id = $1 AND m.player_id = $2
+			  AND m.status <> 'WITHDRAWN' AND pl.status <> 'ARCHIVED'
+		)`, *periodID, in.PlayerID).Scan(&isPeriodMember); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not verify period membership.")
+	}
+	if !isPeriodMember {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Player is not an active member of this period."))
+	}
+
+	var attendanceID, attendanceStatus string
+	var attendanceIsMember bool
+	err = tx.QueryRow(c.Context(), `
+		SELECT id::text, status, is_member
+		FROM attendances
+		WHERE session_id = $1 AND player_id = $2
+		FOR UPDATE`, sessionID, in.PlayerID).Scan(&attendanceID, &attendanceStatus, &attendanceIsMember)
+	attendanceExists := err == nil
+	if err != nil && err != pgx.ErrNoRows {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not load member registration.")
+	}
+	if attendanceExists && !attendanceIsMember {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Member registered in the non-member quota cannot transfer a member slot."))
+	}
+	if attendanceExists && !isAbsenceEligibleAttendanceStatus(attendanceStatus) {
+		return httpx.WriteAppError(c, httpx.Unprocessable("Only period members who have not joined this session can mark absent."))
+	}
+
+	var alreadyAbsent bool
+	if err := tx.QueryRow(c.Context(), `
+		SELECT EXISTS(SELECT 1 FROM absent WHERE session_id = $1 AND player_id = $2)`,
+		sessionID, in.PlayerID).Scan(&alreadyAbsent); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not check absence status.")
+	}
+	if alreadyAbsent {
+		return httpx.WriteAppError(c, httpx.Conflict("ALREADY_ABSENT", "Member has already marked themselves absent."))
+	}
+
+	newMaxMembers, newMaxNonMembers, ok := transferMemberSlot(maxMembers, maxNonMembers)
+	if !ok {
+		return httpx.WriteAppError(c, httpx.Unprocessable("No member slot is available to transfer."))
+	}
+
+	if _, err := tx.Exec(c.Context(), `
+		INSERT INTO absent (session_id, player_id) VALUES ($1, $2)`,
+		sessionID, in.PlayerID); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not record member absence.")
+	}
+	if attendanceExists {
+		if _, err := tx.Exec(c.Context(), `
+			UPDATE attendances
+			SET status = 'ABSENT', cancelled_at = now()
+			WHERE id = $1`, attendanceID); err != nil {
+			return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not update member attendance.")
+		}
+	} else if _, err := tx.Exec(c.Context(), `
+		INSERT INTO attendances (id, session_id, player_id, status, is_member, listed_at, cancelled_at)
+		VALUES (gen_random_uuid(), $1, $2, 'ABSENT', true, now(), now())`,
+		sessionID, in.PlayerID); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not create member absence attendance.")
+	}
+	if _, err := tx.Exec(c.Context(), `
+		UPDATE mabar_sessions
+		SET max_members = $2, max_non_members = $3, updated_at = now()
+		WHERE id = $1`, sessionID, newMaxMembers, newMaxNonMembers); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not transfer the member slot.")
+	}
+
+	if err := tx.Commit(c.Context()); err != nil {
+		return httpx.Err(c, http.StatusInternalServerError, "INTERNAL_ERROR", "Could not commit absence.")
+	}
+
+	return httpx.OK(c, http.StatusOK, fiber.Map{
+		"message": "Absence recorded and one slot transferred to non-members.",
 	})
 }
 

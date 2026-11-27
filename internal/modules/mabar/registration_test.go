@@ -16,6 +16,7 @@ func TestComputeRegistrationQuotas(t *testing.T) {
 		if status != "MEMBER_ONLY" {
 			t.Fatalf("expected MEMBER_ONLY, got %s", status)
 		}
+
 		if isMemberDeadlinePassed(&memberCloses, now) {
 			t.Fatalf("expected member deadline not passed")
 		}
@@ -98,4 +99,54 @@ func TestComputeRegistrationQuotas(t *testing.T) {
 			t.Fatalf("expected 5 member and 5 non-member slots, got %+v", q)
 		}
 	})
+}
+
+func TestTransferMemberSlot(t *testing.T) {
+	newMaxMembers, newMaxNonMembers, ok := transferMemberSlot(20, 8)
+	if !ok {
+		t.Fatal("expected a member slot to be transferable")
+	}
+	if newMaxMembers != 19 || newMaxNonMembers != 9 {
+		t.Fatalf("expected quotas 19/9, got %d/%d", newMaxMembers, newMaxNonMembers)
+	}
+	if newMaxMembers+newMaxNonMembers != 28 {
+		t.Fatalf("expected total capacity to remain 28, got %d", newMaxMembers+newMaxNonMembers)
+	}
+
+	now := time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC)
+	before := computeRegistrationQuotas(20, 8, 3, 10, 5, 0, "MEMBER_ONLY", nil, now)
+	after := computeRegistrationQuotas(newMaxMembers, newMaxNonMembers, 3, 9, 5, 0, "MEMBER_ONLY", nil, now)
+	if after.AvailableMemberSlots != before.AvailableMemberSlots {
+		t.Fatalf("expected member availability to stay the same, got %d before and %d after", before.AvailableMemberSlots, after.AvailableMemberSlots)
+	}
+	if after.AvailableNonMemberSlots != before.AvailableNonMemberSlots+1 {
+		t.Fatalf("expected one additional non-member slot, got %d before and %d after", before.AvailableNonMemberSlots, after.AvailableNonMemberSlots)
+	}
+
+	if _, _, ok := transferMemberSlot(0, 8); ok {
+		t.Fatal("expected zero member slots to be non-transferable")
+	}
+}
+
+func TestIsAbsenceEligibleAttendanceStatus(t *testing.T) {
+	tests := []struct {
+		status string
+		want   bool
+	}{
+		{status: "NOT_LISTED", want: true},
+		{status: "LISTED", want: false},
+		{status: "CONFIRMED", want: false},
+		{status: "PRESENT", want: false},
+		{status: "WAITING", want: false},
+		{status: "CANCELLED", want: false},
+		{status: "ABSENT", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.status, func(t *testing.T) {
+			if got := isAbsenceEligibleAttendanceStatus(tt.status); got != tt.want {
+				t.Fatalf("isAbsenceEligibleAttendanceStatus(%q) = %t, want %t", tt.status, got, tt.want)
+			}
+		})
+	}
 }
